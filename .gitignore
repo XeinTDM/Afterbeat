@@ -1,0 +1,16 @@
+/target/
+/.vs/
+/.idea/
+/.vscode/
+/.venv/
+__pycache__/
+*.py[cod]
+*.user
+*.suo
+*.pdb
+*.exe
+*.zip
+*.ppm
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,1703 @@
+import { AboutSlint, ComboBox, ScrollView } from "std-widgets.slint";
+
+export global Theme {
+    in property <float> text-scale: 1;
+    in property <bool> high-contrast;
+    in property <color> system-background: #141414;
+    in property <color> system-text: #ededed;
+    in property <color> system-highlight: #315fc7;
+    in property <color> system-highlight-text: #ffffff;
+    in property <color> system-disabled: #757575;
+    out property <color> on-accent: high-contrast ? system-highlight-text : #ffffff;
+    out property <color> field-border: high-contrast ? system-text : #6d6d6d;
+    out property <color> choice: high-contrast ? system-highlight : #283448;
+    out property <color> choice-text: high-contrast ? system-highlight-text : #d7e5ff;
+    out property <color> error: high-contrast ? system-text : #ffaaaa;
+    out property <color> background: high-contrast ? system-background : #141414;
+    out property <color> sidebar: high-contrast ? system-background : #191919;
+    out property <color> inset: high-contrast ? system-background : #1c1c1c;
+    out property <color> surface: high-contrast ? system-background : #242424;
+    out property <color> divider: high-contrast ? system-text : #2a2a2a;
+    out property <color> text: high-contrast ? system-text : #ededed;
+    out property <color> muted: high-contrast ? system-text : #aaaaaa;
+    out property <color> disabled: high-contrast ? system-disabled : #757575;
+    out property <color> accent: high-contrast ? system-text : #8bb0ff;
+    out property <color> blue: high-contrast ? system-highlight : #315fc7;
+    out property <color> blue-hover: high-contrast ? system-highlight : #3868d1;
+    out property <color> blue-pressed: high-contrast ? system-highlight : #294fae;
+    out property <color> blue-disabled: high-contrast ? system-background : #293f6a;
+    out property <color> red: high-contrast ? system-highlight : #b6333d;
+    out property <color> red-hover: high-contrast ? system-highlight : #c33b46;
+    out property <color> red-pressed: high-contrast ? system-highlight : #962630;
+    out property <color> red-disabled: high-contrast ? system-background : #49252a;
+}
+
+component Label inherits Text {
+    color: Theme.text;
+    font-size: 13px * Theme.text-scale;
+    vertical-alignment: center;
+}
+
+component Secondary inherits Label {
+    color: Theme.muted;
+    font-size: 12px * Theme.text-scale;
+    overflow: elide;
+}
+
+component Rule inherits Rectangle {
+    height: 1px;
+    background: Theme.divider;
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <string> key-hint;
+    in property <string> hint: root.key-hint == "" ? root.label : root.label + " (" + root.key-hint + ")";
+    in property <bool> enabled: true;
+    in property <bool> selected;
+    in property <bool> segment;
+    in property <bool> primary;
+    in property <bool> danger;
+    in property <bool> managed-focus;
+    in property <bool> group-focused;
+    in property <bool> icon-only;
+    in property <bool> left-align;
+    in property <image> icon;
+    callback activated();
+
+    height: 36px * Theme.text-scale;
+    min-width: root.icon-only ? 32px : title.preferred-width + (root.left-align ? 28px : 18px) + (root.icon.width > 0 ? 23px : 0px);
+    preferred-width: title.preferred-width + 20px;
+    border-width: (focus.has-focus || root.group-focused) && root.enabled ? 2px :
+        Theme.high-contrast && !root.segment ? 1px : 0px;
+    border-radius: 6px;
+    border-color: Theme.accent;
+    background: root.danger ?
+                    (!root.enabled ? Theme.red-disabled :
+                        touch.pressed ? Theme.red-pressed : touch.has-hover ? Theme.red-hover : Theme.red) :
+                !root.enabled ? (root.selected ? Theme.blue-disabled : root.segment ? transparent : Theme.inset) :
+                root.primary ?
+                    (touch.pressed ? Theme.blue-pressed : touch.has-hover ? Theme.blue-hover : Theme.blue) :
+                root.selected ? Theme.choice :
+                Theme.high-contrast ? Theme.surface :
+                touch.pressed ? #373737 : touch.has-hover ? #303030 :
+                root.segment ? transparent : Theme.surface;
+
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.hint;
+    accessible-enabled: root.enabled;
+    accessible-checkable: root.segment;
+    accessible-checked: root.selected;
+    accessible-item-selected: root.selected;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+
+    title := Label {
+        x: root.left-align ? (root.icon.width > 0 ? 38px : 11px) : 0px;
+        y: 0px;
+        width: root.width - self.x - (root.left-align ? 9px : 0px);
+        height: root.key-hint == "" ? root.height : root.height * 0.56;
+        text: root.label;
+        font-size: 13px * Theme.text-scale;
+        overflow: elide;
+        font-weight: root.primary || root.danger ? 680 : root.selected ? 600 : 500;
+        color: !root.enabled ? (root.danger && !Theme.high-contrast ? #e9bfc1 :
+                root.selected && !Theme.high-contrast ? Theme.muted : Theme.disabled) :
+               root.primary || root.danger ? Theme.on-accent : root.selected ? Theme.choice-text : Theme.text;
+        horizontal-alignment: root.left-align ? left : center;
+        accessible-role: none;
+    }
+    if (root.key-hint != ""): Label {
+        y: title.height;
+        height: root.height - self.y;
+        text: root.key-hint;
+        font-family: "Consolas";
+        font-size: 11px * Theme.text-scale;
+        color: title.color;
+        horizontal-alignment: center;
+        accessible-role: none;
+    }
+    if (root.icon.width > 0): Image {
+        x: root.icon-only ? (root.width - self.width) / 2 : 11px;
+        y: (root.height - 17px) / 2;
+        width: 17px;
+        height: 17px;
+        source: root.icon;
+        colorize: title.color;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { if (!root.managed-focus) { focus.focus(); } root.activated(); }
+    }
+    if (root.icon-only): Tooltip {
+        text: @markdown("\{root.hint}");
+    }
+    focus := FocusScope {
+        width: 0px;
+        enabled: root.enabled && !root.managed-focus;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                if (!event.repeat) { root.activated(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+component IntervalPresets inherits HorizontalLayout {
+    in property <bool> enabled;
+    callback selected(int);
+    alignment: start;
+    horizontal-stretch: 0;
+    spacing: 8px;
+    for millis[index] in [10, 100, 0]: ActionButton {
+        label: index == 2 ? "Max speed" : "\{millis} ms";
+        enabled: root.enabled;
+        activated => { root.selected(millis); }
+    }
+}
+
+component Choices inherits Rectangle {
+    in property <[string]> labels;
+    in property <int> current;
+    in property <bool> enabled: true;
+    callback selected(int);
+
+    height: 36px * Theme.text-scale;
+    border-radius: 6px;
+    background: Theme.inset;
+    forward-focus: group-focus;
+    accessible-role: radio-group;
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 1px;
+        for name[index] in root.labels: ActionButton {
+            label: name;
+            height: 32px * Theme.text-scale;
+            preferred-width: 76px;
+            horizontal-stretch: 1;
+            segment: true;
+            managed-focus: true;
+            accessible-role: radio-button;
+            group-focused: group-focus.has-focus && root.current == index;
+            enabled: root.enabled;
+            selected: root.current == index;
+            activated => { group-focus.focus(); root.selected(index); }
+        }
+    }
+    group-focus := FocusScope {
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow || event.text == Key.UpArrow) {
+                root.selected(mod(root.current - 1 + root.labels.length, root.labels.length));
+                return accept;
+            }
+            if (event.text == Key.RightArrow || event.text == Key.DownArrow) {
+                root.selected(mod(root.current + 1, root.labels.length));
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+component NumberField inherits Rectangle {
+    in property <string> label;
+    in property <string> unit;
+    in property <string> error;
+    in property <bool> enabled: true;
+    in-out property <string> value <=> editor.text;
+    callback edited();
+
+    height: 36px * Theme.text-scale;
+    border-radius: 6px;
+    border-width: editor.has-focus && root.enabled ? 2px : root.enabled ? 1px : 0px;
+    border-color: root.error != "" ? Theme.error : editor.has-focus ? Theme.accent : Theme.field-border;
+    background: Theme.inset;
+    forward-focus: editor;
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 5px;
+        editor := TextInput {
+            single-line: true;
+            font-family: "Consolas";
+            font-size: 14px * Theme.text-scale;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            color: root.enabled ? Theme.text : Theme.disabled;
+            selection-background-color: Theme.high-contrast ? Theme.system-highlight : Theme.accent;
+            selection-foreground-color: Theme.high-contrast ? Theme.system-highlight-text : #10151f;
+            enabled: root.enabled;
+            accessible-role: text-input;
+            accessible-label: root.label;
+            accessible-description: root.error;
+            accessible-value: self.text;
+            accessible-enabled: root.enabled;
+            accessible-action-set-value(v) => { if (root.enabled) { self.text = v; root.edited(); } }
+            edited => { root.edited(); }
+        }
+        Secondary { text: root.unit; }
+    }
+}
+
+component FieldRow inherits FlexboxLayout {
+    in property <string> label;
+    in property <string> error;
+    in property <bool> compact;
+    in property <length> label-width: 108px * Theme.text-scale;
+    in property <bool> reveal;
+    callback reveal-at(length);
+    alignment: start;
+    cross-axis-alignment: center;
+    flex-wrap: wrap;
+    spacing-horizontal: 8px;
+    spacing-vertical: 5px;
+    Label {
+        text: root.label;
+        width: root.compact ? root.width : root.label-width;
+        height: root.compact ? 21px * Theme.text-scale : 36px * Theme.text-scale;
+    }
+    @children
+    if (root.error != ""): Label {
+        width: root.width;
+        text: root.error;
+        color: Theme.error;
+        wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    Timer {
+        interval: 1ms;
+        running: root.reveal;
+        triggered => { root.reveal-at(root.absolute-position.y); }
+    }
+}
+
+component CadenceUnit inherits ComboBox {
+    in property <bool> short-labels;
+    height: 36px * Theme.text-scale;
+    accessible-label: "Cadence unit";
+    model: root.short-labels ? ["ms", "sec", "min", "hr", "day", "/ sec", "/ min", "/ hr", "/ day"] :
+        ["Delay · milliseconds", "Delay · seconds", "Delay · minutes", "Delay · hours",
+         "Delay · days", "Rate · per second", "Rate · per minute", "Rate · per hour", "Rate · per day"];
+}
+
+component TestPad inherits Rectangle {
+    in property <string> count;
+    in property <bool> compact;
+    callback hit();
+    height: root.compact ? max(63px, 34px * Theme.text-scale) : 63px * Theme.text-scale;
+    min-width: root.compact ? 0px : 127px;
+    background: pointer.pressed ? #353535 : pointer.has-hover ? #2b2b2b : Theme.surface;
+    border-width: focus.has-focus ? 2px : 0px;
+    border-color: Theme.accent;
+    border-radius: 6px;
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: "Test pad, " + root.count + " presses";
+    accessible-description: "Counts mouse presses over this area";
+    accessible-action-default => { root.hit(); }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 3px;
+        Label { text: root.compact ? "Test" : "Test pad"; font-weight: 600; horizontal-alignment: center; accessible-role: none; }
+        Secondary { text: root.compact ? root.count : root.count + " presses"; horizontal-alignment: center; accessible-role: none; }
+    }
+    pointer := TouchArea {
+        mouse-cursor: crosshair;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) { root.hit(); }
+        }
+    }
+    focus := FocusScope {
+        width: 0px;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                if (!event.repeat) { root.hit(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+component SectionTitle inherits Label {
+    font-size: 14px * Theme.text-scale;
+    font-weight: 650;
+    height: 24px * Theme.text-scale;
+}
+
+struct Shortcut {
+    key: string,
+    label: string,
+    available: bool,
+}
+
+component ShortcutHint inherits HorizontalLayout {
+    in property <Shortcut> shortcut;
+    height: 34px * Theme.text-scale;
+    spacing: 7px;
+    alignment: start;
+    horizontal-stretch: 0;
+    Rectangle {
+        width: max(30px, cap.preferred-width + 14px);
+        height: 24px * Theme.text-scale;
+        y: (root.height - self.height) / 2;
+        border-radius: 5px;
+        background: Theme.surface;
+        cap := Label {
+            x: 7px;
+            width: parent.width - 14px;
+            text: root.shortcut.key;
+            color: root.shortcut.available ? Theme.text : Theme.disabled;
+            font-size: 11px * Theme.text-scale;
+            font-family: "Consolas";
+            horizontal-alignment: center;
+        }
+    }
+    Secondary {
+        text: root.shortcut.label;
+        min-width: self.preferred-width;
+        color: root.shortcut.available ? Theme.muted : Theme.disabled;
+    }
+}
+
+component SelectionList inherits Rectangle {
+    in property <[string]> rows;
+    in property <int> selected: -1;
+    in property <string> empty-text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <length> max-list-height: 138px;
+    callback chosen(int, string);
+    private property <length> row-height: 35px * Theme.text-scale;
+
+    height: min(root.max-list-height * Theme.text-scale, max(46px, 6px + root.rows.length * root.row-height));
+    border-radius: 7px;
+    border-width: list-focus.has-focus || Theme.high-contrast ? 1px : 0px;
+    border-color: Theme.accent;
+    background: Theme.inset;
+    clip: true;
+    forward-focus: list-focus;
+    accessible-role: AccessibleRole.list;
+    accessible-label: root.label;
+
+    function choose(index: int) {
+        if (index >= 0 && index < root.rows.length) {
+            root.chosen(index, root.rows[index]);
+            list.content-y = min(-max(0px, (index + 1) * root.row-height - list.visible-height),
+                max(list.content-y, -index * root.row-height));
+        }
+    }
+    if (root.rows.length == 0): Secondary {
+        x: 13px;
+        width: parent.width - 26px;
+        text: root.empty-text;
+        wrap: word-wrap;
+    }
+    list := ScrollView {
+        visible: root.rows.length > 0;
+        x: 3px; y: 3px;
+        width: root.width - 6px; height: root.height - 6px;
+        content-width: self.visible-width;
+        content-height: root.rows.length * root.row-height;
+        for item[i] in root.rows: ActionButton {
+            y: i * root.row-height;
+            width: parent.width - 13px;
+            height: root.row-height - 1px;
+            label: item;
+            left-align: true;
+            segment: true;
+            managed-focus: true;
+            accessible-role: list-item;
+            group-focused: list-focus.has-focus && root.selected == i;
+            selected: root.selected == i;
+            enabled: root.enabled;
+            activated => { list-focus.focus(); root.choose(i); }
+        }
+    }
+    list-focus := FocusScope {
+        width: 0px;
+        enabled: root.enabled && root.rows.length > 0;
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow || event.text == Key.DownArrow ||
+                event.text == Key.Home || event.text == Key.End) {
+                root.choose(event.text == Key.Home ? 0 : event.text == Key.End ? root.rows.length - 1 :
+                    clamp(root.selected + (event.text == Key.DownArrow ? 1 : -1), 0, root.rows.length - 1));
+                return accept;
+            }
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.choose(max(0, root.selected));
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+component RunButton inherits ActionButton {
+    width: 128px * min(1.5, Theme.text-scale);
+    height: 34px * Theme.text-scale;
+}
+
+export struct DryArea {
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    kind: int,
+}
+
+export struct DryPoint {
+    x: float,
+    y: float,
+    radius-x: float,
+    radius-y: float,
+    blocked: bool,
+    location: string,
+    result: string,
+}
+
+component DryMap inherits Rectangle {
+    in property <[DryArea]> areas;
+    in property <[DryPoint]> points;
+    in property <float> aspect: 1.8;
+    in property <int> step: -1;
+
+    height: 252px;
+    background: Theme.inset;
+    border-color: Theme.divider;
+    border-width: 1px;
+    border-radius: 9px;
+    accessible-role: image;
+    accessible-label: "Virtual desktop map with preview points and safety zones";
+
+    map := Rectangle {
+        width: min(parent.width - 36px, (parent.height - 36px) * root.aspect);
+        height: self.width / root.aspect;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        for area in root.areas: Rectangle {
+            x: area.x * map.width;
+            y: area.y * map.height;
+            width: area.w * map.width;
+            height: area.h * map.height;
+            border-width: area.kind == 0 ? 1px : 2px;
+            border-color: Theme.high-contrast ? Theme.text :
+                area.kind == 0 ? #465466 : area.kind == 1 ? #52bcad : #ed6976;
+            background: Theme.high-contrast ? Theme.background :
+                area.kind == 0 ? #202833 : area.kind == 1 ? #16423e : #492730;
+        }
+        for point[index] in root.points: Path {
+            visible: index > 0;
+            width: map.width;
+            height: map.height;
+            viewbox-width: map.width / 1px;
+            viewbox-height: map.height / 1px;
+            stroke: Theme.high-contrast ? Theme.text : #7ea9f1;
+            stroke-width: 2px;
+            opacity: index <= root.step ? 1 : 0.5;
+            MoveTo {
+                x: root.points[max(0, index - 1)].x * map.width / 1px;
+                y: root.points[max(0, index - 1)].y * map.height / 1px;
+            }
+            LineTo { x: point.x * map.width / 1px; y: point.y * map.height / 1px; }
+        }
+        for point in root.points: Rectangle {
+            visible: point.radius-x > 0;
+            x: (point.x - point.radius-x) * map.width;
+            y: (point.y - point.radius-y) * map.height;
+            width: point.radius-x * 2 * map.width;
+            height: point.radius-y * 2 * map.height;
+            border-radius: min(self.width, self.height) / 2;
+            border-width: 1px;
+            border-color: Theme.high-contrast ? Theme.text : #7ea9f199;
+        }
+        for point[index] in root.points: Rectangle {
+            width: 24px;
+            height: 24px;
+            x: point.x * map.width - self.width / 2;
+            y: point.y * map.height - self.height / 2;
+            border-radius: 12px;
+            border-width: index == root.step ? 2px : 1px;
+            border-color: index == root.step ? Theme.on-accent :
+                Theme.high-contrast ? Theme.text : point.blocked ? #ed6976 : #7ea9f1;
+            background: point.blocked ? Theme.red : index == root.step ? Theme.blue : Theme.choice;
+            Label {
+                text: "\{index + 1}";
+                color: point.blocked || index == root.step ? Theme.on-accent : Theme.choice-text;
+                font-size: 11px;
+                font-weight: 680;
+                horizontal-alignment: center;
+                accessible-role: none;
+            }
+        }
+    }
+}
+
+export component App inherits Window {
+    title: "Afterbeat";
+    icon: @image-url("afterbeat.svg");
+    background: Theme.background;
+    default-font-family: "Segoe UI";
+    default-font-size: 13px * Theme.text-scale;
+    preferred-width: 922px;
+    min-width: 560px;
+    preferred-height: 634px;
+    min-height: 420px;
+
+    in-out property <string> interval-text: "100";
+    in-out property <int> interval-unit;
+    in-out property <string> count-text: "100";
+    in-out property <int> button-mode;
+    in-out property <bool> double-click;
+    in-out property <bool> limited;
+    in-out property <bool> fixed-target;
+    in-out property <int> delay: 3;
+    in-out property <int> page;
+    in-out property <bool> keyboard;
+    in-out property <string> key-text: "Space";
+    in-out property <bool> text-output;
+    in-out property <string> text-character: "a";
+    in-out property <bool> hold-activation;
+    in-out property <string> trigger-text: "F6";
+    in-out property <bool> armed: true;
+    in-out property <string> time-limit: "0";
+    in-out property <string> press-text: "0";
+    in-out property <bool> timed-press;
+    in-out property <bool> hold-down;
+    in-out property <bool> random-rate;
+    in-out property <bool> low-cpu;
+    in property <bool> low-cpu-available;
+    in-out property <string> min-rate: "8";
+    in-out property <string> max-rate: "12";
+    in-out property <bool> route-enabled;
+    in-out property <bool> route-once;
+    in-out property <string> route-radius: "0";
+    in-out property <int> route-index: -1;
+    in-out property <int> edge-mode;
+    in-out property <int> process-mode;
+    in-out property <string> process-names;
+    in-out property <int> pick-kind: 1;
+    in-out property <string> profile-name;
+
+    in property <bool> input-ready;
+    in property <bool> input-failed;
+    in property <bool> shortcut-failure;
+    in property <string> configuration-error;
+    in property <string> save-error;
+    in property <string> configuration-field;
+    in property <string> guard-summary;
+    in property <string> limit-summary;
+    in property <[DryArea]> dry-areas;
+    in property <[DryPoint]> dry-points;
+    in property <bool> dry-sample-allowed;
+    in property <string> dry-source: "Saved route centers";
+    in property <string> dry-message;
+    in property <bool> dry-error;
+    in property <float> dry-aspect: 1.8;
+    in-out property <int> dry-step: -1;
+    private property <int> dry-preview-point:
+        !root.route-enabled && root.dry-points.length > 0 ? 0 : root.dry-step;
+    private property <bool> dry-playing;
+    private property <bool> dry-at-end: root.dry-step >= root.dry-points.length - 1 ||
+        (root.dry-step >= 0 && root.dry-points[root.dry-step].blocked);
+    in-out property <string> shortcut-error;
+    in-out property <string> preset-error;
+    in property <string> run-state;
+    in property <bool> active;
+    in property <bool> stopping;
+    in property <bool> capturing;
+    in property <bool> can-start: true;
+    in property <bool> has-toggle: true;
+    in property <string> point-label: "No point captured";
+    in property <string> pace-value: "10 /s";
+    in property <int> route-count;
+    in property <[string]> route-rows;
+    in property <string> inside-label: "Unset";
+    in property <string> stop-zone-label: "Unset";
+    in property <[string]> profile-rows;
+    in property <string> library-stats: "0 runs  ·  0 actions  ·  0 min active";
+    in property <bool> message-error;
+    in property <string> message;
+    in property <string> toggle-key: "F6";
+    in property <string> stop-key: "F7";
+    in property <string> capture-key: "F8";
+    in property <string> session-count: "0";
+    in property <string> session-rate: "—";
+    in property <string> session-elapsed: "0.0 s";
+    in property <string> pad-count: "0";
+
+    callback settings-edited();
+    callback toggle-run();
+    callback capture-point(int);
+    callback test-hit();
+    callback reset-pad();
+    callback apply-shortcut();
+    callback edit-route(int);
+    callback clear-zone(int);
+    callback open-dry-run();
+    callback sample-dry-run();
+    callback profile-action(int);
+    callback preset-interval(int);
+
+    in-out property <int> profile-index: -1;
+    in-out property <string> selected-preset;
+    private property <int> confirm-preset;
+    private property <[image]> nav-icons: [@image-url("nav-pointer.svg"), @image-url("nav-clock.svg"),
+        @image-url("nav-target.svg"), @image-url("nav-bookmark.svg")];
+
+    callback test-hits(int);
+    callback select-unit(int);
+    callback open-data-folder();
+
+    private property <length> window-width: 922px;
+    changed width => { root.window-width = root.width; }
+    private property <bool> compact: root.window-width < 760px || Theme.text-scale > 1.25;
+    private property <bool> stack-fields: root.window-width < 620px || Theme.text-scale > 1.25;
+    private property <bool> large-text: Theme.text-scale > 1.25;
+    private property <bool> clicker-options;
+    private property <bool> show-clicker-options: !root.compact || root.clicker-options ||
+        root.configuration-field == "click-type";
+    private property <int> guide-return-page;
+    private property <string> reveal-field;
+    out property <int> capture-shortcut-kind: root.capturing ? root.pick-kind :
+        root.page == 2 ? max(1, root.pick-kind) : root.route-enabled ? 1 : 0;
+    private property <string> capture-hint: root.page == 4 ? "Sample pointer" : root.active ? "Pick" :
+        root.capture-shortcut-kind == 1 ? "Add point" :
+        root.capture-shortcut-kind == 2 ? "Inside corner" :
+        root.capture-shortcut-kind == 3 ? "Stop corner" : "Pick point";
+    private property <bool> locked: root.active || root.capturing;
+    private property <bool> valid: root.configuration-error == "";
+    private property <bool> available: root.can-start && root.input-ready;
+    private property <bool> inline-configuration-error:
+        !root.locked && !root.valid && root.has-field-row(root.configuration-field);
+    private property <bool> message-shown-inline:
+        (root.inline-configuration-error && root.message == root.configuration-error) ||
+        (root.page == 1 && root.message == root.shortcut-error) ||
+        (root.page == 3 && root.message == root.preset-error);
+    private property <string> system-blocker: root.shortcut-failure ?
+        "The shortcut listener stopped. Reopen Afterbeat to run again." :
+        !root.can-start ? "Free F7 or Ctrl+Alt+F7 in the other app, then reopen Afterbeat." :
+        root.input-failed ? "Input protection could not start. See Help → Open data folder." :
+        !root.input-ready ? "Starting input protection…" : "";
+    private property <string> control-blocker: !root.armed ?
+        "Automation is disarmed. Enable the master switch in Timing." :
+        root.hold-activation && !root.has-toggle ? "Apply an activation shortcut in Timing." : "";
+    private property <string> readiness-blocker: root.system-blocker != "" ? root.system-blocker :
+        root.control-blocker != "" ? root.control-blocker : root.configuration-error;
+    private property <string> readiness-field: root.system-blocker != "" ? "" :
+        !root.armed ? "armed" : root.hold-activation && !root.has-toggle ? "shortcut" : root.configuration-field;
+    private property <int> readiness-page:
+        root.readiness-field == "route" || root.readiness-field == "inside" || root.readiness-field == "filter" ? 2 :
+        root.readiness-field == "press" || root.readiness-field == "rate" || root.readiness-field == "time" ||
+        root.readiness-field == "armed" || root.readiness-field == "shortcut" ? 1 : 0;
+    private property <string> footer-error: root.system-blocker != "" ? root.system-blocker :
+        root.control-blocker != "" ? root.control-blocker :
+        !root.locked && !root.inline-configuration-error && !root.valid ? root.configuration-error :
+        root.message-error && !root.message-shown-inline ? root.message : "";
+    private property <bool> show-run-button: root.page != 4 && (root.active || !root.hold-activation);
+    private property <string> run-button-label: root.stopping ? "Stopping…" : root.active ? "Stop run" : "Start run";
+    private property <bool> run-button-enabled: root.page != 4 && !root.stopping && !root.capturing &&
+        (root.active || (root.available && root.valid && root.armed && !root.hold-activation));
+    private property <string> hold-instructions: root.page != 4 && root.hold-activation &&
+        !root.active && !root.capturing && root.available && root.valid && root.armed && root.has-toggle ?
+        "Hold " + root.toggle-key + " to start. Release to stop." : "";
+    private property <string> run-metrics: root.session-count + " actions  ·  " +
+        (root.session-rate == "—" ? "—" : root.session-rate + "/s") + "  ·  " + root.session-elapsed;
+    private property <string> setup-summary:
+        (root.keyboard ? "Keyboard" : root.double-click ? "Double click" : "Mouse") + "  ·  " + root.pace-value + "  ·  " +
+        (root.route-enabled ? "\{root.route-count}-point route" : root.keyboard ? "Foreground app" :
+            root.fixed-target ? "Fixed point · " + root.point-label : "Follow cursor") +
+        root.limit-summary +
+        (!root.hold-activation && root.delay > 0 ? "  ·  \{root.delay} s delay" : "") +
+        (root.low-cpu && root.low-cpu-available ? "  ·  Low CPU" : "") +
+        (root.guard-summary == "" ? "" : "  ·  " + root.guard-summary);
+    private property <[Shortcut]> shortcuts: [
+        { key: root.toggle-key, label: root.hold-activation ? "Hold" : "Toggle",
+            available: root.page != 4 && root.has-toggle && !root.capturing },
+        { key: root.stop-key, label: root.capturing ? "Cancel" : "Stop",
+            available: (root.page != 4 || root.capturing) && root.stop-key != "—" },
+        { key: root.capture-key, label: root.capture-hint,
+            available: !root.active && (root.page != 4 || root.capturing) && root.capture-key != "—" },
+    ];
+
+    function has-field-row(field: string) -> bool {
+        if (root.page == 0) {
+            return field == "cadence" || field == "repeat" ||
+                (root.keyboard && field == "input") ||
+                (!root.keyboard && field == "click-type") ||
+                ((!root.keyboard || root.route-enabled) && field == "target");
+        }
+        if (root.page == 1) {
+            return field == "cadence" || field == "press" || field == "rate" || field == "time" || field == "shortcut";
+        }
+        return root.page == 2 && (field == "route" || field == "inside" || field == "filter");
+    }
+
+    function field-error(field: string) -> string {
+        return !root.locked && root.configuration-field == field ? root.configuration-error : "";
+    }
+    private property <[string]> unit-labels: ["ms", "s", "min", "h", "day", "/s", "/min", "/h", "/day"];
+    private property <string> unit-label: root.unit-labels[root.interval-unit];
+    private property <[string]> page-titles: ["Clicker", "Timing", "Targets", "Presets"];
+    private property <[string]> page-descriptions: [
+        "Choose an input, set its pace, and decide where it runs.",
+        "Fine-tune the cadence, press duration, and activation shortcut.",
+        "Build a route or restrict where automation can run.",
+        "Save a setup for later or load a saved configuration."
+    ];
+
+    public function test-pad-at(x: length, y: length) -> bool {
+        return x >= pad.absolute-position.x && x < pad.absolute-position.x + pad.width &&
+               y >= pad.absolute-position.y && y < pad.absolute-position.y + pad.height;
+    }
+
+    public function show-dry-run() {
+        root.dry-step = -1;
+        root.dry-playing = false;
+        if (root.page != 4) { root.show-page(4); }
+    }
+
+    function advance-dry-run() {
+        if (!root.dry-at-end) {
+            root.dry-step += 1;
+        }
+        if (root.dry-at-end) {
+            root.dry-playing = false;
+        }
+    }
+
+    Timer {
+        interval: 550ms;
+        running: root.dry-playing;
+        triggered => { root.advance-dry-run(); }
+    }
+
+    function show-page(index: int) {
+        root.dry-playing = false;
+        root.page = index;
+        root.confirm-preset = 0;
+        root.reveal-field = "";
+        scroll.content-y = 0px;
+    }
+
+    function show-blocking-setting() {
+        root.show-page(root.readiness-page);
+        root.reveal-field = root.readiness-field;
+    }
+
+    function reveal-setting(y: length) {
+        scroll.content-y = clamp(scroll.content-y + scroll.absolute-position.y - y + 12px,
+            min(0px, scroll.visible-height - scroll.content-height), 0px);
+        root.reveal-field = "";
+    }
+
+    help-menu := PopupWindow {
+        width: 182px * Theme.text-scale;
+        height: 121px * Theme.text-scale;
+        x: help-button.absolute-position.x;
+        y: help-button.absolute-position.y - self.height - 4px;
+        Rectangle {
+            background: Theme.high-contrast ? Theme.background : #2a2a2a;
+            border-width: Theme.high-contrast ? 1px : 0px;
+            border-color: Theme.divider;
+            border-radius: 7px;
+            VerticalLayout {
+                padding: 5px;
+                spacing: 3px;
+                ActionButton {
+                    label: "User guide"; left-align: true; segment: true; enabled: !root.capturing;
+                    activated => {
+                        help-menu.close();
+                        if (root.page != 5) {
+                            root.guide-return-page = root.page;
+                            root.show-page(5);
+                        }
+                    }
+                }
+                ActionButton { label: "Open data folder"; left-align: true; segment: true;
+                    activated => { help-menu.close(); root.open-data-folder(); } }
+                ActionButton { label: "About Afterbeat"; left-align: true; segment: true;
+                    activated => { help-menu.close(); about.show(); } }
+            }
+        }
+    }
+
+    shortcuts-menu := PopupWindow {
+        width: min(450px, run-bar.width);
+        height: shortcut-menu-content.preferred-height;
+        x: run-bar.absolute-position.x;
+        y: run-bar.absolute-position.y - self.height - 4px;
+        Rectangle {
+            background: Theme.surface;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.field-border;
+            shortcut-menu-content := VerticalLayout {
+                padding: 10px;
+                spacing: 5px;
+                for shortcut in root.shortcuts: Label {
+                    text: shortcut.label + "  " + shortcut.key;
+                    color: shortcut.available ? Theme.text : Theme.muted;
+                    wrap: word-wrap;
+                }
+                ActionButton { label: "Close"; activated => { shortcuts-menu.close(); } }
+            }
+        }
+    }
+
+    about := PopupWindow {
+        width: 336px * min(1.55, Theme.text-scale);
+        height: 177px * min(1.8, Theme.text-scale);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        Rectangle {
+            background: Theme.high-contrast ? Theme.background : #2a2a2a;
+            border-width: Theme.high-contrast ? 1px : 0px;
+            border-color: Theme.divider;
+            border-radius: 9px;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 5px;
+                Label { text: "Afterbeat 1.2.6"; horizontal-alignment: center; font-weight: 650; }
+                AboutSlint { vertical-stretch: 1; }
+                ActionButton { label: "Close"; activated => { about.close(); } }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        Rectangle {
+            width: root.compact ? 66px : 172px;
+            background: Theme.sidebar;
+            VerticalLayout {
+                padding: root.compact ? 7px : 14px;
+                spacing: root.compact ? 6px : 7px;
+                HorizontalLayout {
+                    height: 44px;
+                    spacing: 8px;
+                    alignment: root.compact ? center : start;
+                    Image {
+                        source: @image-url("afterbeat.svg");
+                        width: 30px; height: 30px;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    if (!root.compact): Label { text: "Afterbeat"; font-size: 17px * Theme.text-scale; font-weight: 680; }
+                }
+                Rectangle { height: root.compact ? 5px : 11px; }
+                for item[i] in root.page-titles: ActionButton {
+                    label: root.compact ? "" : item;
+                    hint: item;
+                    icon-only: root.compact;
+                    icon: root.nav-icons[i];
+                    left-align: true;
+                    segment: true;
+                    selected: (root.page == 4 ? 2 : root.page) == i;
+                    height: 39px;
+                    enabled: !root.capturing;
+                    activated => { root.show-page(i); }
+                }
+                Rectangle { vertical-stretch: 1; min-height: 5px; }
+                pad := TestPad { compact: root.compact; count: root.pad-count; hit => { root.test-hit(); } }
+                FlexboxLayout {
+                    flex-wrap: wrap;
+                    spacing-vertical: 3px;
+                    help-button := ActionButton {
+                        label: root.compact && Theme.text-scale > 1.5 ? "?" : "Help";
+                        hint: "Help";
+                        segment: true;
+                        left-align: !root.compact;
+                        width: root.compact ? 52px : 64px;
+                        height: root.compact ? 32px : 32px * Theme.text-scale;
+                        activated => { help-menu.show(); }
+                    }
+                    if (!root.compact): Rectangle { horizontal-stretch: 1; }
+                    ActionButton {
+                        label: root.compact && Theme.text-scale > 1.5 ? "↺" : "Reset";
+                        preferred-width: root.compact ? 52px : 50px;
+                        hint: "Reset test pad count";
+                        segment: true;
+                        height: root.compact ? 32px : 32px * Theme.text-scale;
+                        enabled: root.pad-count != "0";
+                        activated => { root.reset-pad(); }
+                    }
+                }
+            }
+        }
+        Rectangle { width: 1px; background: Theme.divider; }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            scroll := ScrollView {
+                vertical-stretch: 1;
+                content-width: self.visible-width;
+                content-height: body.preferred-height;
+                body := VerticalLayout {
+                    width: scroll.visible-width;
+                    height: self.preferred-height;
+                    padding-left: root.compact ? 16px : 27px;
+                    padding-right: root.compact ? 16px : 28px;
+                    padding-top: root.compact ? 14px : 22px;
+                    padding-bottom: root.compact ? 14px : 22px;
+                    spacing: root.compact ? 10px : 14px;
+                    VerticalLayout {
+                        spacing: 4px;
+                        Label {
+                            text: root.page == 5 ? "User guide" : root.page == 4 ? "Dry run" : root.page-titles[root.page];
+                            font-size: (root.large-text ? 22px : 28px) * Theme.text-scale;
+                            font-weight: 680;
+                            height: (root.large-text ? 28px : 36px) * Theme.text-scale;
+                        }
+                        if (root.page < 4 && (!root.compact || root.page != 0)): Secondary {
+                            text: root.page-descriptions[root.page];
+                            font-size: 13px * Theme.text-scale;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Rule {}
+                    if (root.page == 0): VerticalLayout {
+                        spacing: 8px;
+                        if (!root.compact): SectionTitle { text: "Pace and input"; }
+                        FieldRow {
+                            compact: root.stack-fields && !root.large-text;
+                            label-width: root.large-text ? 100px : 108px;
+                            label: root.interval-unit < 5 ? "Interval" : "Rate";
+                            error: root.field-error("cadence");
+                            reveal: root.reveal-field == "cadence";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                horizontal-stretch: 0;
+                                NumberField {
+                                    width: (root.large-text ? 104px : 108px) * min(1.4, Theme.text-scale);
+                                    label: "Click interval or rate"; error: root.field-error("cadence");
+                                    enabled: !root.locked && !root.random-rate && !root.hold-down;
+                                    value <=> root.interval-text;
+                                    edited => { root.settings-edited(); }
+                                }
+                                CadenceUnit {
+                                    width: (root.large-text ? 74px : 76px) * min(1.75, Theme.text-scale);
+                                    short-labels: true;
+                                    enabled: !root.locked && !root.random-rate && !root.hold-down;
+                                    current-index: root.interval-unit;
+                                    selected => { root.select-unit(self.current-index); }
+                                }
+                            }
+                            if (!root.compact): IntervalPresets {
+                                enabled: !root.locked;
+                                selected(millis) => { root.preset-interval(millis); }
+                            }
+                            Secondary { text: root.pace-value; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields && !root.large-text;
+                            label-width: (root.large-text ? 82px : 108px) * Theme.text-scale;
+                            label: "Input";
+                            Choices {
+                                width: 129px * min(1.8, Theme.text-scale);
+                                labels: ["Mouse", "Key"];
+                                current: root.keyboard ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => { root.keyboard = index == 1; root.settings-edited(); }
+                            }
+                            if (!root.keyboard): Choices {
+                                width: 225px * min(1.8, Theme.text-scale);
+                                labels: ["Left", "Right", "Middle"];
+                                current: root.button-mode;
+                                enabled: !root.locked;
+                                selected(index) => { root.button-mode = index; root.settings-edited(); }
+                            }
+                        }
+                        if (root.keyboard): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Key output";
+                            error: root.field-error("input");
+                            reveal: root.reveal-field == "input";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 129px * min(1.8, Theme.text-scale);
+                                labels: ["Key press", "Text"];
+                                current: root.text-output ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => { root.text-output = index == 1; root.settings-edited(); }
+                            }
+                            if (!root.text-output): NumberField {
+                                width: 125px * min(1.6, Theme.text-scale);
+                                label: "Output key"; error: root.field-error("input");
+                                enabled: !root.locked;
+                                value <=> root.key-text;
+                                edited => { root.settings-edited(); }
+                            }
+                            if (root.text-output): NumberField {
+                                width: 125px * min(1.6, Theme.text-scale);
+                                label: "Text character"; error: root.field-error("input");
+                                enabled: !root.locked;
+                                value <=> root.text-character;
+                                edited => { root.settings-edited(); }
+                            }
+                            Secondary { text: root.text-output ? "One literal character" : "e.g. Space, A, Enter"; }
+                        }
+                        if (!root.compact && !root.keyboard): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Click type";
+                            error: root.field-error("click-type");
+                            reveal: root.reveal-field == "click-type";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 168px * min(1.8, Theme.text-scale);
+                                labels: ["Single", "Double"];
+                                current: root.double-click ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => { root.double-click = index == 1; root.settings-edited(); }
+                            }
+                        }
+                        if (!root.compact): SectionTitle { text: "Target and limits"; }
+                        if (!root.keyboard || root.route-enabled): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Target";
+                            error: root.field-error("target");
+                            reveal: root.reveal-field == "target";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            if (root.route-enabled): Secondary { text: "\{root.route-count} points"; }
+                            if (root.route-enabled): ActionButton { label: "Edit route"; activated => { root.show-page(2); } }
+                            if (!root.route-enabled): Choices {
+                                width: 202px * min(1.8, Theme.text-scale);
+                                labels: ["Follow cursor", "Fixed point"];
+                                current: root.fixed-target ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => { root.fixed-target = index == 1; root.settings-edited(); }
+                            }
+                            if (!root.route-enabled && (!root.compact || root.fixed-target || root.capturing)): ActionButton {
+                                label: root.capturing ? "Cancel" : "Pick in 3s";
+                                min-width: 78px;
+                                enabled: !root.active;
+                                activated => { root.capture-point(0); }
+                            }
+                            if (!root.route-enabled && root.fixed-target): Secondary {
+                                text: root.point-label;
+                                min-width: 125px;
+                            }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Repeat";
+                            error: root.field-error("repeat");
+                            reveal: root.reveal-field == "repeat";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 202px * min(1.8, Theme.text-scale);
+                                labels: ["Continuous", "Counted"];
+                                current: root.limited ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => { root.limited = index == 1; root.settings-edited(); }
+                            }
+                            if (root.limited): NumberField {
+                                width: 108px * min(1.6, Theme.text-scale);
+                                label: "Number of actions"; error: root.field-error("repeat");
+                                unit: "×";
+                                enabled: !root.locked;
+                                value <=> root.count-text;
+                                edited => { root.settings-edited(); }
+                            }
+                        }
+                        if (root.compact): FlexboxLayout {
+                            alignment: start;
+                            flex-wrap: wrap;
+                            spacing: 8px;
+                            ActionButton {
+                                label: root.show-clicker-options ? "Fewer options" : "More options";
+                                enabled: root.configuration-field != "click-type";
+                                activated => { root.clicker-options = !root.clicker-options; }
+                            }
+                            if (!root.clicker-options && !root.hold-activation): Secondary {
+                                text: root.delay > 0 ? "\{root.delay} s start delay" : "No start delay";
+                            }
+                        }
+                        if (root.compact && root.show-clicker-options): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Quick intervals";
+                            IntervalPresets {
+                                enabled: !root.locked;
+                                selected(millis) => { root.preset-interval(millis); }
+                            }
+                        }
+                        if (root.compact && root.show-clicker-options && !root.keyboard): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Click type";
+                            error: root.field-error("click-type");
+                            reveal: root.reveal-field == "click-type";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 168px * min(1.8, Theme.text-scale);
+                                labels: ["Single", "Double"];
+                                current: root.double-click ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => { root.double-click = index == 1; root.settings-edited(); }
+                            }
+                        }
+                        if (root.show-clicker-options): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Start delay";
+                            Choices {
+                                width: 225px * min(1.8, Theme.text-scale);
+                                labels: ["None", "1 s", "3 s"];
+                                current: root.delay == 3 ? 2 : root.delay;
+                                enabled: !root.locked && !root.hold-activation;
+                                selected(index) => { root.delay = index == 2 ? 3 : index; root.settings-edited(); }
+                            }
+                            if (root.hold-activation): Secondary { text: "Hold starts immediately"; }
+                        }
+                        if (root.large-text): Secondary { text: root.setup-summary; wrap: word-wrap; }
+                    }
+
+                    if (root.page == 1): VerticalLayout {
+                        spacing: 8px;
+                        SectionTitle { text: "Cadence and press"; }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Cadence";
+                            error: root.field-error("cadence");
+                            NumberField {
+                                width: 108px * min(1.6, Theme.text-scale); label: "Click interval or rate"; error: root.field-error("cadence"); unit: root.unit-label;
+                                enabled: !root.locked && !root.random-rate && !root.hold-down;
+                                value <=> root.interval-text;
+                                edited => { root.settings-edited(); }
+                            }
+                            CadenceUnit {
+                                width: 166px * min(2.25, Theme.text-scale);
+                                enabled: !root.locked && !root.random-rate && !root.hold-down;
+                                current-index: root.interval-unit;
+                                selected => { root.select-unit(self.current-index); }
+                            }
+                            Secondary { text: root.pace-value; min-width: 90px; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Press";
+                            error: root.field-error("press");
+                            reveal: root.reveal-field == "press";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 241px * min(1.8, Theme.text-scale);
+                                labels: ["Tap", "Timed", "Hold down"];
+                                current: root.hold-down ? 2 : root.timed-press ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => {
+                                    root.hold-down = index == 2;
+                                    if (index == 0) { root.press-text = "0"; }
+                                    if (index == 1 && !root.timed-press) { root.press-text = "30"; }
+                                    if (index != 2) { root.timed-press = index == 1; }
+                                    root.settings-edited();
+                                }
+                            }
+                            if (!root.hold-down && root.timed-press): NumberField {
+                                width: 95px * min(1.6, Theme.text-scale); label: "Press duration"; error: root.field-error("press"); unit: "ms"; enabled: !root.locked;
+                                value <=> root.press-text;
+                                edited => { root.settings-edited(); }
+                            }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Variable rate";
+                            error: root.field-error("rate");
+                            reveal: root.reveal-field == "rate";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 129px * min(1.8, Theme.text-scale); labels: ["Off", "On"];
+                                current: root.random-rate ? 1 : 0;
+                                enabled: !root.locked && !root.hold-down;
+                                selected(index) => { root.random-rate = index == 1; root.settings-edited(); }
+                            }
+                            if (root.random-rate && !root.hold-down): NumberField {
+                                width: 77px * min(1.6, Theme.text-scale); label: "Minimum actions per second"; error: root.field-error("rate"); enabled: !root.locked;
+                                value <=> root.min-rate;
+                                edited => { root.settings-edited(); }
+                            }
+                            if (root.random-rate && !root.hold-down): Secondary { text: "to"; }
+                            if (root.random-rate && !root.hold-down): NumberField {
+                                width: 83px * min(1.6, Theme.text-scale); label: "Maximum actions per second"; error: root.field-error("rate"); unit: "/s"; enabled: !root.locked;
+                                value <=> root.max-rate;
+                                edited => { root.settings-edited(); }
+                            }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Time limit";
+                            error: root.field-error("time");
+                            reveal: root.reveal-field == "time";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            NumberField {
+                                width: 108px * min(1.6, Theme.text-scale); label: "Time limit in seconds"; error: root.field-error("time"); unit: "s"; enabled: !root.locked;
+                                value <=> root.time-limit;
+                                edited => { root.settings-edited(); }
+                            }
+                            Secondary { text: "0 = off"; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Pacing";
+                            Choices {
+                                width: 168px * min(1.8, Theme.text-scale);
+                                labels: ["Precise", "Low CPU"];
+                                current: root.low-cpu ? 1 : 0;
+                                enabled: !root.locked && (root.low-cpu-available || root.low-cpu);
+                                selected(index) => { root.low-cpu = index == 1; root.settings-edited(); }
+                            }
+                        }
+                        Secondary {
+                            wrap: word-wrap;
+                            text: root.low-cpu-available
+                                ? "Low CPU sends clicks in groups, with less even spacing."
+                                : "This setup uses Precise. Low CPU needs fixed-rate single mouse taps at 50–1,000 /s, Toggle, an unmodified shortcut, and no route or guards.";
+                        }
+                        SectionTitle { text: "Activation"; }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Activation";
+                            Choices {
+                                width: 168px * min(1.8, Theme.text-scale); labels: ["Toggle", "Hold"];
+                                current: root.hold-activation ? 1 : 0; enabled: !root.locked;
+                                selected(index) => { root.hold-activation = index == 1; root.settings-edited(); }
+                            }
+                        }
+                        shortcut_row := FieldRow {
+                            compact: root.stack-fields;
+                            label: "Shortcut";
+                            error: root.shortcut-error != "" ? root.shortcut-error : root.field-error("shortcut");
+                            reveal: root.reveal-field == "shortcut";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            NumberField {
+                                width: 148px * min(1.6, Theme.text-scale); label: "Activation shortcut"; error: shortcut_row.error; enabled: !root.locked;
+                                value <=> root.trigger-text;
+                                edited => { root.shortcut-error = ""; }
+                            }
+                            ActionButton { label: "Apply"; enabled: !root.locked; activated => { root.apply-shortcut(); } }
+                            Secondary { text: "e.g. F6, Ctrl+Alt+G, Mouse4"; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Master switch";
+                            reveal: root.reveal-field == "armed";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 129px * min(1.8, Theme.text-scale); labels: ["Off", "On"]; current: root.armed ? 1 : 0; enabled: !root.locked;
+                                selected(index) => { root.armed = index == 1; root.settings-edited(); }
+                            }
+                        }
+                    }
+
+                    if (root.page == 2): VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            SectionTitle { text: "Click route"; horizontal-stretch: 1; }
+                            ActionButton {
+                                label: "Dry run";
+                                enabled: !root.locked;
+                                activated => { root.open-dry-run(); }
+                            }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Route";
+                            error: root.field-error("route");
+                            reveal: root.reveal-field == "route";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 221px * min(1.8, Theme.text-scale); labels: ["Off", "Loop", "Once"];
+                                current: !root.route-enabled ? 0 : root.route-once ? 2 : 1;
+                                enabled: !root.locked;
+                                selected(index) => {
+                                    root.route-enabled = index != 0;
+                                    root.route-once = index == 2;
+                                    root.settings-edited();
+                                }
+                            }
+                            NumberField {
+                                width: 83px * min(1.6, Theme.text-scale); label: "Point radius in pixels"; error: root.field-error("route"); unit: "px"; enabled: !root.locked;
+                                value <=> root.route-radius;
+                                edited => { root.settings-edited(); }
+                            }
+                            Secondary { text: "Radius"; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Route points";
+                            ActionButton {
+                                label: root.capturing && root.pick-kind == 1 ? "Cancel" : "Add in 3s";
+                                enabled: !root.active && (!root.capturing || root.pick-kind == 1);
+                                activated => { root.capture-point(1); }
+                            }
+                            ActionButton { label: "Move up"; enabled: !root.locked && root.route-index > 0; activated => { root.edit-route(-1); } }
+                            ActionButton { label: "Move down"; enabled: !root.locked && root.route-index >= 0 && root.route-index + 1 < root.route-count; activated => { root.edit-route(1); } }
+                            ActionButton { label: "Remove"; enabled: !root.locked && root.route-index >= 0; activated => { root.edit-route(0); } }
+                        }
+                        SelectionList {
+                            label: "Route points";
+                            rows: root.route-rows;
+                            selected: root.route-index;
+                            enabled: !root.locked;
+                            empty-text: "Add a point by moving the pointer to its position.";
+                            chosen(index, name) => { root.route-index = index; }
+                        }
+                        Rule {}
+                        SectionTitle { text: "Zones and filters"; }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Screen stop";
+                            Choices {
+                                width: 226px * min(1.8, Theme.text-scale); labels: ["Off", "Corners", "Edges"]; current: root.edge-mode; enabled: !root.locked;
+                                selected(index) => { root.edge-mode = index; root.settings-edited(); }
+                            }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Inside only";
+                            error: root.field-error("inside");
+                            reveal: root.reveal-field == "inside";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            ActionButton {
+                                label: root.capturing && root.pick-kind == 2 ? "Cancel" : "Pick corner";
+                                enabled: !root.active && (!root.capturing || root.pick-kind == 2);
+                                activated => { root.capture-point(2); }
+                            }
+                            ActionButton { label: "Clear"; enabled: !root.locked && root.inside-label != "Unset"; activated => { root.clear-zone(2); } }
+                            Secondary { text: root.inside-label; min-width: 150px; wrap: word-wrap; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Stop zone";
+                            ActionButton {
+                                label: root.capturing && root.pick-kind == 3 ? "Cancel" : "Pick corner";
+                                enabled: !root.active && (!root.capturing || root.pick-kind == 3);
+                                activated => { root.capture-point(3); }
+                            }
+                            ActionButton { label: "Clear"; enabled: !root.locked && root.stop-zone-label != "Unset"; activated => { root.clear-zone(3); } }
+                            Secondary { text: root.stop-zone-label; min-width: 150px; wrap: word-wrap; }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "App filter";
+                            error: root.field-error("filter");
+                            reveal: root.reveal-field == "filter";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 205px * min(1.8, Theme.text-scale); labels: ["Off", "Allow", "Block"];
+                                current: root.process-mode; enabled: !root.locked;
+                                selected(index) => { root.process-mode = index; root.settings-edited(); }
+                            }
+                            if (root.process-mode != 0): NumberField {
+                                width: 177px * min(1.6, Theme.text-scale); label: "Executable names, separated by commas"; error: root.field-error("filter"); enabled: !root.locked;
+                                value <=> root.process-names;
+                                edited => { root.settings-edited(); }
+                            }
+                            if (root.process-mode != 0 && root.process-names == ""): Secondary { text: "app.exe"; }
+                        }
+                        Secondary {
+                            wrap: word-wrap;
+                            text: root.capture-key + (root.capture-shortcut-kind == 2 ? " captures an inside-only corner" :
+                                  root.capture-shortcut-kind == 3 ? " captures a stop-zone corner" : " adds a route point");
+                        }
+                    }
+
+                    if (root.page == 4): VerticalLayout {
+                        spacing: 10px;
+                        Label { text: root.dry-source; font-weight: 650; wrap: word-wrap; }
+                        FlexboxLayout {
+                            alignment: start;
+                            flex-wrap: wrap;
+                            spacing: 8px;
+                            ActionButton { label: "Back to Targets"; enabled: !root.capturing; activated => { root.show-page(2); } }
+                            if (root.dry-sample-allowed): ActionButton {
+                                label: root.capturing ? "Cancel sample" : "Sample pointer in 3 s";
+                                primary: !root.capturing;
+                                activated => { root.sample-dry-run(); }
+                            }
+                            if (root.route-enabled && root.dry-points.length > 0): ActionButton {
+                                label: root.dry-playing ? "Pause" : "Play";
+                                primary: true;
+                                enabled: root.dry-playing || !root.dry-at-end;
+                                activated => { root.dry-playing = !root.dry-playing; }
+                            }
+                            if (root.route-enabled && root.dry-points.length > 0): ActionButton {
+                                label: "Step";
+                                enabled: !root.dry-playing && !root.dry-at-end;
+                                activated => { root.advance-dry-run(); }
+                            }
+                            if (root.route-enabled && root.dry-points.length > 0): ActionButton {
+                                label: "Reset";
+                                enabled: root.dry-step >= 0 || root.dry-playing;
+                                activated => { root.dry-playing = false; root.dry-step = -1; }
+                            }
+                        }
+                        Label {
+                            text: root.readiness-blocker == "" ? "Run readiness · Settings checks passed" :
+                                "Run blocked · " + root.readiness-blocker;
+                            color: root.readiness-blocker == "" ? Theme.muted : Theme.error;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                        if (root.readiness-blocker != "" && root.readiness-field != ""): HorizontalLayout {
+                            alignment: start;
+                            ActionButton {
+                                label: "Fix in " + root.page-titles[root.readiness-page];
+                                enabled: !root.capturing;
+                                activated => { root.show-blocking-setting(); }
+                            }
+                        }
+                        Label {
+                            text: root.dry-points.length == 0 ?
+                                (root.dry-sample-allowed ? "Sample the pointer to check a specific location." : "No saved target points to preview.") :
+                                !root.route-enabled ? root.dry-points[0].location + " · " + root.dry-points[0].result :
+                                root.dry-step < 0 ? "Ready to preview \{root.dry-points.length} saved point(s)." :
+                                "Point \{root.dry-step + 1} of \{root.dry-points.length} · " +
+                                root.dry-points[root.dry-step].location + " · " + root.dry-points[root.dry-step].result;
+                            color: root.dry-preview-point >= 0 &&
+                                root.dry-points[root.dry-preview-point].blocked ? Theme.error : Theme.text;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                        DryMap {
+                            height: root.compact ? 210px : 252px;
+                            areas: root.dry-areas;
+                            points: root.dry-points;
+                            aspect: root.dry-aspect;
+                            step: root.dry-preview-point;
+                        }
+                        Secondary {
+                            text: "Blue · preview points    Teal · inside-only zone    Red · stop zone or blocked point";
+                            wrap: word-wrap;
+                        }
+                        Secondary {
+                            text: root.dry-sample-allowed ?
+                                "Checks screen edges and zones at the sampled point. Live pointer movement and app filters can change a run." :
+                                "Checks saved point centers for screen edges and zones. Radius rings show possible offsets. Live pointer position and app filters can change a run.";
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    if (root.page == 5): VerticalLayout {
+                        spacing: 10px;
+                        HorizontalLayout {
+                            alignment: start;
+                            ActionButton {
+                                label: "Back";
+                                activated => {
+                                    if (root.guide-return-page == 4 && !root.active) { root.open-dry-run(); }
+                                    else if (root.guide-return-page == 4) { root.show-page(2); }
+                                    else { root.show-page(root.guide-return-page); }
+                                }
+                            }
+                        }
+                        SectionTitle { text: "Start and stop"; }
+                        Label {
+                            text: "Choose the interval, input, target, and repeat mode on Clicker. Select Start run or use the activation shortcut. For Follow cursor, put the pointer over the target during the countdown.";
+                            wrap: word-wrap;
+                        }
+                        Label {
+                            text: "Use Stop run or the Stop shortcut to end a run. In Hold mode, hold the activation shortcut to run and release it to stop. Use the Test pad to check that clicks arrive.";
+                            wrap: word-wrap;
+                        }
+                        SectionTitle { text: "Timing and shortcuts"; }
+                        Label {
+                            text: "Open Timing to change the interval unit, press duration, time limit, or activation mode. To change the shortcut, enter a key or chord, such as F6 or Ctrl+Alt+G, and select Apply.";
+                            wrap: word-wrap;
+                        }
+                        SectionTitle { text: "Targets and safety"; }
+                        Label {
+                            text: "Choose Fixed point to capture a single location. On Targets, add and reorder route points or capture two opposite corners for a zone. Inside only pauses outside its zone. Stop zone and Screen stop end the run.";
+                            wrap: word-wrap;
+                        }
+                        Label {
+                            text: "Use Dry run to check saved points or sample a cursor location without sending input. App filters apply during a live run. Keyboard output goes to the foreground app and pauses while Afterbeat has focus.";
+                            wrap: word-wrap;
+                        }
+                        SectionTitle { text: "Save a setup"; }
+                        Label {
+                            text: "On Presets, name the current setup and select Save as new. Select a saved preset and choose Load to use it again.";
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    if (root.page == 3): VerticalLayout {
+                        spacing: 8px;
+                        SectionTitle { text: "Saved configurations"; }
+                        SelectionList {
+                            label: "Saved presets";
+                            rows: root.profile-rows;
+                            selected: root.profile-index;
+                            max-list-height: 182px;
+                            enabled: !root.locked;
+                            empty-text: "No presets yet. Name the current setup to save it.";
+                            chosen(index, name) => {
+                                root.profile-index = index;
+                                root.selected-preset = name;
+                                root.confirm-preset = 0;
+                                root.preset-error = "";
+                            }
+                        }
+                        if (root.profile-index >= 0): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Selected preset";
+                            ActionButton { label: "Load"; enabled: !root.locked;
+                                activated => { root.confirm-preset = 0; root.profile-action(1); } }
+                            ActionButton { label: "Update preset"; enabled: !root.locked;
+                                activated => { root.confirm-preset = 3; } }
+                            ActionButton { label: "Delete"; enabled: !root.locked;
+                                activated => { root.confirm-preset = 2; } }
+                        }
+                        if (root.confirm-preset != 0): VerticalLayout {
+                            spacing: 5px;
+                            Label {
+                                text: (root.confirm-preset == 3 ? "Replace the settings in “" : "Delete “") +
+                                    root.selected-preset + "”?";
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 8px;
+                                ActionButton { label: "Cancel"; activated => { root.confirm-preset = 0; } }
+                                ActionButton {
+                                    label: root.confirm-preset == 3 ? "Replace preset" : "Delete preset";
+                                    enabled: !root.locked;
+                                    danger: true;
+                                    activated => { root.profile-action(root.confirm-preset); root.confirm-preset = 0; }
+                                }
+                            }
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "New preset";
+                            error: root.preset-error;
+                            NumberField {
+                                width: 175px * min(1.6, Theme.text-scale);
+                                label: "New preset name";
+                                error: root.preset-error;
+                                enabled: !root.locked;
+                                value <=> root.profile-name;
+                                edited => { root.preset-error = ""; }
+                            }
+                            ActionButton { label: "Save as new"; enabled: !root.locked && root.profile-name != "";
+                                activated => { root.confirm-preset = 0; root.profile-action(0); } }
+                        }
+                        Rule {}
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Lifetime";
+                            Secondary { text: root.library-stats; }
+                        }
+                    }
+                }
+            }
+            VerticalLayout {
+                vertical-stretch: 0;
+                padding-left: root.compact ? 16px : 27px;
+                padding-right: root.compact ? 16px : 28px;
+                padding-bottom: root.large-text ? 8px : 16px;
+                spacing: 6px;
+                if (root.save-error != ""): Label {
+                    text: root.save-error;
+                    color: Theme.error;
+                    wrap: word-wrap;
+                    accessible-live-region: assertive;
+                }
+                if (root.page != 4 && root.footer-error != ""): Label {
+                    text: root.footer-error;
+                    color: Theme.error;
+                    wrap: word-wrap;
+                    accessible-live-region: assertive;
+                }
+                if (root.page != 4 && root.run-state == "" && !root.capturing &&
+                    root.hold-instructions == "" && !root.large-text): Secondary {
+                    text: root.setup-summary;
+                    wrap: word-wrap;
+                }
+                if (root.page != 4 && root.run-state != "" && (!root.large-text || !root.capturing)): FlexboxLayout {
+                    flex-wrap: wrap;
+                    cross-axis-alignment: center;
+                    spacing-horizontal: 10px;
+                    Label {
+                        text: root.run-state;
+                        height: 20px * Theme.text-scale;
+                        color: root.active ? Theme.accent : Theme.muted;
+                        font-weight: 650;
+                        accessible-live-region: polite;
+                    }
+                    Secondary {
+                        text: root.run-metrics;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: right;
+                        wrap: word-wrap;
+                    }
+                }
+                if (root.page != 4 && !root.message-error && root.message != "" && root.run-state != "Paused"): Secondary {
+                    text: root.message;
+                    wrap: word-wrap;
+                }
+                if (root.page != 4 && root.run-state == "Paused" && root.message != "" && !root.message-error): Secondary {
+                    text: root.message;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if (root.page == 4): Label {
+                    text: root.dry-message == "" ? "Simulation only · no input is sent" : root.dry-message;
+                    color: root.dry-error ? Theme.error : Theme.muted;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if (root.hold-instructions != ""): Label {
+                    text: root.hold-instructions;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                run-bar := Rectangle {
+                    private property <bool> inline-shortcuts: !root.compact && hints.min-width <= hints.width;
+                    height: root.page == 4 && !root.capturing ? 0px : 34px * Theme.text-scale + 12px;
+                    visible: self.height > 0px;
+                    background: Theme.inset;
+                    border-width: 1px;
+                    border-color: Theme.divider;
+                    border-radius: 9px;
+                    hints := HorizontalLayout {
+                        x: 10px;
+                        y: 6px;
+                        width: parent.width - 16px - (root.show-run-button ? 128px * min(1.5, Theme.text-scale) + 10px : 0px);
+                        height: 34px * Theme.text-scale;
+                        visible: run-bar.inline-shortcuts;
+                        alignment: start;
+                        spacing: root.compact ? 5px : 10px;
+                        for shortcut in root.shortcuts: ShortcutHint {
+                            shortcut: shortcut;
+                        }
+                    }
+                    if (!run-bar.inline-shortcuts && (root.page != 4 || root.capturing)): ActionButton {
+                        x: 6px;
+                        y: 6px;
+                        width: self.preferred-width + 8px;
+                        height: 34px * Theme.text-scale;
+                        label: "Shortcuts";
+                        segment: true;
+                        activated => { shortcuts-menu.show(); }
+                    }
+                    if (root.show-run-button): RunButton {
+                        x: parent.width - self.width - 6px;
+                        y: parent.height - self.height - 6px;
+                        label: root.run-button-label;
+                        key-hint: root.active && !run-bar.inline-shortcuts && root.stop-key != "—" ? root.stop-key : "";
+                        primary: !root.active && !root.hold-activation;
+                        danger: root.active;
+                        enabled: root.run-button-enabled;
+                        activated => { root.toggle-run(); }
+                    }
+                }
+            }
+        }
+    }
+}

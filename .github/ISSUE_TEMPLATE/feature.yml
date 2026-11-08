@@ -1,0 +1,17 @@
+name: Feature request
+description: Propose an improvement to Afterbeat.
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What are you trying to do?
+      description: Describe the workflow and where the current app gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include an example if it helps explain the change.
+    validations:
+      required: true

@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible problem with Afterbeat.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use the [security policy](https://github.com/XeinTDM/Afterbeat/blob/main/SECURITY.md) for vulnerabilities. Remove personal data from logs, screenshots, and settings before sharing them.
+  - type: input
+    id: version
+    attributes:
+      label: Afterbeat version
+      placeholder: 1.2.6
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and build
+      description: Run `winver` to find the build number.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: For delivery issues, include the activation mode, output, pace, and target if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or diagnostics
+      description: Help → Open data folder shows diagnostics.log.
