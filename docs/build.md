@@ -16,10 +16,11 @@ Open `target\release\afterbeat.exe`.
 
 ```powershell
 .\scripts\verify.ps1
+py -3.12 -m pip install -r scripts/delivery/requirements.txt
 py -3.12 -B -m unittest discover -s scripts/delivery -p 'test_*.py'
 ```
 
-The PowerShell script checks formatting, runs Clippy and Rust tests, builds the release executable, and runs offscreen keyboard, Dry run, and compact preview checks. The Python command runs the delivery harness unit tests using Python 3.12 and its standard library. For a local scheduler check, use the following command.
+The PowerShell script checks formatting, runs Clippy and Rust tests, builds the release executable, and runs offscreen keyboard, Dry run, and compact preview checks. The Python tests cover the delivery harness and use the pinned dependencies above. For a local scheduler check, use the following command.
 
 ```powershell
 cargo test --release --locked benchmark_timed_scheduler -- --ignored --nocapture

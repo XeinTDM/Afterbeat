@@ -8,6 +8,7 @@ On Windows x64, run the project checks in PowerShell 7.
 
 ```powershell
 .\scripts\verify.ps1
+py -3.12 -m pip install -r scripts/delivery/requirements.txt
 py -3.12 -B -m unittest discover -s scripts/delivery -p 'test_*.py'
 ```
 
