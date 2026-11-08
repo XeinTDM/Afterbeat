@@ -5,22 +5,21 @@ use crate::{
     mouse::{self, Injector, Input, Press, Zone},
     settings::{Issue, Settings},
 };
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::{
     io,
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     time::{Duration, Instant},
 };
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{HWND, POINT},
     System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     },
-    UI::{
-        Input::KeyboardAndMouse::{VK_F7, VK_F8},
-        WindowsAndMessaging::{
-            GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
-            WindowFromPoint,
-        },
+    UI::WindowsAndMessaging::{
+        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+        WindowFromPoint,
     },
 };
 
@@ -31,6 +30,14 @@ pub fn prepare(
 ) -> Result<(Schedule, Injector, Guard), String> {
     if !settings.armed {
         return Err("Enable the master switch in Timing to start a run.".into());
+    }
+    #[cfg(target_os = "linux")]
+    if crate::wayland::active() && settings.keyboard && invoked.is_some_and(Binding::has_modifiers)
+    {
+        return Err(
+            "Use an unmodified global shortcut or start this Wayland keyboard run from Afterbeat."
+                .into(),
+        );
     }
     let Plan {
         mut schedule,
@@ -53,6 +60,8 @@ pub fn prepare(
         radius,
         press,
     )?;
+    #[cfg(target_os = "linux")]
+    let injector = injector.with_activation(bound);
     let guard = Guard {
         hold,
         release_modifiers: invoked.filter(|binding| hold.is_none() && binding.has_modifiers()),
@@ -81,6 +90,10 @@ pub fn validated_schedule(settings: &Settings, bound: Option<Binding>) -> Result
 }
 
 pub fn low_cpu_available(settings: &Settings, bound: Option<Binding>) -> bool {
+    #[cfg(target_os = "linux")]
+    if crate::wayland::active() {
+        return false;
+    }
     !settings.keyboard
         && !settings.double
         && !settings.hold_down
@@ -99,6 +112,34 @@ pub fn low_cpu_available(settings: &Settings, bound: Option<Binding>) -> bool {
 }
 
 fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
+    #[cfg(target_os = "linux")]
+    let native_wayland = crate::wayland::active();
+    #[cfg(not(target_os = "linux"))]
+    let native_wayland = false;
+    #[cfg(target_os = "linux")]
+    if native_wayland {
+        crate::wayland::validate(settings)?;
+    }
+    if settings.route_enabled
+        && !settings.route.is_empty()
+        && settings.route_wayland != native_wayland
+    {
+        return Err(Issue::new(
+            "route",
+            "This route uses a different desktop coordinate system. Replace its points for this session.",
+        ));
+    }
+    if !settings.route_enabled
+        && settings.fixed
+        && !settings.keyboard
+        && settings.point.is_some()
+        && settings.point_wayland != native_wayland
+    {
+        return Err(Issue::new(
+            "target",
+            "Set the fixed point again for this desktop coordinate system.",
+        ));
+    }
     let mut schedule = settings.schedule()?;
     schedule.low_cpu = schedule.low_cpu && low_cpu_available(settings, bound);
     let input = if settings.keyboard && settings.text_output {
@@ -125,7 +166,7 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
             "input",
             "Enter a key such as a, A, Space, Enter, or F5.",
         ))?;
-        if matches!(key.vk, VK_F7 | VK_F8) || bound.is_some_and(|binding| binding.vk == key.vk) {
+        if key.is_safety_key() || bound.is_some_and(|binding| binding.matches_key(key)) {
             return Err(Issue::new(
                 "input",
                 "Choose an output key different from the activation, stop, and capture keys.",
@@ -210,39 +251,64 @@ impl Guard {
     }
 
     pub fn check_destination(&mut self, target: Option<mouse::Point>) -> Gate {
-        let state = self.observe(mouse::cursor, Binding::modifiers_pressed);
-        if !matches!(state, Gate::Open) {
-            return state;
-        }
+        self.destination_target(target, mouse::cursor)
+            .err()
+            .unwrap_or(Gate::Open)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn dispatch_target(
+        &mut self,
+        target: Option<mouse::Point>,
+        cursor: mouse::Point,
+    ) -> Result<Option<u32>, Gate> {
+        self.destination_target(target, || Ok(cursor))
+    }
+
+    fn destination_target(
+        &mut self,
+        target: Option<mouse::Point>,
+        cursor: impl Fn() -> io::Result<mouse::Point>,
+    ) -> Result<Option<u32>, Gate> {
+        let foreground = self.observe_target(&cursor, Binding::modifiers_pressed)?;
         let follows_pointer = target.is_none();
         let target = if follows_pointer && !self.keyboard && self.processes.is_some() {
-            let Ok(point) = mouse::cursor() else {
-                return Gate::Stop("Windows cursor access was lost.");
-            };
-            Some(point)
+            Some(cursor().map_err(|_| Gate::Stop("Cursor access was lost."))?)
         } else {
             target
         };
         if let Some(point) = target {
             let spatial = spatial_gate(point, self.edge, self.inside, self.stop);
             if !matches!(spatial, Gate::Open) {
-                return spatial;
+                return Err(spatial);
             }
             if !self.keyboard
                 && let Some(filter) = &mut self.processes
-                && !filter.permits_mouse(point)
             {
-                return Gate::Paused(if follows_pointer {
+                let blocked = Gate::Paused(if follows_pointer {
                     PauseReason::PointerFilter
                 } else {
                     PauseReason::TargetFilter
                 });
+                #[cfg(target_os = "macos")]
+                {
+                    let pid = crate::macos::window_pid(mouse::to_quartz(point));
+                    return filter.permits(pid).then_some(Some(pid)).ok_or(blocked);
+                }
+                #[cfg(not(target_os = "macos"))]
+                if !filter.permits_mouse(point) {
+                    return Err(blocked);
+                }
             }
+            #[cfg(windows)]
             if !follows_pointer {
-                return mouse::cursor_confinement(point);
+                let gate = mouse::cursor_confinement(point);
+                if !matches!(gate, Gate::Open) {
+                    return Err(gate);
+                }
             }
         }
-        Gate::Open
+        Ok(foreground)
     }
 
     fn observe(
@@ -250,43 +316,62 @@ impl Guard {
         cursor: impl FnOnce() -> io::Result<mouse::Point>,
         modifiers_pressed: impl FnOnce(Binding) -> bool,
     ) -> Gate {
+        self.observe_target(cursor, modifiers_pressed)
+            .err()
+            .unwrap_or(Gate::Open)
+    }
+
+    fn observe_target(
+        &mut self,
+        cursor: impl FnOnce() -> io::Result<mouse::Point>,
+        modifiers_pressed: impl FnOnce(Binding) -> bool,
+    ) -> Result<Option<u32>, Gate> {
         if self.hold.is_some_and(|binding| !binding.pressed()) {
-            return Gate::Stop("Activation released.");
+            return Err(Gate::Stop("Activation released."));
         }
         let cursor_gate = if self.watch_cursor() {
             let Ok(point) = cursor() else {
-                return Gate::Stop("Windows cursor access was lost.");
+                return Err(Gate::Stop("Cursor access was lost."));
             };
             spatial_gate(point, self.edge, self.inside, self.stop)
         } else {
             Gate::Open
         };
         if matches!(cursor_gate, Gate::Stop(_)) {
-            return cursor_gate;
+            return Err(cursor_gate);
         }
         if let Some(binding) = self.release_modifiers {
             if modifiers_pressed(binding) {
-                return Gate::Paused(PauseReason::Modifiers);
+                return Err(Gate::Paused(PauseReason::Modifiers));
             }
             self.release_modifiers = None;
         }
         if !matches!(cursor_gate, Gate::Open) {
-            return cursor_gate;
+            return Err(cursor_gate);
         }
         if self.keyboard {
+            #[cfg(target_os = "linux")]
+            if crate::wayland::active() {
+                return if crate::wayland::focused() {
+                    Err(Gate::Paused(PauseReason::KeyboardFocus))
+                } else {
+                    Ok(None)
+                };
+            }
             let pid = foreground_pid();
             if pid == 0 || pid == std::process::id() {
-                return Gate::Paused(PauseReason::KeyboardFocus);
+                return Err(Gate::Paused(PauseReason::KeyboardFocus));
             }
             if self
                 .processes
                 .as_mut()
                 .is_some_and(|filter| !filter.permits(pid))
             {
-                return Gate::Paused(PauseReason::KeyboardFilter);
+                return Err(Gate::Paused(PauseReason::KeyboardFilter));
             }
+            return Ok(Some(pid));
         }
-        Gate::Open
+        Ok(None)
     }
 }
 
@@ -311,9 +396,11 @@ pub fn spatial_gate(
 struct ProcessFilter {
     allow_list: bool,
     names: Vec<String>,
+    #[cfg(windows)]
     cached: [Option<CachedProcess>; 2],
 }
 
+#[cfg(windows)]
 struct CachedProcess {
     pid: u32,
     permitted: bool,
@@ -332,13 +419,23 @@ impl ProcessFilter {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            if name.contains(['/', '\\', ':']) || name.len() > 260 || names.len() == 32 {
+            #[cfg(windows)]
+            let contains_path = name.contains(['/', '\\', ':']);
+            #[cfg(not(windows))]
+            let contains_path = name.contains('/');
+            if contains_path || name.len() > 260 || names.len() == 32 {
                 return Err("Enter up to 32 executable names, separated by commas.");
             }
-            let mut name = name.to_lowercase();
-            if !name.ends_with(".exe") {
-                name.push_str(".exe");
-            }
+            #[cfg(windows)]
+            let name = {
+                let mut name = name.to_lowercase();
+                if !name.ends_with(".exe") {
+                    name.push_str(".exe");
+                }
+                name
+            };
+            #[cfg(not(windows))]
+            let name = name.to_owned();
             names.push(name);
         }
         if names.is_empty() {
@@ -347,10 +444,32 @@ impl ProcessFilter {
         Ok(Some(Self {
             allow_list: mode == 1,
             names,
+            #[cfg(windows)]
             cached: [None, None],
         }))
     }
 
+    #[cfg(target_os = "linux")]
+    fn permits(&self, pid: u32) -> bool {
+        let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                !name.ends_with(" (deleted)")
+                    && self.names.iter().any(|entry| entry == name) == self.allow_list
+            })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn permits(&self, pid: u32) -> bool {
+        crate::macos::process_name(pid)
+            .is_some_and(|name| self.names.contains(&name) == self.allow_list)
+    }
+
+    #[cfg(windows)]
     fn permits(&mut self, pid: u32) -> bool {
         if pid == 0 {
             return false;
@@ -376,6 +495,12 @@ impl ProcessFilter {
         permitted
     }
 
+    #[cfg(target_os = "linux")]
+    fn permits_mouse(&self, point: mouse::Point) -> bool {
+        crate::x11::with(|desktop| desktop.pointer_pid(point)).is_ok_and(|pid| self.permits(pid))
+    }
+
+    #[cfg(windows)]
     fn permits_mouse(&mut self, point: mouse::Point) -> bool {
         let mut info = GUITHREADINFO {
             cbSize: size_of::<GUITHREADINFO>() as u32,
@@ -398,10 +523,20 @@ impl ProcessFilter {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn foreground_pid() -> u32 {
+    crate::x11::with(|desktop| desktop.focus_pid()).unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+use crate::macos::foreground_pid;
+
+#[cfg(windows)]
 fn foreground_pid() -> u32 {
     window_pid(unsafe { GetForegroundWindow() })
 }
 
+#[cfg(windows)]
 fn window_pid(window: HWND) -> u32 {
     let mut pid = 0;
     if !window.is_null() {
@@ -410,6 +545,7 @@ fn window_pid(window: HWND) -> u32 {
     pid
 }
 
+#[cfg(windows)]
 fn process_name(process: &OwnedHandle) -> Option<String> {
     let mut path = [0; 1_024];
     let mut len = path.len() as u32;

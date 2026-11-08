@@ -14,10 +14,10 @@ body:
     validations:
       required: true
   - type: input
-    id: windows
+    id: platform
     attributes:
-      label: Windows version and build
-      description: Run `winver` to find the build number.
+      label: Operating system and desktop session
+      description: On Windows, include the build from winver. On Linux, include the distribution and whether the desktop uses X11 or Wayland. On macOS, include the version and whether the Mac uses Apple silicon or Intel.
     validations:
       required: true
   - type: textarea

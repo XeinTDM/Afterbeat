@@ -1,23 +1,20 @@
 use std::{
-    hint::spin_loop,
-    io,
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    ptr::null,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
-use windows_sys::Win32::{
-    Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0},
-    System::Threading::{
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW,
-        GetCurrentThread, INFINITE, SetEvent, SetThreadPriority, SetWaitableTimer,
-        THREAD_PRIORITY_ABOVE_NORMAL, TIMER_ALL_ACCESS, WaitForMultipleObjects,
-        WaitForSingleObject,
-    },
-};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "engine/unix.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "engine/windows.rs"]
+mod platform;
+
+use platform::Pacer;
+pub use platform::StopSignal;
 
 // Bound the number of taps submitted before the next stop check.
 pub const BURST_SIZE: u32 = 4;
@@ -26,106 +23,6 @@ pub const GUARD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FASTEST_LOAD_PACED_INTERVAL: Duration = Duration::from_millis(1);
 const PRIORITY_PACED_INTERVAL: Duration = Duration::from_millis(2);
 const MAX_RECOVERABLE_DELAY: Duration = Duration::from_millis(8);
-
-pub struct StopSignal {
-    requested: AtomicBool,
-    event: OwnedHandle,
-}
-
-impl StopSignal {
-    pub fn new() -> io::Result<Self> {
-        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        Ok(Self {
-            requested: AtomicBool::new(false),
-            event: own_handle(event)?,
-        })
-    }
-
-    pub fn request(&self) {
-        self.requested.store(true, Ordering::Release);
-        // The worker holds the same Arc while it waits.
-        unsafe { SetEvent(self.event.as_raw_handle()) };
-    }
-
-    pub fn requested(&self) -> bool {
-        self.requested.load(Ordering::Acquire)
-    }
-}
-
-fn own_handle(handle: HANDLE) -> io::Result<OwnedHandle> {
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-}
-
-#[derive(Default)]
-struct Pacer {
-    timer: Option<OwnedHandle>,
-    spin_tail: Duration,
-}
-
-impl Pacer {
-    fn new() -> Self {
-        let timer = |flags| {
-            own_handle(unsafe { CreateWaitableTimerExW(null(), null(), flags, TIMER_ALL_ACCESS) })
-        };
-        match timer(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) {
-            Ok(timer) => Self {
-                timer: Some(timer),
-                spin_tail: SPIN_TAIL,
-            },
-            Err(_) => Self {
-                timer: timer(0).ok(),
-                spin_tail: Duration::ZERO,
-            },
-        }
-    }
-
-    fn wait_until(
-        &self,
-        stop: &StopSignal,
-        deadline: Instant,
-        spin_tail: Duration,
-    ) -> io::Result<bool> {
-        let stop_event = stop.event.as_raw_handle();
-        while !stop.requested() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(true);
-            }
-            if remaining <= spin_tail {
-                spin_loop();
-                continue;
-            }
-
-            let sleep = remaining - spin_tail;
-            let mut wait = WAIT_FAILED;
-            if let Some(timer) = &self.timer {
-                let timer = timer.as_raw_handle();
-                // A negative due time is relative, in 100 ns units.
-                let due = -(sleep.as_nanos().div_ceil(100) as i64);
-                if unsafe { SetWaitableTimer(timer, &due, 0, None, null(), 0) } != 0 {
-                    let handles = [stop_event, timer];
-                    wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
-                }
-            }
-            if wait == WAIT_FAILED {
-                let millis = sleep
-                    .as_micros()
-                    .div_ceil(1_000)
-                    .clamp(1, (INFINITE - 1) as u128);
-                wait = unsafe { WaitForSingleObject(stop_event, millis as u32) };
-            }
-            match wait {
-                WAIT_OBJECT_0 => return Ok(false),
-                WAIT_FAILED => return Err(io::Error::last_os_error()),
-                _ => {}
-            }
-        }
-        Ok(false)
-    }
-}
 
 #[derive(Default)]
 pub struct Progress {
@@ -148,6 +45,8 @@ impl Progress {
             5 => Some(PauseReason::PointerFilter),
             6 => Some(PauseReason::TargetFilter),
             7 => Some(PauseReason::CursorConfined),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            8 => Some(PauseReason::InputGrabbed),
             _ => None,
         }
     }
@@ -196,8 +95,8 @@ impl Schedule {
     }
 
     pub fn prioritize_paced_worker() {
-        // Give short load-paced intervals a better chance to wake on time.
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+        #[cfg(windows)]
+        platform::prioritize_worker();
     }
 }
 
@@ -225,6 +124,8 @@ pub enum PauseReason {
     PointerFilter = 5,
     TargetFilter = 6,
     CursorConfined = 7,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    InputGrabbed = 8,
 }
 
 #[derive(Default)]
@@ -271,6 +172,8 @@ impl RunControl<'_> {
         if self.expired() {
             return Some(Outcome::Completed);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.progress.clear_pause();
         self.progress.started.get_or_init(|| {
             let now = Instant::now();
             self.expires = self.duration.map(|duration| now + duration);
@@ -284,7 +187,7 @@ impl RunControl<'_> {
         self.pacer
             .wait_until(self.stop, deadline, spin)
             .map(|_| ())
-            .map_err(|err| format!("Windows timer failed ({err})."))
+            .map_err(|err| format!("The scheduling timer failed ({err})."))
     }
 
     fn wait(
@@ -333,6 +236,19 @@ impl RunControl<'_> {
                 },
             )?;
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn retry_dispatch(&mut self, gate: Gate) -> Result<Option<Outcome>, String> {
+        if let Gate::Paused(reason) = gate {
+            self.progress.pause(reason);
+            self.sleep(Instant::now() + GUARD_POLL_INTERVAL, Duration::ZERO)?;
+        } else {
+            self.allow_press(gate);
+        }
+        Ok(self
+            .interruption()
+            .or_else(|| self.expired().then_some(Outcome::Completed)))
     }
 
     pub fn hold(

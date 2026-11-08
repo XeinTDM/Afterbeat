@@ -58,6 +58,7 @@ fn write(folder: &std::path::Path, message: &str) -> io::Result<()> {
     )
 }
 
+#[cfg(windows)]
 pub fn open_folder() -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
@@ -80,5 +81,27 @@ pub fn open_folder() -> io::Result<()> {
             "Windows could not open the local data folder.",
         ));
     }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn open_folder() -> io::Result<()> {
+    let folder =
+        folder().ok_or_else(|| io::Error::other("No local configuration folder is available."))?;
+    fs::create_dir_all(&folder)?;
+    #[cfg(target_os = "linux")]
+    let command = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let command = "/usr/bin/open";
+    let mut opener = std::process::Command::new(command).arg(folder).spawn()?;
+    std::thread::spawn(move || {
+        if let Ok(status) = opener.wait()
+            && !status.success()
+        {
+            record(&format!(
+                "Could not open the configuration folder ({status})."
+            ));
+        }
+    });
     Ok(())
 }

@@ -1,5 +1,21 @@
 import { AboutSlint, ComboBox, ScrollView } from "std-widgets.slint";
 
+export component StartupError inherits Window {
+    title: "Afterbeat";
+    icon: @image-url("afterbeat.svg");
+    background: #141414;
+    preferred-width: 430px;
+    in property <string> message;
+    VerticalLayout {
+        padding: 24px;
+        Text {
+            text: root.message;
+            color: #ededed;
+            wrap: word-wrap;
+        }
+    }
+}
+
 export global Theme {
     in property <float> text-scale: 1;
     in property <bool> high-contrast;
@@ -588,6 +604,18 @@ export component App inherits Window {
     in-out property <string> profile-name;
 
     in property <bool> input-ready;
+    in property <bool> native-wayland;
+    in property <bool> wayland-ready;
+    in property <bool> wayland-pending;
+    in property <bool> wayland-configure;
+    in property <string> wayland-status;
+    in property <string> wayland-displays;
+    in-out property <string> wayland-x;
+    in-out property <string> wayland-y;
+    callback wayland-action(int);
+    in property <bool> input-permissions-needed;
+    in property <string> input-permissions-help;
+    in property <string> process-example: "app.exe";
     in property <bool> input-failed;
     in property <bool> shortcut-failure;
     in property <string> configuration-error;
@@ -656,6 +684,7 @@ export component App inherits Window {
     callback test-hits(int);
     callback select-unit(int);
     callback open-data-folder();
+    callback request-input-permissions();
 
     private property <length> window-width: 922px;
     changed width => { root.window-width = root.width; }
@@ -682,7 +711,8 @@ export component App inherits Window {
         (root.inline-configuration-error && root.message == root.configuration-error) ||
         (root.page == 1 && root.message == root.shortcut-error) ||
         (root.page == 3 && root.message == root.preset-error);
-    private property <string> system-blocker: root.shortcut-failure ?
+    private property <string> system-blocker: root.input-permissions-needed ? root.input-permissions-help :
+        root.shortcut-failure ?
         "The shortcut listener stopped. Reopen Afterbeat to run again." :
         !root.can-start ? "Free F7 or Ctrl+Alt+F7 in the other app, then reopen Afterbeat." :
         root.input-failed ? "Input protection could not start. See Help → Open data folder." :
@@ -801,7 +831,7 @@ export component App inherits Window {
 
     help-menu := PopupWindow {
         width: 182px * Theme.text-scale;
-        height: 121px * Theme.text-scale;
+        height: (root.input-permissions-needed ? 158px : 121px) * Theme.text-scale;
         x: help-button.absolute-position.x;
         y: help-button.absolute-position.y - self.height - 4px;
         Rectangle {
@@ -824,6 +854,8 @@ export component App inherits Window {
                 }
                 ActionButton { label: "Open data folder"; left-align: true; segment: true;
                     activated => { help-menu.close(); root.open-data-folder(); } }
+                if (root.input-permissions-needed): ActionButton { label: "Input permissions"; left-align: true; segment: true;
+                    activated => { help-menu.close(); root.request-input-permissions(); } }
                 ActionButton { label: "About Afterbeat"; left-align: true; segment: true;
                     activated => { help-menu.close(); about.show(); } }
             }
@@ -961,6 +993,50 @@ export component App inherits Window {
                         }
                     }
                     Rule {}
+                    if (root.native-wayland && root.page < 4): VerticalLayout {
+                        spacing: 6px;
+                        SectionTitle { text: "Wayland desktop access"; }
+                        Secondary {
+                            text: root.wayland-status == "" ?
+                                "Enable input and bind an emergency shortcut through your desktop." : root.wayland-status;
+                            wrap: word-wrap;
+                        }
+                        FlexboxLayout {
+                            flex-wrap: wrap;
+                            spacing-horizontal: 6px;
+                            spacing-vertical: 4px;
+                            if (!root.wayland-ready && !root.wayland-pending): ActionButton {
+                                label: "Enable input";
+                                enabled: !root.locked;
+                                activated => { root.wayland-action(0); }
+                            }
+                            if (!root.wayland-ready && !root.wayland-pending): ActionButton {
+                                label: "Enable with displays";
+                                enabled: !root.locked;
+                                activated => { root.wayland-action(1); }
+                            }
+                            if (root.wayland-ready || root.wayland-pending): ActionButton {
+                                label: root.wayland-pending ? "Cancel permission" : "Disconnect";
+                                activated => { root.wayland-action(2); }
+                            }
+                            if (root.wayland-configure): ActionButton {
+                                label: "Desktop shortcuts";
+                                enabled: !root.locked;
+                                activated => { root.wayland-action(3); }
+                            }
+                        }
+                        if (root.wayland-displays != "" && (root.page == 0 || root.page == 2)): VerticalLayout {
+                            spacing: 4px;
+                            Secondary { text: "Shared display bounds · " + root.wayland-displays; wrap: word-wrap; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                horizontal-stretch: 0;
+                                NumberField { width: 84px; label: "Logical X coordinate"; unit: "X"; enabled: !root.locked; value <=> root.wayland-x; }
+                                NumberField { width: 84px; label: "Logical Y coordinate"; unit: "Y"; enabled: !root.locked; value <=> root.wayland-y; }
+                            }
+                        }
+                        Rule {}
+                    }
                     if (root.page == 0): VerticalLayout {
                         spacing: 8px;
                         if (!root.compact): SectionTitle { text: "Pace and input"; }
@@ -1074,9 +1150,9 @@ export component App inherits Window {
                                 selected(index) => { root.fixed-target = index == 1; root.settings-edited(); }
                             }
                             if (!root.route-enabled && (!root.compact || root.fixed-target || root.capturing)): ActionButton {
-                                label: root.capturing ? "Cancel" : "Pick in 3s";
+                                label: root.native-wayland ? "Use coordinates" : root.capturing ? "Cancel" : "Pick in 3s";
                                 min-width: 78px;
-                                enabled: !root.active;
+                                enabled: !root.active && (!root.native-wayland || root.wayland-displays != "");
                                 activated => { root.capture-point(0); }
                             }
                             if (!root.route-enabled && root.fixed-target): Secondary {
@@ -1252,7 +1328,7 @@ export component App inherits Window {
                         }
                         Secondary {
                             wrap: word-wrap;
-                            text: root.low-cpu-available
+                            text: root.native-wayland ? "Wayland delivers each action through the desktop portal." : root.low-cpu-available
                                 ? "Low CPU sends clicks in groups, with less even spacing."
                                 : "This setup uses Precise. Low CPU needs fixed-rate single mouse taps at 50–1,000 /s, Toggle, an unmodified shortcut, and no route or guards.";
                         }
@@ -1266,19 +1342,25 @@ export component App inherits Window {
                                 selected(index) => { root.hold-activation = index == 1; root.settings-edited(); }
                             }
                         }
-                        shortcut_row := FieldRow {
+                        if (!root.native-wayland): FieldRow {
                             compact: root.stack-fields;
                             label: "Shortcut";
                             error: root.shortcut-error != "" ? root.shortcut-error : root.field-error("shortcut");
                             reveal: root.reveal-field == "shortcut";
                             reveal-at(y) => { root.reveal-setting(y); }
                             NumberField {
-                                width: 148px * min(1.6, Theme.text-scale); label: "Activation shortcut"; error: shortcut_row.error; enabled: !root.locked;
+                                width: 148px * min(1.6, Theme.text-scale); label: "Activation shortcut";
+                                error: root.shortcut-error != "" ? root.shortcut-error : root.field-error("shortcut");
+                                enabled: !root.locked;
                                 value <=> root.trigger-text;
                                 edited => { root.shortcut-error = ""; }
                             }
                             ActionButton { label: "Apply"; enabled: !root.locked; activated => { root.apply-shortcut(); } }
                             Secondary { text: "e.g. F6, Ctrl+Alt+G, Mouse4"; }
+                        }
+                        if (root.native-wayland): Secondary {
+                            text: "Change global shortcuts in the desktop portal or your desktop’s shortcut settings.";
+                            wrap: word-wrap;
                         }
                         FieldRow {
                             compact: root.stack-fields;
@@ -1330,8 +1412,8 @@ export component App inherits Window {
                             compact: root.stack-fields;
                             label: "Route points";
                             ActionButton {
-                                label: root.capturing && root.pick-kind == 1 ? "Cancel" : "Add in 3s";
-                                enabled: !root.active && (!root.capturing || root.pick-kind == 1);
+                                label: root.native-wayland ? "Add coordinates" : root.capturing && root.pick-kind == 1 ? "Cancel" : "Add in 3s";
+                                enabled: !root.active && (!root.capturing || root.pick-kind == 1) && (!root.native-wayland || root.wayland-displays != "");
                                 activated => { root.capture-point(1); }
                             }
                             ActionButton { label: "Move up"; enabled: !root.locked && root.route-index > 0; activated => { root.edit-route(-1); } }
@@ -1343,7 +1425,7 @@ export component App inherits Window {
                             rows: root.route-rows;
                             selected: root.route-index;
                             enabled: !root.locked;
-                            empty-text: "Add a point by moving the pointer to its position.";
+                            empty-text: root.native-wayland ? "Enable with displays and enter logical coordinates." : "Add a point by moving the pointer to its position.";
                             chosen(index, name) => { root.route-index = index; }
                         }
                         Rule {}
@@ -1364,7 +1446,7 @@ export component App inherits Window {
                             reveal-at(y) => { root.reveal-setting(y); }
                             ActionButton {
                                 label: root.capturing && root.pick-kind == 2 ? "Cancel" : "Pick corner";
-                                enabled: !root.active && (!root.capturing || root.pick-kind == 2);
+                                enabled: !root.native-wayland && !root.active && (!root.capturing || root.pick-kind == 2);
                                 activated => { root.capture-point(2); }
                             }
                             ActionButton { label: "Clear"; enabled: !root.locked && root.inside-label != "Unset"; activated => { root.clear-zone(2); } }
@@ -1375,7 +1457,7 @@ export component App inherits Window {
                             label: "Stop zone";
                             ActionButton {
                                 label: root.capturing && root.pick-kind == 3 ? "Cancel" : "Pick corner";
-                                enabled: !root.active && (!root.capturing || root.pick-kind == 3);
+                                enabled: !root.native-wayland && !root.active && (!root.capturing || root.pick-kind == 3);
                                 activated => { root.capture-point(3); }
                             }
                             ActionButton { label: "Clear"; enabled: !root.locked && root.stop-zone-label != "Unset"; activated => { root.clear-zone(3); } }
@@ -1397,7 +1479,7 @@ export component App inherits Window {
                                 value <=> root.process-names;
                                 edited => { root.settings-edited(); }
                             }
-                            if (root.process-mode != 0 && root.process-names == ""): Secondary { text: "app.exe"; }
+                            if (root.process-mode != 0 && root.process-names == ""): Secondary { text: root.process-example; }
                         }
                         Secondary {
                             wrap: word-wrap;

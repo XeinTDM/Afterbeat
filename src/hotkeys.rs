@@ -75,6 +75,10 @@ impl Binding {
         (!matches!(vk, VK_F7 | VK_F8 | VK_F12)).then_some(Self { vk, mods })
     }
 
+    pub fn matches_key(self, key: keys::Key) -> bool {
+        self.vk == key.vk
+    }
+
     fn mouse(self) -> bool {
         matches!(self.vk, VK_XBUTTON1 | VK_XBUTTON2)
     }

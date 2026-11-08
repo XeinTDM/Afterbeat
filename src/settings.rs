@@ -37,6 +37,7 @@ pub struct Settings {
     pub limited: bool,
     pub fixed: bool,
     pub point: Option<Point>,
+    pub point_wayland: bool,
     pub delay_seconds: u8,
     pub unit: u8,
     pub keyboard: bool,
@@ -57,6 +58,7 @@ pub struct Settings {
     pub route_once: bool,
     pub route_radius: String,
     pub route: Vec<Point>,
+    pub route_wayland: bool,
     pub edge_mode: u8,
     pub inside_zone: Option<Zone>,
     pub stop_zone: Option<Zone>,
@@ -74,6 +76,7 @@ impl Default for Settings {
             limited: false,
             fixed: false,
             point: None,
+            point_wayland: false,
             delay_seconds: 3,
             unit: 0,
             keyboard: false,
@@ -94,6 +97,7 @@ impl Default for Settings {
             route_once: false,
             route_radius: "0".into(),
             route: Vec::new(),
+            route_wayland: false,
             edge_mode: 0,
             inside_zone: None,
             stop_zone: None,
@@ -311,6 +315,7 @@ fn unit_seconds(unit: u8) -> Option<f64> {
     })
 }
 
+#[cfg(windows)]
 pub fn path() -> Option<PathBuf> {
     let local = PathBuf::from(env::var_os("LOCALAPPDATA")?);
     let current = local.join("Afterbeat");
@@ -321,6 +326,25 @@ pub fn path() -> Option<PathBuf> {
         current
     };
     Some(folder.join("settings.json"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn path() -> Option<PathBuf> {
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            let home = PathBuf::from(env::var_os("HOME")?);
+            home.is_absolute().then(|| home.join(".config"))
+        })?;
+    Some(config.join("afterbeat/settings.json"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn path() -> Option<PathBuf> {
+    let home = PathBuf::from(env::var_os("HOME")?);
+    home.is_absolute()
+        .then(|| home.join("Library/Application Support/Afterbeat/settings.json"))
 }
 
 const MAX_STORE: u64 = 2 * 1024 * 1024;

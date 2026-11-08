@@ -1,17 +1,32 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod automation;
+#[cfg(windows)]
 mod desktop_shell;
 mod diagnostics;
 mod dry_run;
 mod engine;
+#[cfg_attr(target_os = "linux", path = "linux/hotkeys.rs")]
+#[cfg_attr(target_os = "macos", path = "macos/hotkeys.rs")]
 mod hotkeys;
+#[cfg_attr(target_os = "linux", path = "x11/input_filter.rs")]
+#[cfg_attr(target_os = "macos", path = "macos/input_filter.rs")]
 mod input_filter;
+#[cfg_attr(target_os = "linux", path = "x11/keys.rs")]
+#[cfg_attr(target_os = "macos", path = "macos/keys.rs")]
 mod keys;
+#[cfg(target_os = "macos")]
+mod macos;
 mod mouse;
 mod settings;
+#[cfg(windows)]
 mod system_appearance;
+#[cfg(target_os = "linux")]
+mod wayland;
+#[cfg(target_os = "linux")]
+mod x11;
 
+#[cfg(windows)]
 use desktop_shell::{DesktopShell, RunState};
 use engine::{Checks, Outcome, PauseReason, Progress, Schedule, StopSignal};
 use hotkeys::{Action, Binding, Hotkeys};
@@ -22,14 +37,18 @@ use std::{
     cell::RefCell,
     error::Error,
     io,
-    os::windows::io::{FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
-    ptr::{null, null_mut},
     rc::{Rc, Weak as RcWeak},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+use std::{
+    os::windows::io::{FromRawHandle, OwnedHandle},
+    ptr::{null, null_mut},
+};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
     System::Threading::CreateMutexW,
@@ -128,39 +147,99 @@ struct Controller {
     tick: Timer,
     save_timer: Timer,
     hotkeys: Hotkeys,
+    #[cfg(windows)]
     shell: RefCell<Option<DesktopShell>>,
+    #[cfg(not(target_os = "macos"))]
     input_filter: RefCell<Option<input_filter::InputFilter>>,
 }
 
 fn main() {
+    #[cfg(not(windows))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version")
+    {
+        println!("afterbeat {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     diagnostics::install_panic_hook();
     if let Err(error) = launch() {
         diagnostics::record(&format!("Startup failed: {error}"));
-        alert(
-            &format!("Afterbeat could not start.\n\n{error}"),
-            MB_ICONERROR,
-        );
+        let message = format!("Afterbeat could not start.\n\n{error}");
+        #[cfg(windows)]
+        alert(&message, MB_ICONERROR);
+        #[cfg(not(windows))]
+        {
+            eprintln!("{message}");
+            if let Ok(dialog) = StartupError::new() {
+                dialog.set_message(message.into());
+                let _ = dialog.run();
+            }
+            std::process::exit(1);
+        }
     }
 }
 
 fn launch() -> Result<(), Box<dyn Error>> {
+    #[cfg(windows)]
+    let Some(_instance) = acquire_windows_instance()? else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    let _instance = {
+        wayland::select(wayland::detect());
+        if wayland::active() {
+            let instance = wayland::acquire_instance()?;
+            wayland::select_backend()?;
+            (None, Some(instance))
+        } else {
+            let Some(instance) = x11::shell::Instance::acquire()? else {
+                return Ok(());
+            };
+            x11::shell::select_backend()?;
+            (Some(instance), None)
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let Some(_instance) = macos::acquire_instance()? else {
+        return Ok(());
+    };
+
+    let app = App::new()?;
+    #[cfg(windows)]
+    let _appearance = system_appearance::watch(&app);
+    #[cfg(target_os = "macos")]
+    let _keyboard_layout = keys::watch_layout();
+    #[cfg(target_os = "linux")]
+    {
+        app.set_process_example("firefox".into());
+        app.set_native_wayland(wayland::active());
+    }
+    #[cfg(target_os = "macos")]
+    app.set_process_example("Safari, Finder".into());
+    run_app(app)
+}
+
+#[cfg(windows)]
+fn acquire_windows_instance() -> io::Result<Option<OwnedHandle>> {
     // Share the single-instance guard with older releases.
     let name = wide(r"Local\PulseClick.Desktop.SingleInstance");
     let instance = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
     let last_error = unsafe { GetLastError() };
     if instance.is_null() {
-        return Err(io::Error::from_raw_os_error(last_error as i32).into());
+        return Err(io::Error::from_raw_os_error(last_error as i32));
     }
     let _instance = unsafe { OwnedHandle::from_raw_handle(instance) };
     if last_error == ERROR_ALREADY_EXISTS {
         if !desktop_shell::activate_existing() {
             alert("Afterbeat is already open.", MB_ICONINFORMATION);
         }
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(_instance))
+}
 
-    let app = App::new()?;
-    let _appearance = system_appearance::watch(&app);
+fn run_app(app: App) -> Result<(), Box<dyn Error>> {
     let stop_slot = StopSlot::default();
     let path = settings::path();
     let (mut settings, recovered_settings, settings_error) =
@@ -198,12 +277,30 @@ fn launch() -> Result<(), Box<dyn Error>> {
         tick: Timer::default(),
         save_timer: Timer::default(),
         hotkeys,
+        #[cfg(windows)]
         shell: RefCell::new(None),
+        #[cfg(not(target_os = "macos"))]
         input_filter: RefCell::new(None),
     });
     ACTIVE_CONTROLLER.with(|local| *local.borrow_mut() = Rc::downgrade(&controller));
     controller.wire(&app, load_notice);
+    #[cfg(not(target_os = "macos"))]
     controller.attach_input_filter(8);
+    #[cfg(target_os = "macos")]
+    {
+        let ready = controller.hotkeys.listening();
+        let permissions_needed = !ready && !macos::has_permissions();
+        app.set_input_ready(ready);
+        app.set_input_permissions_help(macos::PERMISSIONS_HELP.into());
+        app.set_input_permissions_needed(permissions_needed);
+        app.set_shortcut_failure(!ready && !permissions_needed);
+        if ready {
+            diagnostics::record("Input protection active.");
+        }
+        app.on_request_input_permissions(macos::request_permissions);
+    }
+    #[cfg(target_os = "macos")]
+    let _quit_observer = macos::QuitObserver::install();
     let result = app.run();
     controller.shutdown();
     result?;
@@ -243,6 +340,8 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                 slot.signal()
             }
             Action::Unavailable => signal_stop(&stop_slot),
+            #[cfg(target_os = "linux")]
+            Action::PortalChanged => signal_stop(&stop_slot),
             Action::Capture(point, requested_at) => stop_slot
                 .lock()
                 .unwrap()
@@ -267,6 +366,12 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                         controller.capture_shortcut(&ui, point, requested_at)
                     }
                     Action::Capture(..) => controller.refresh(&ui),
+                    #[cfg(target_os = "linux")]
+                    Action::PortalChanged => {
+                        controller.display_shortcuts(&ui);
+                        controller.update_configuration(&ui, &controller.state.borrow().settings);
+                        controller.refresh(&ui);
+                    }
                     Action::Unavailable => {
                         ui.set_can_start(false);
                         ui.set_has_toggle(false);
@@ -274,6 +379,8 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                         ui.set_stop_key("—".into());
                         ui.set_capture_key("—".into());
                         ui.set_shortcut_failure(true);
+                        #[cfg(target_os = "macos")]
+                        ui.set_input_permissions_needed(!macos::has_permissions());
                         diagnostics::record("Global shortcut listener stopped.");
                         controller.refresh(&ui);
                     }
@@ -326,6 +433,8 @@ impl Controller {
         bind!(on_preset_interval, preset_interval, millis);
         bind!(on_select_unit, select_unit, unit);
         bind!(on_open_data_folder, open_data_folder);
+        #[cfg(target_os = "linux")]
+        bind!(on_wayland_action, wayland_action, operation);
 
         let slot = self.stop_slot.clone();
         ui.window().on_close_requested(move || {
@@ -334,7 +443,16 @@ impl Controller {
         });
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn attach_input_filter(&self, attempts: u8) {
+        #[cfg(target_os = "linux")]
+        if wayland::active() {
+            if let Some(ui) = self.app.upgrade() {
+                wayland::attach(&ui, self.stop_slot.clone());
+                ui.set_input_ready(true);
+            }
+            return;
+        }
         let weak = self.own.clone();
         Timer::single_shot(Duration::from_millis(50), move || {
             let Some(controller) = weak.upgrade() else {
@@ -343,6 +461,7 @@ impl Controller {
             let Some(ui) = controller.app.upgrade() else {
                 return;
             };
+            #[cfg(windows)]
             let attached = desktop_shell::window_handle(&ui).and_then(|hwnd| {
                 let mut shell = controller.shell.borrow_mut();
                 if shell.is_none() {
@@ -355,6 +474,9 @@ impl Controller {
                 }
                 input_filter::InputFilter::attach(&ui, hwnd)
             });
+            #[cfg(target_os = "linux")]
+            let attached =
+                x11::shell::window_handle(&ui).and_then(input_filter::InputFilter::attach);
             match attached {
                 Ok(filter) => {
                     *controller.input_filter.borrow_mut() = Some(filter);
@@ -413,9 +535,53 @@ impl Controller {
     fn display_shortcuts(&self, ui: &App) {
         ui.set_toggle_key(self.hotkeys.label().unwrap_or_else(|| "—".into()).into());
         ui.set_has_toggle(self.hotkeys.toggle_binding().is_some());
-        ui.set_stop_key(self.hotkeys.shortcuts.stop.unwrap_or("—").into());
-        ui.set_capture_key(self.hotkeys.shortcuts.capture.unwrap_or("—").into());
-        ui.set_can_start(self.hotkeys.shortcuts.stop.is_some());
+        #[cfg(target_os = "linux")]
+        {
+            let stop = self.hotkeys.stop_label();
+            ui.set_stop_key(stop.as_deref().unwrap_or("—").into());
+            ui.set_capture_key(self.hotkeys.capture_label().unwrap_or("—").into());
+            ui.set_can_start(stop.is_some());
+            if wayland::active() {
+                let state = wayland::status();
+                ui.set_can_start(state.ready && state.stop.is_some());
+                ui.set_wayland_ready(state.ready);
+                ui.set_wayland_pending(state.pending);
+                ui.set_wayland_configure(state.configure);
+                ui.set_wayland_displays(state.displays.into());
+                ui.set_wayland_status(state.message.into());
+                let _ = wayland::layout_unchanged(ui);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ui.set_stop_key(self.hotkeys.shortcuts.stop.unwrap_or("—").into());
+            ui.set_capture_key(self.hotkeys.shortcuts.capture.unwrap_or("—").into());
+            ui.set_can_start(self.hotkeys.shortcuts.stop.is_some());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wayland_action(&self, ui: &App, operation: i32) {
+        if let Hotkeys::Wayland(hotkeys) = &self.hotkeys {
+            match operation {
+                0 | 1
+                    if !ui.get_active() && !ui.get_wayland_pending() && !ui.get_wayland_ready() =>
+                {
+                    if hotkeys.enable(operation == 1) {
+                        ui.set_wayland_pending(true);
+                    } else {
+                        failure(ui, "Could not start the Wayland permission request.");
+                    }
+                }
+                2 => {
+                    signal_stop(&self.stop_slot);
+                    ui.set_can_start(false);
+                    hotkeys.disable();
+                }
+                3 if !ui.get_active() => hotkeys.configure(),
+                _ => {}
+            }
+        }
     }
 
     fn apply_shortcut(&self, ui: &App) {
@@ -530,6 +696,10 @@ impl Controller {
     }
 
     fn update_configuration(&self, ui: &App, settings: &Settings) {
+        #[cfg(target_os = "linux")]
+        if wayland::active() {
+            wayland::set_hold_mode(settings.hold_activation);
+        }
         let binding = self.hotkeys.toggle_binding();
         let schedule = automation::validated_schedule(settings, binding);
         let issue = schedule.as_ref().err();
@@ -840,7 +1010,7 @@ impl Controller {
         if let Some(ui) = self.app.upgrade() {
             ui.set_save_error(
                 if failed {
-                    "Windows could not save your data."
+                    "Afterbeat could not save your data."
                 } else {
                     ""
                 }
@@ -852,6 +1022,29 @@ impl Controller {
 
     fn capture(&self, ui: &App, kind: i32) {
         if ui.get_active() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if wayland::active() {
+            if !matches!(kind, 0 | 1) {
+                failure(
+                    ui,
+                    "Wayland does not expose the live pointer for this capture.",
+                );
+                return;
+            }
+            match (
+                ui.get_wayland_x().trim().parse(),
+                ui.get_wayland_y().trim().parse(),
+            ) {
+                (Ok(x), Ok(y)) if mouse::on_monitor(Point { x, y }) => {
+                    self.set_point(ui, Some(Point { x, y }), kind)
+                }
+                _ => failure(
+                    ui,
+                    "Enter whole X and Y coordinates inside a shared Wayland display.",
+                ),
+            }
             return;
         }
         if ui.get_capturing() {
@@ -901,18 +1094,31 @@ impl Controller {
         let mut state = self.state.borrow_mut();
         if kind == DRY_SAMPLE {
             let result = point
-                .ok_or("Windows could not read the cursor position.")
+                .ok_or("Could not read the cursor position.")
                 .and_then(|point| dry_run::show(ui, &state.settings, Some(point)));
             ui.set_dry_message(result.as_ref().err().copied().unwrap_or("").into());
             ui.set_dry_error(result.is_err());
             return;
         }
         let Some(point) = point else {
-            failure(ui, "Windows could not read the cursor position.");
+            failure(ui, "Could not read the cursor position.");
             return;
         };
+        #[cfg(target_os = "linux")]
+        let native_wayland = wayland::active();
+        #[cfg(not(target_os = "linux"))]
+        let native_wayland = false;
         match kind {
             1 => {
+                if !state.settings.route.is_empty()
+                    && state.settings.route_wayland != native_wayland
+                {
+                    failure(
+                        ui,
+                        "Remove the route points from the other desktop coordinate system first.",
+                    );
+                    return;
+                }
                 if state.settings.route.len() == settings::MAX_POINTS {
                     failure(
                         ui,
@@ -922,6 +1128,7 @@ impl Controller {
                 }
                 ui.set_route_index(state.settings.route.len() as i32);
                 state.settings.route.push(point);
+                state.settings.route_wayland = native_wayland;
                 state.settings.route_enabled = true;
                 ui.set_route_enabled(true);
             }
@@ -944,6 +1151,7 @@ impl Controller {
             }
             _ => {
                 state.settings.point = Some(point);
+                state.settings.point_wayland = native_wayland;
                 state.settings.fixed = true;
                 ui.set_fixed_target(true);
             }
@@ -981,6 +1189,14 @@ impl Controller {
     }
 
     fn start(&self, ui: &App, binding: Option<Binding>, requested_at: u64) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if wayland::active() && !wayland::layout_unchanged(ui) {
+            self.wayland_action(ui, 2);
+            return Err(
+                "The display layout changed. Reconnect Wayland input and verify your coordinates."
+                    .into(),
+            );
+        }
         let settings = self.state.borrow().settings.clone();
         let (schedule, injector, guard) =
             automation::prepare(&settings, self.hotkeys.toggle_binding(), binding)?;
@@ -1010,6 +1226,10 @@ impl Controller {
             slot.run = Some(stop.clone());
         }
         let (complete, completion) = mpsc::channel();
+        #[cfg(target_os = "linux")]
+        if wayland::active() {
+            wayland::protect(Some(settings.keyboard));
+        }
         self.hotkeys.set_paced_stop_priority(load_pacing);
         let worker = thread::Builder::new()
             .name("afterbeat-worker".into())
@@ -1040,12 +1260,23 @@ impl Controller {
                         .as_mut()
                         .map(|probe| probe as &mut dyn FnMut() -> bool),
                     |count, control| {
-                        let mut check = |target| guard.borrow_mut().check_destination(target);
-                        injector.borrow_mut().send(
-                            count,
-                            control,
-                            needs_destination_check.then_some(&mut check),
-                        )
+                        #[cfg(target_os = "macos")]
+                        let result =
+                            injector
+                                .borrow_mut()
+                                .send(count, control, &mut |target, cursor| {
+                                    guard.borrow_mut().dispatch_target(target, cursor)
+                                });
+                        #[cfg(not(target_os = "macos"))]
+                        let result = {
+                            let mut check = |target| guard.borrow_mut().check_destination(target);
+                            injector.borrow_mut().send(
+                                count,
+                                control,
+                                needs_destination_check.then_some(&mut check),
+                            )
+                        };
+                        result
                     },
                 );
                 if complete.send((Instant::now(), result)).is_ok() {
@@ -1060,6 +1291,8 @@ impl Controller {
                 }
             })
             .map_err(|err| {
+                #[cfg(target_os = "linux")]
+                wayland::protect(None);
                 self.stop_slot.lock().unwrap().run = None;
                 self.hotkeys.set_paced_stop_priority(false);
                 format!("Could not start the click worker ({err}).")
@@ -1073,6 +1306,7 @@ impl Controller {
             burst: schedule.interval.is_zero() && schedule.rates.is_none(),
         });
         ui.set_active(true);
+        #[cfg(windows)]
         self.set_shell_run_state(RunState::Active);
         ui.set_stopping(false);
         ui.set_run_state("Starting".into());
@@ -1094,6 +1328,10 @@ impl Controller {
 
     fn refresh(&self, ui: &App) {
         let now = Instant::now();
+        #[cfg(target_os = "linux")]
+        if ui.get_active() && wayland::active() && !wayland::layout_unchanged(ui) {
+            self.wayland_action(ui, 2);
+        }
         if self.refresh_capture(ui, now) {
             return;
         }
@@ -1110,6 +1348,8 @@ impl Controller {
             Err(mpsc::TryRecvError::Empty) => None,
         };
         if let Some((ended, result)) = completed {
+            #[cfg(target_os = "linux")]
+            wayland::protect(None);
             let run = state.run.take().unwrap();
             self.stop_slot.lock().unwrap().run = None;
             self.hotkeys.set_paced_stop_priority(false);
@@ -1130,6 +1370,7 @@ impl Controller {
                 }
             }
             drop(state);
+            #[cfg(windows)]
             self.set_shell_run_state(RunState::Idle);
             self.queue_save();
             return;
@@ -1141,6 +1382,7 @@ impl Controller {
             ui.set_stopping(true);
             ui.set_run_state("Stopping".into());
             status(ui, "");
+            #[cfg(windows)]
             self.set_shell_run_state(RunState::Stopping);
         } else if let Some(reason) = run.progress.pause_reason() {
             ui.set_run_state("Paused".into());
@@ -1195,6 +1437,7 @@ impl Controller {
         true
     }
 
+    #[cfg(windows)]
     fn set_shell_run_state(&self, state: RunState) {
         if let Some(shell) = self.shell.borrow().as_ref() {
             shell.set_run_state(state);
@@ -1227,6 +1470,8 @@ impl Controller {
             record_run(&mut self.state.borrow_mut(), &run.progress, ended);
         }
         self.save();
+        #[cfg(target_os = "linux")]
+        wayland::protect(None);
     }
 }
 
@@ -1249,7 +1494,15 @@ fn pause_hint(reason: PauseReason) -> &'static str {
             "App filter blocked the target. Release held mouse buttons and bring an allowed app to the target."
         }
         PauseReason::CursorConfined => {
-            "Windows is confining the cursor away from the target. Release cursor confinement to resume."
+            "The cursor is confined away from the target. Release cursor confinement to resume."
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        PauseReason::InputGrabbed => {
+            #[cfg(target_os = "linux")]
+            let message = "Input is grabbed. Release held buttons or close the grab to resume.";
+            #[cfg(target_os = "macos")]
+            let message = "Release the output key or mouse button to resume.";
+            message
         }
     }
 }
@@ -1360,10 +1613,12 @@ fn grouped(value: u64) -> String {
     text
 }
 
+#[cfg(windows)]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
 
+#[cfg(windows)]
 fn alert(text: &str, icon: u32) {
     let caption = wide("Afterbeat");
     let text = wide(text);

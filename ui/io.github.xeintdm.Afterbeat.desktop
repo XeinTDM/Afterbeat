@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Afterbeat
+Comment=Auto-clicker and key repeater
+Exec=afterbeat
+TryExec=afterbeat
+Icon=afterbeat
+Terminal=false
+StartupWMClass=Afterbeat
+Categories=Utility;Accessibility;

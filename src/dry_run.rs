@@ -9,13 +9,21 @@ use crate::{
 use slint::{ModelRc, VecModel};
 
 pub fn can_sample(settings: &Settings) -> bool {
+    #[cfg(target_os = "linux")]
+    if crate::wayland::active() {
+        return false;
+    }
     !settings.route_enabled && (settings.keyboard || !settings.fixed)
 }
 
 pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), &'static str> {
     let displays = mouse::display_areas();
     let Some(first) = displays.first() else {
-        return Err("Windows did not report any displays for the preview.");
+        #[cfg(target_os = "linux")]
+        if crate::wayland::active() {
+            return Err("Enable Wayland input with displays to preview logical targets.");
+        }
+        return Err("The desktop did not report any displays for the preview.");
     };
     let desktop = displays.iter().fold(*first, |bounds, display| Zone {
         from: Point {

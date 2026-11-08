@@ -1,10 +1,19 @@
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
+pub const F7: u16 = VK_F7;
+pub const F8: u16 = VK_F8;
+
 #[derive(Clone, Copy)]
 pub struct Key {
     pub vk: u16,
     pub shift: bool,
     pub extended: bool,
+}
+
+impl Key {
+    pub fn is_safety_key(self) -> bool {
+        matches!(self.vk, F7 | F8)
+    }
 }
 
 pub fn parse(text: &str) -> Option<Key> {
