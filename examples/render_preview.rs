@@ -240,10 +240,12 @@ fn main() {
             click(433.0, 203.0);
             assert_eq!(app.get_press_text(), "30");
             click(585.0, 203.0);
-            press(Key::Home);
+            // Two Left presses reach the start of "30" regardless of click placement.
+            press(Key::LeftArrow);
+            press(Key::LeftArrow);
             press(Key::Delete);
             assert_eq!(app.get_press_text(), "0");
-            press(Key::End);
+            press(Key::RightArrow);
             for character in [".", "5"] {
                 let text: SharedString = character.into();
                 window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
