@@ -2,7 +2,7 @@
 
 ## Install and update
 
-Extract the Windows x64 ZIP and open `afterbeat.exe`. On Linux, extract the x64 tarball and run `./afterbeat` from the extracted folder. To update, close the app and extract the newer archive. The new version reads the same local settings and presets. [Downloads](https://github.com/XeinTDM/Afterbeat/releases) · [Verify a download](https://github.com/XeinTDM/Afterbeat/blob/main/docs/releasing.md#verify-a-download)
+On Windows, open the direct x64 `.exe` if listed, or extract the ZIP and open `afterbeat.exe`. On Linux, extract the x64 tarball and run `./afterbeat` from the extracted folder. To update, close the app and open the new executable or extract the newer archive. The new version reads the same local settings and presets. [Downloads](https://github.com/XeinTDM/Afterbeat/releases) · [Verify a download](https://github.com/XeinTDM/Afterbeat/blob/main/docs/releasing.md#verify-a-download)
 
 ### Linux
 

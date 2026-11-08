@@ -8,7 +8,7 @@ Afterbeat is a desktop auto-clicker and key repeater for x64 Windows 10 and 11, 
 
 ## Get started
 
-1. Download and extract the archive for your platform. Open `afterbeat.exe` on Windows, run `./afterbeat` on Linux, or open `Afterbeat.app` on macOS. On Wayland and macOS, grant input permission through your desktop. [Releases](https://github.com/XeinTDM/Afterbeat/releases) · [Platform setup](docs/usage.md#install-and-update) · [Verify a download](docs/releasing.md#verify-a-download)
+1. On Windows, run the direct `.exe` if listed, or extract the Windows ZIP and open `afterbeat.exe`. On Linux or macOS, extract the archive and run `./afterbeat` or open `Afterbeat.app`. On Wayland and macOS, grant input permission through your desktop. [Releases](https://github.com/XeinTDM/Afterbeat/releases) · [Platform setup](docs/usage.md#install-and-update) · [Verify a download](docs/releasing.md#verify-a-download)
 2. On **Clicker**, choose the input, pace, target, and repeat mode. The default is a left click every 100 ms with a three-second countdown.
 3. Press **F6** or select **Start run**, then move over the **Test pad** to see the clicks arrive. Press **F7** to stop.
 

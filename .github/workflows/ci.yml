@@ -31,7 +31,7 @@ jobs:
         run: python -B -m unittest discover -s scripts/delivery -p 'test_*.py'
       - name: Verify the app
         run: ./scripts/verify.ps1
-      - name: Package Windows x64 ZIP
+      - name: Package Windows x64 downloads
         run: ./scripts/package.ps1
       - name: Upload Windows package and UI renders
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

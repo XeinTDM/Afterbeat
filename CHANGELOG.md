@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.7
+
+- Added a direct Windows x64 executable download with embedded license notices.
+
 ## 1.2.6
 
 First GitHub release.

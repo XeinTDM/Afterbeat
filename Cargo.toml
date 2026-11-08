@@ -1,6 +1,6 @@
 [package]
 name = "afterbeat"
-version = "1.2.6"
+version = "1.2.7"
 edition = "2024"
 rust-version = "1.99.1"
 description = "Desktop auto-clicker and key repeater with routes, presets, and safety controls"

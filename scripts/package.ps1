@@ -37,12 +37,18 @@ try {
 
     $output = [System.IO.Path]::GetFullPath($OutputDirectory, $root)
     $archiveName = "Afterbeat-v$version-windows-x64.zip"
+    $portableName = "Afterbeat-v$version-windows-x64.exe"
     $archive = Join-Path $output $archiveName
+    $portable = Join-Path $output $portableName
     New-Item -ItemType Directory -Path $output -Force | Out-Null
     Compress-Archive -LiteralPath $exe, 'LICENSE', 'THIRD-PARTY-NOTICES.txt', 'docs/usage.md' -DestinationPath $archive -Force
-    $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value ("$hash  $archiveName" + [char]10) -Encoding ascii -NoNewline
-    Write-Output $archive
+    Copy-Item -LiteralPath $exe -Destination $portable -Force
+    $checksums = foreach ($file in @($archive, $portable)) {
+        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $(Split-Path $file -Leaf)"
+    }
+    Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Value (($checksums -join [char]10) + [char]10) -Encoding ascii -NoNewline
+    Write-Output $archive, $portable
 } finally {
     Pop-Location
 }

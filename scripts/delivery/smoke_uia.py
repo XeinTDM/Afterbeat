@@ -15,14 +15,24 @@ def check(hwnd, sink, windows, path):
         return root.descendants()
 
     def find(name, control_type, *, timeout=4):
+        def expected_name():
+            return name() if callable(name) else name
+
         def match():
-            matches = [item for item in controls()
-                       if item.element_info.control_type == control_type and item.element_info.name == name]
+            expected = expected_name()
+            try:
+                matches = [item for item in controls()
+                           if item.element_info.control_type == control_type and item.element_info.name == expected]
+            except KeyError as error:
+                # A disappearing element can lose its control type before pywinauto wraps it.
+                if error.args != (None,):
+                    raise
+                return None
             if len(matches) > 1:
-                raise RuntimeError(f"UI Automation exposed duplicate {control_type} controls named {name!r}.")
+                raise RuntimeError(f"UI Automation exposed duplicate {control_type} controls named {expected!r}.")
             return matches[0] if matches else None
 
-        return windows.wait_for(match, timeout, f"UI Automation did not expose {control_type} {name!r}.")
+        return windows.wait_for(match, timeout, f"UI Automation did not expose {control_type} {expected_name()!r}.")
 
     def button(name):
         item = find(name, "Button")
@@ -62,7 +72,6 @@ def check(hwnd, sink, windows, path):
 
         step = "Announce the Dry run sampling countdown through UI Automation"
         sink.aim()
-        cursor = windows.api.GetCursorPos()
         begin = time.perf_counter()
         invoke("Sample pointer in 3 s")
         find("Sampling in 3 s. Move the pointer to the target.", "Text", timeout=2)
@@ -72,7 +81,12 @@ def check(hwnd, sink, windows, path):
         record("3 s → 2 s → 1 s")
 
         step = "Report the sampled location without delivering clicks"
-        result = find(f"X {cursor[0]}  Y {cursor[1]} · Spatial checks passed.", "Text", timeout=6)
+
+        def sampled_location():
+            x, y = windows.api.GetCursorPos()
+            return f"X {x}  Y {y} · Spatial checks passed."
+
+        result = find(sampled_location, "Text", timeout=6)
         elapsed = time.perf_counter() - begin
         if elapsed < 2.75:
             raise RuntimeError(f"Dry run sampling completed early after {elapsed:.3f} s.")

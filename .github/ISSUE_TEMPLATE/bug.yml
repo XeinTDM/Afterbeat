@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Afterbeat version
-      placeholder: 1.2.6
+      placeholder: 1.2.7
     validations:
       required: true
   - type: input

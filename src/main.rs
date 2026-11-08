@@ -154,6 +154,18 @@ struct Controller {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--licenses")
+    {
+        print!(
+            "{}\n{}",
+            include_str!("../LICENSE"),
+            include_str!("../THIRD-PARTY-NOTICES.txt")
+        );
+        return;
+    }
     #[cfg(not(windows))]
     if std::env::args_os()
         .nth(1)
