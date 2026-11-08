@@ -789,6 +789,12 @@ export component App inherits Window {
                y >= pad.absolute-position.y && y < pad.absolute-position.y + pad.height;
     }
 
+    public function stop-run-at(x: length, y: length) -> bool {
+        return root.active && root.show-run-button && root.run-button-enabled &&
+               x >= run-button.absolute-position.x && x < run-button.absolute-position.x + run-button.width &&
+               y >= run-button.absolute-position.y && y < run-button.absolute-position.y + run-button.height;
+    }
+
     public function show-dry-run() {
         root.dry-step = -1;
         root.dry-playing = false;
@@ -1768,9 +1774,10 @@ export component App inherits Window {
                         segment: true;
                         activated => { shortcuts-menu.show(); }
                     }
-                    if (root.show-run-button): RunButton {
+                    run-button := RunButton {
                         x: parent.width - self.width - 6px;
                         y: parent.height - self.height - 6px;
+                        visible: root.show-run-button;
                         label: root.run-button-label;
                         key-hint: root.active && !run-bar.inline-shortcuts && root.stop-key != "—" ? root.stop-key : "";
                         primary: !root.active && !root.hold-activation;

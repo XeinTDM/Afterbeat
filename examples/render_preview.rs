@@ -291,8 +291,24 @@ fn main() {
             press(Key::Tab);
             press(Key::DownArrow);
             assert_eq!(app.get_profile_index(), 7, "Tab should leave the list");
+
+            app.set_page(0);
+            for (width, height) in [size, (640, 530)] {
+                window.set_size(PhysicalSize::new(width, height));
+                let x = width as f32 - 90.0;
+                let y = height as f32 - 40.0;
+                assert!(!app.invoke_stop_run_at(x, y));
+                app.set_active(true);
+                assert!(app.invoke_stop_run_at(x, y));
+                assert!(!app.invoke_stop_run_at(20.0, y));
+                app.set_stopping(true);
+                assert!(!app.invoke_stop_run_at(x, y));
+                app.set_stopping(false);
+                app.set_active(false);
+            }
+            window.set_size(PhysicalSize::new(size.0, size.1));
             println!(
-                "Arrow navigation, grouped Tab stops, capture shortcuts, and fractional presses passed"
+                "Arrow navigation, grouped Tab stops, capture shortcuts, fractional presses, and Stop hit testing passed"
             );
         }
         _ => {}

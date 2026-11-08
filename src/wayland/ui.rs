@@ -4,7 +4,7 @@ use slint::{
     winit_030::{
         EventResult, SlintEvent, WinitWindowAccessor,
         winit::{
-            event::{ElementState, WindowEvent},
+            event::{ElementState, MouseButton, WindowEvent},
             event_loop::EventLoop,
             keyboard::{Key, NamedKey},
             platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesExtWayland},
@@ -89,6 +89,14 @@ pub fn click_own_window() -> bool {
     }
 }
 
+fn stop_at_pointer(app: &App) -> bool {
+    let Pointer::Inside(Some((x, y))) = *POINTER.lock().unwrap() else {
+        return false;
+    };
+    let scale = app.window().scale_factor();
+    app.invoke_stop_run_at(f32::from(x) / scale, f32::from(y) / scale)
+}
+
 pub fn layout_unchanged(app: &App) -> bool {
     LAYOUT.with(|layout| {
         let mut layout = layout.borrow_mut();
@@ -129,6 +137,7 @@ pub fn layout_unchanged(app: &App) -> bool {
 
 pub fn attach(app: &App, stop: StopSlot) {
     let window = app.window();
+    let app = app.as_weak();
     window.with_winit_window(|window| FOCUSED.store(window.has_focus(), Ordering::Release));
     window.on_winit_window_event(move |_, event| {
         let protection = PROTECTION.load(Ordering::Acquire);
@@ -151,9 +160,16 @@ pub fn attach(app: &App, stop: StopSlot) {
             WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_) if protection == KEYBOARD => {
                 return EventResult::PreventDefault;
             }
-            WindowEvent::MouseInput { state, .. } if protection == MOUSE => {
+            WindowEvent::MouseInput { state, button, .. } if protection == MOUSE => {
                 if *state == ElementState::Pressed {
-                    click_own_window();
+                    // Wayland cannot distinguish generated clicks here. Allow only a stop.
+                    if *button == MouseButton::Left
+                        && app.upgrade().is_some_and(|app| stop_at_pointer(&app))
+                    {
+                        signal_stop(&stop);
+                    } else {
+                        click_own_window();
+                    }
                 }
                 return EventResult::PreventDefault;
             }

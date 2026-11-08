@@ -205,6 +205,13 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
             Press::Timed(duration)
         }
     };
+    #[cfg(target_os = "linux")]
+    if !native_wayland && matches!(input, Input::Key(_)) && !matches!(press, Press::Tap) {
+        return Err(Issue::new(
+            "press",
+            "Select Tap for X11 key output. Focus can change before a held key is released.",
+        ));
+    }
     Ok(Plan {
         schedule,
         input,
@@ -565,6 +572,25 @@ fn process_name(process: &OwnedHandle) -> Option<String> {
 mod tests {
     use super::*;
     use crate::mouse::Point;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_key_output_requires_tap() {
+        for (press, hold_down) in [("30", false), ("0", true)] {
+            let mut settings = Settings {
+                keyboard: true,
+                press: press.into(),
+                hold_down,
+                ..Settings::default()
+            };
+            assert_eq!(
+                validated_schedule(&settings, None).err().unwrap().field,
+                "press"
+            );
+            settings.keyboard = false;
+            assert!(validated_schedule(&settings, None).is_ok());
+        }
+    }
 
     #[test]
     fn modified_hold_shortcuts_are_rejected_for_key_presses_only() {

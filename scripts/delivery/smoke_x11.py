@@ -208,6 +208,28 @@ def smoke(executable):
         desktop.events(0.18)
         assert desktop.keys.count((X.KeyPress, ord("A"))) == 3, desktop.keys
 
+    # Change the server mapping after the first dispatch, while the run has a cached keycode.
+    a = ord("a")
+    z = ord("z")
+    a_code = desktop.display.keysym_to_keycode(a)
+    z_code = desktop.display.keysym_to_keycode(z)
+    a_mapping = desktop.display.get_keyboard_mapping(a_code, 1)
+    z_mapping = desktop.display.get_keyboard_mapping(z_code, 1)
+    try:
+        with desktop.app(executable, keyboard=True, key="a", interval="10", time_limit="2"):
+            desktop.tap("F6")
+            desktop.wait_for(lambda: (X.KeyPress, a) in desktop.keys, "Initial key was not delivered.")
+            desktop.display.change_keyboard_mapping(a_code, z_mapping)
+            desktop.display.change_keyboard_mapping(z_code, a_mapping)
+            desktop.display.sync()
+            desktop.events(0.35)
+            assert (X.KeyPress, z) not in desktop.keys, "Afterbeat reused a stale keycode."
+    finally:
+        desktop.display.change_keyboard_mapping(a_code, a_mapping)
+        desktop.display.change_keyboard_mapping(z_code, z_mapping)
+        desktop.display.sync()
+        desktop.events()
+
     with desktop.app(executable, limited=True, count="3") as (window, _):
         # An independent X11 child detects input that escapes protection of Afterbeat's controls.
         probe = window.create_window(

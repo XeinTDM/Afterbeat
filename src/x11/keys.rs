@@ -3,8 +3,9 @@ use std::ptr::{NonNull, null_mut};
 use x11rb::{
     connection::Connection,
     protocol::{
+        Event,
         xkb::{self, ConnectionExt as _},
-        xproto::ConnectionExt as _,
+        xproto::{ConnectionExt as _, Mapping},
     },
 };
 use xkbcommon_dl as xkb_dl;
@@ -172,6 +173,46 @@ impl Drop for Keymap {
     fn drop(&mut self) {
         unsafe { (self.xkb.xkb_keymap_unref)(self.map.as_ptr()) };
     }
+}
+
+pub fn watch_layout(desktop: &Desktop) -> XResult<()> {
+    let map_parts = xkb::MapPart::KEY_TYPES
+        | xkb::MapPart::KEY_SYMS
+        | xkb::MapPart::MODIFIER_MAP
+        | xkb::MapPart::VIRTUAL_MODS
+        | xkb::MapPart::VIRTUAL_MOD_MAP;
+    let group = xkb::StatePart::GROUP_STATE;
+    desktop
+        .conn
+        .xkb_select_events(
+            u16::from(xkb::ID::USE_CORE_KBD),
+            0u16.into(),
+            xkb::EventType::NEW_KEYBOARD_NOTIFY | xkb::EventType::MAP_NOTIFY,
+            map_parts,
+            map_parts,
+            &xkb::SelectEventsAux::new().state_notify(xkb::SelectEventsAuxStateNotify {
+                affect_state: group,
+                state_details: group,
+            }),
+        )?
+        .check()?;
+    Ok(())
+}
+
+pub fn layout_changed(desktop: &Desktop) -> XResult<bool> {
+    let mut changed = false;
+    while let Some(event) = desktop.conn.poll_for_event()? {
+        changed |= match event {
+            Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) | Event::XkbStateNotify(_) => {
+                true
+            }
+            Event::MappingNotify(event) => {
+                matches!(event.request, Mapping::KEYBOARD | Mapping::MODIFIER)
+            }
+            _ => false,
+        };
+    }
+    Ok(changed)
 }
 
 pub fn enable_detectable_repeat(desktop: &Desktop) -> XResult<()> {

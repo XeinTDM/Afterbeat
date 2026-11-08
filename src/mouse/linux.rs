@@ -3,7 +3,7 @@ use crate::{
     engine::{GUARD_POLL_INTERVAL, Gate, Outcome, PauseReason, RunControl},
     hotkeys::Binding,
     input_filter::{self, Hit},
-    keys::{F7, F8, Keymap},
+    keys::{self, F7, F8, Keymap},
     wayland,
     x11::{self, Desktop, XResult},
 };
@@ -21,8 +21,6 @@ use x11rb::{
     },
 };
 use xkeysym::{Keysym, key};
-
-const LAYOUT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct Injector(Backend);
 
@@ -219,7 +217,7 @@ impl TextMapping {
         let setup = desktop.conn.setup();
         let first = setup.min_keycode;
         let count = setup.max_keycode - first + 1;
-        let _grab = desktop.grab()?;
+        // The caller holds the server grab through resolution and dispatch.
         let mapping = desktop.conn.get_keyboard_mapping(first, count)?.reply()?;
         let width = usize::from(mapping.keysyms_per_keycode);
         if width == 0 {
@@ -246,7 +244,9 @@ impl TextMapping {
             last_used: Instant::now(),
         };
         // XKB may normalize the new mapping, so compare the server's representation on cleanup.
-        if let Ok(reply) = desktop.conn.get_keyboard_mapping(code, 1)?.reply() {
+        if let Ok(cookie) = desktop.conn.get_keyboard_mapping(code, 1)
+            && let Ok(reply) = cookie.reply()
+        {
             mapping.installed = reply.keysyms;
         }
         Ok(mapping)
@@ -333,7 +333,6 @@ struct X11Injector {
     route: Option<Route>,
     text_mapping: Option<TextMapping>,
     stroke: Option<Stroke>,
-    next_keyboard_check: Instant,
     activation: Option<Binding>,
 }
 
@@ -358,7 +357,6 @@ impl X11Injector {
             route: Route::new(points, radius)?,
             text_mapping: None,
             stroke: None,
-            next_keyboard_check: Instant::now(),
             activation: None,
         })
     }
@@ -403,11 +401,14 @@ impl X11Injector {
             Input::Text(character) => Keysym::from_char(character).raw(),
         };
         if let Some(stroke) = self.stroke
-            && Instant::now() < self.next_keyboard_check
+            && !keys::layout_changed(desktop)?
         {
             return Ok(stroke);
         }
         let map = Keymap::read(desktop)?;
+        if self.stroke.is_none() {
+            keys::watch_layout(desktop)?;
+        }
         let conflicts = |stroke: Stroke| {
             let code = stroke.code();
             self.activation
@@ -450,7 +451,6 @@ impl X11Injector {
             return Err("The X11 keyboard layout changed. Start the run again.".into());
         }
         self.stroke = Some(stroke);
-        self.next_keyboard_check = Instant::now() + LAYOUT_CHECK_INTERVAL;
         Ok(stroke)
     }
 
@@ -478,9 +478,15 @@ impl X11Injector {
                         .map_or(Gate::Open, |check| check(target))
                 };
                 let release = loop {
-                    let stroke = self.stroke(desktop)?;
                     let taps = duration.is_none().then_some(actions * self.repeats);
-                    match attempt(desktop, stroke, target, taps, control, &mut check)? {
+                    match attempt(
+                        desktop,
+                        || self.stroke(desktop),
+                        target,
+                        taps,
+                        control,
+                        &mut check,
+                    )? {
                         Attempt::Paused(gate) => {
                             if let Some(outcome) = control.retry_dispatch(gate)? {
                                 return Ok(Some(outcome));
@@ -523,7 +529,7 @@ impl X11Injector {
 
 fn attempt<'a>(
     desktop: &'a Desktop,
-    stroke: Stroke,
+    resolve_stroke: impl FnOnce() -> XResult<Stroke>,
     target: Option<Point>,
     taps: Option<u32>,
     control: &mut RunControl<'_>,
@@ -549,6 +555,8 @@ fn attempt<'a>(
             return Ok(Attempt::Paused(gate));
         }
     }
+    // Process queued layout events with the server grabbed, before using the keycode.
+    let stroke = resolve_stroke()?;
     let hit = if matches!(stroke, Stroke::Button(_)) {
         let hit = input_filter::hit(desktop, desktop.cursor()?)?;
         if let Hit::External(window) = hit

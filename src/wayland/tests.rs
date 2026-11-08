@@ -156,6 +156,7 @@ fn portal_lifecycle() {
     let remote = remote().unwrap();
     let keyboard = Settings {
         keyboard: true,
+        press: "30".into(),
         ..Settings::default()
     };
     let (_, _, mut guard) = automation::prepare(&keyboard, toggle_binding(), None).unwrap();
