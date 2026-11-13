@@ -228,6 +228,7 @@ pub enum Action {
     Capture(Point, u64),
     Unavailable,
     PortalChanged,
+    PortalStatus,
 }
 
 pub struct StopProbe {

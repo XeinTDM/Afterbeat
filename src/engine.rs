@@ -45,7 +45,6 @@ impl Progress {
             5 => Some(PauseReason::PointerFilter),
             6 => Some(PauseReason::TargetFilter),
             7 => Some(PauseReason::CursorConfined),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             8 => Some(PauseReason::InputGrabbed),
             _ => None,
         }
@@ -124,7 +123,6 @@ pub enum PauseReason {
     PointerFilter = 5,
     TargetFilter = 6,
     CursorConfined = 7,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     InputGrabbed = 8,
 }
 
@@ -172,7 +170,6 @@ impl RunControl<'_> {
         if self.expired() {
             return Some(Outcome::Completed);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.progress.clear_pause();
         self.progress.started.get_or_init(|| {
             let now = Instant::now();
@@ -238,7 +235,6 @@ impl RunControl<'_> {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn retry_dispatch(&mut self, gate: Gate) -> Result<Option<Outcome>, String> {
         if let Gate::Paused(reason) = gate {
             self.progress.pause(reason);

@@ -40,6 +40,7 @@ class Portal:
         self.stop_enabled = True
         self.bound = []
         self.share = False
+        self.configuration = None
         self.connection = connection
         register(connection, GLOBAL, [
             ("CreateSession", [OPTIONS], ["o"]),
@@ -61,6 +62,7 @@ class Portal:
             ("Revoke", [], []),
             ("EnableStop", ["b"], []),
             ("Trace", [], ["as"]),
+            ("FinishConfiguration", [], []),
         ], self.call)
 
     def current_shortcuts(self):
@@ -90,6 +92,9 @@ class Portal:
                             None, PATH, GLOBAL, "ShortcutsChanged",
                             GLib.Variant("(oa(sa{sv}))", (self.sessions[GLOBAL], self.current_shortcuts())),
                         )
+                elif method == "FinishConfiguration":
+                    self.configuration.return_value(None)
+                    self.configuration = None
                 invocation.return_value(None)
                 return
             if method.startswith("Notify"):
@@ -102,7 +107,8 @@ class Portal:
                 invocation.return_value(None)
                 return
             if method == "ConfigureShortcuts":
-                invocation.return_value(None)
+                self.trace.append("configure")
+                self.configuration = invocation
                 return
 
             response = {}

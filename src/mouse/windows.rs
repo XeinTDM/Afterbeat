@@ -20,7 +20,7 @@ use windows_sys::Win32::{
             KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
             MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-            SendInput, VK_LSHIFT, VK_SHIFT,
+            SendInput, VK_LBUTTON, VK_LSHIFT, VK_MBUTTON, VK_RBUTTON, VK_SHIFT,
         },
         WindowsAndMessaging::{
             GetClipCursor, GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -62,6 +62,14 @@ fn confinement_gate(point: Point, bounds: RECT) -> Gate {
 }
 
 impl Button {
+    fn virtual_key(self) -> u16 {
+        match self {
+            Self::Left => VK_LBUTTON,
+            Self::Right => VK_RBUTTON,
+            Self::Middle => VK_MBUTTON,
+        }
+    }
+
     fn flags(self) -> (u32, u32) {
         match self {
             Self::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -457,6 +465,39 @@ impl Injector {
         control: &mut RunControl<'_>,
         check_destination: Option<&mut dyn FnMut(Option<Point>) -> Gate>,
     ) -> Result<Option<Outcome>, String> {
+        let output = match self.input {
+            Input::Mouse(button) => Some(button.virtual_key()),
+            Input::Key(key) => Some(key.vk),
+            Input::Text(_) => None,
+        };
+        self.send_checked(
+            actions,
+            control,
+            check_destination,
+            || output.is_some_and(keys::down),
+            send,
+        )
+    }
+
+    fn send_checked(
+        &mut self,
+        actions: u32,
+        control: &mut RunControl<'_>,
+        mut check_destination: Option<&mut dyn FnMut(Option<Point>) -> Gate>,
+        mut output_held: impl FnMut() -> bool,
+        mut submit: impl FnMut(&[INPUT], &[INPUT]) -> Result<(), String>,
+    ) -> Result<Option<Outcome>, String> {
+        if output_held() {
+            let mut recheck = || {
+                let target = self.destination()?;
+                Ok(check_destination
+                    .as_mut()
+                    .map_or(Gate::Open, |check| check(target)))
+            };
+            if let Some(outcome) = wait_for_output(control, &mut output_held, &mut recheck)? {
+                return Ok(Some(outcome));
+            }
+        }
         if matches!(self.input, Input::Key(key) if key.shift) {
             let stroke = Stroke::new(self.input);
             if stroke.len != self.stroke.len {
@@ -470,13 +511,15 @@ impl Injector {
                 if let Some(outcome) = control.begin_dispatch() {
                     return Ok(Some(outcome));
                 }
-                send(&self.packet[..len], self.stroke.up())?;
+                submit(&self.packet[..len], self.stroke.up())?;
                 Ok(None)
             }
-            Press::Timed(duration) => self.send_timed(duration, control, check_destination, send),
+            Press::Timed(duration) => {
+                self.send_timed(duration, control, check_destination, output_held, submit)
+            }
             Press::Held => {
                 let duration = Duration::from_secs(365 * 86_400);
-                self.send_timed(duration, control, check_destination, send)
+                self.send_timed(duration, control, check_destination, output_held, submit)
             }
         }
     }
@@ -486,6 +529,7 @@ impl Injector {
         duration: Duration,
         control: &mut RunControl<'_>,
         mut check_destination: Option<&mut dyn FnMut(Option<Point>) -> Gate>,
+        mut output_held: impl FnMut() -> bool,
         mut submit: impl FnMut(&[INPUT], &[INPUT]) -> Result<(), String>,
     ) -> Result<Option<Outcome>, String> {
         let mut down = [INPUT::default(); 3];
@@ -518,8 +562,19 @@ impl Injector {
                 .map_or(Gate::Open, |check| check(target))
         };
         for index in 0..self.repeats {
-            if index != 0 && (!control.can_press()? || !control.allow_press(check_held_target())) {
-                break;
+            if index != 0 {
+                if !control.can_press()? || !control.allow_press(check_held_target()) {
+                    break;
+                }
+                if output_held() {
+                    let mut recheck = || Ok(check_held_target());
+                    if wait_for_output(control, &mut output_held, &mut recheck)?.is_some() {
+                        break;
+                    }
+                }
+                if control.begin_dispatch().is_some() {
+                    break;
+                }
             }
             submit(&down[..offset + self.stroke.len], self.stroke.up())?;
             let held = control.hold(
@@ -535,6 +590,26 @@ impl Injector {
             }
         }
         Ok(None)
+    }
+}
+
+fn wait_for_output(
+    control: &mut RunControl<'_>,
+    output_held: &mut impl FnMut() -> bool,
+    recheck: &mut impl FnMut() -> Result<Gate, String>,
+) -> Result<Option<Outcome>, String> {
+    let mut gate = Gate::Paused(PauseReason::InputGrabbed);
+    loop {
+        if let Some(outcome) = control.retry_dispatch(gate)? {
+            return Ok(Some(outcome));
+        }
+        gate = recheck()?;
+        if matches!(gate, Gate::Open) {
+            if !output_held() {
+                return Ok(None);
+            }
+            gate = Gate::Paused(PauseReason::InputGrabbed);
+        }
     }
 }
 
@@ -703,6 +778,7 @@ mod tests {
         );
         let mut checks = Vec::new();
         let mut packets = Vec::new();
+        let mut samples = 0;
         let result = run_controlled(
             Schedule {
                 limit: Some(1),
@@ -714,13 +790,18 @@ mod tests {
             Checks::default(),
             None,
             |_, control| {
-                injector.send_timed(
-                    duration,
+                injector.send_checked(
+                    1,
                     control,
                     Some(&mut |point| {
                         checks.push(point);
                         Gate::Open
                     }),
+                    || {
+                        samples += 1;
+                        // A held button after the first tap must delay the second tap.
+                        samples == 2
+                    },
                     |events, _| {
                         packets.push(events.to_vec());
                         Ok(())
@@ -729,6 +810,7 @@ mod tests {
             },
         );
         assert_eq!(result, Ok(Outcome::Completed));
+        assert_eq!(samples, 3);
         assert!(checks.len() >= 3);
         assert!(checks.iter().all(|point| *point == Some(first)));
         assert_eq!(injector.destination().unwrap(), Some(next));
@@ -778,13 +860,14 @@ mod tests {
             Checks::default(),
             None,
             |_, control| {
-                injector.send_timed(
-                    duration,
+                injector.send_checked(
+                    1,
                     control,
                     Some(&mut |_| {
                         rechecks += 1;
                         Gate::Paused(PauseReason::PointerFilter)
                     }),
+                    || false,
                     |packet, _| {
                         events.extend(
                             packet
@@ -844,19 +927,111 @@ mod tests {
             Checks::default(),
             None,
             |_, control| {
-                injector.send_timed(Duration::from_secs(60), control, None, |packet, _| {
-                    events.extend(
-                        packet
-                            .iter()
-                            .map(|event| unsafe { event.Anonymous.mi.dwFlags }),
-                    );
-                    Ok(())
-                })
+                injector.send_checked(
+                    1,
+                    control,
+                    None,
+                    || false,
+                    |packet, _| {
+                        events.extend(
+                            packet
+                                .iter()
+                                .map(|event| unsafe { event.Anonymous.mi.dwFlags }),
+                        );
+                        Ok(())
+                    },
+                )
             },
         );
         assert_eq!(result, Ok(Outcome::Guarded(LAYOUT_CHANGED)));
         assert_eq!(events[1..], [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]);
         assert_eq!(progress.actions(), 1);
+    }
+
+    #[test]
+    fn waits_for_held_input_before_submitting_a_tap_or_timed_press() {
+        use crate::engine::{Checks, Progress, Schedule, StopSignal, run_controlled};
+
+        for press in [Press::Tap, Press::Timed(Duration::from_millis(1))] {
+            let mut injector =
+                Injector::with_targets(Input::Mouse(Button::Left), false, None, press);
+            let progress = Progress::default();
+            let mut samples = 0;
+            let mut events = Vec::new();
+            let result = run_controlled(
+                Schedule {
+                    limit: Some(1),
+                    ..Schedule::default()
+                },
+                &StopSignal::new().unwrap(),
+                &progress,
+                false,
+                Checks::default(),
+                None,
+                |_, control| {
+                    injector.send_checked(
+                        1,
+                        control,
+                        None,
+                        || {
+                            samples += 1;
+                            if samples > 1 {
+                                assert_eq!(
+                                    progress.pause_reason(),
+                                    Some(PauseReason::InputGrabbed)
+                                );
+                                assert!(progress.started.get().is_none());
+                            }
+                            samples < 3
+                        },
+                        |packet, _| {
+                            assert_eq!(progress.pause_reason(), None);
+                            events.extend(
+                                packet
+                                    .iter()
+                                    .map(|event| unsafe { event.Anonymous.mi.dwFlags }),
+                            );
+                            Ok(())
+                        },
+                    )
+                },
+            );
+            assert_eq!(result, Ok(Outcome::Completed));
+            assert_eq!(samples, 3);
+            assert_eq!(events, [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP]);
+        }
+    }
+
+    #[test]
+    fn emergency_stop_while_output_is_held_sends_no_events() {
+        use crate::engine::{Checks, Progress, Schedule, StopSignal, run_controlled};
+
+        let key = keys::parse("Space").unwrap();
+        let mut injector = Injector::with_targets(Input::Key(key), false, None, Press::Tap);
+        let stop = StopSignal::new().unwrap();
+        let progress = Progress::default();
+        let result = run_controlled(
+            Schedule::default(),
+            &stop,
+            &progress,
+            false,
+            Checks::default(),
+            None,
+            |_, control| {
+                injector.send_checked(
+                    1,
+                    control,
+                    None,
+                    || {
+                        stop.request();
+                        true
+                    },
+                    |_, _| panic!("submitted input while the key was held"),
+                )
+            },
+        );
+        assert_eq!(result, Ok(Outcome::Stopped));
+        assert_eq!(progress.actions(), 0);
     }
 
     #[test]

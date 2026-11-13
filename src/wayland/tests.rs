@@ -89,6 +89,22 @@ fn portal_lifecycle() {
     assert_eq!(status().stop.as_deref(), Some("F7"));
     assert_eq!(status().toggle.as_deref(), Some("F6"));
     assert_eq!(displays()[0].from, Point { x: -800, y: 0 });
+    shortcuts.configure();
+    wait_for(
+        || trace().iter().any(|entry| entry == "configure"),
+        || "The portal did not receive ConfigureShortcuts.".into(),
+    );
+    emit(STOP, true);
+    let stop_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let action = events
+            .recv_timeout(stop_deadline.saturating_duration_since(Instant::now()))
+            .expect("Stop was blocked by the pending ConfigureShortcuts reply.");
+        if matches!(action, Action::Stop(_)) {
+            break;
+        }
+    }
+    block_on(fixture.call::<_, _, ()>("FinishConfiguration", &())).unwrap();
     let fixed = Settings {
         fixed: true,
         point: Some(Point { x: -600, y: 40 }),

@@ -354,6 +354,8 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
             Action::Unavailable => signal_stop(&stop_slot),
             #[cfg(target_os = "linux")]
             Action::PortalChanged => signal_stop(&stop_slot),
+            #[cfg(target_os = "linux")]
+            Action::PortalStatus => false,
             Action::Capture(point, requested_at) => stop_slot
                 .lock()
                 .unwrap()
@@ -379,7 +381,7 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                     }
                     Action::Capture(..) => controller.refresh(&ui),
                     #[cfg(target_os = "linux")]
-                    Action::PortalChanged => {
+                    Action::PortalChanged | Action::PortalStatus => {
                         controller.display_shortcuts(&ui);
                         controller.update_configuration(&ui, &controller.state.borrow().settings);
                         controller.refresh(&ui);
@@ -1291,7 +1293,10 @@ impl Controller {
                         result
                     },
                 );
-                if complete.send((Instant::now(), result)).is_ok() {
+                let ended = Instant::now();
+                // X11 text output may still need to restore the keyboard mapping.
+                drop(injector);
+                if complete.send((ended, result)).is_ok() {
                     let _ = slint::invoke_from_event_loop(|| {
                         let controller = ACTIVE_CONTROLLER.with(|local| local.borrow().upgrade());
                         if let Some(controller) = controller
@@ -1508,11 +1513,10 @@ fn pause_hint(reason: PauseReason) -> &'static str {
         PauseReason::CursorConfined => {
             "The cursor is confined away from the target. Release cursor confinement to resume."
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         PauseReason::InputGrabbed => {
             #[cfg(target_os = "linux")]
             let message = "Input is grabbed. Release held buttons or close the grab to resume.";
-            #[cfg(target_os = "macos")]
+            #[cfg(not(target_os = "linux"))]
             let message = "Release the output key or mouse button to resume.";
             message
         }

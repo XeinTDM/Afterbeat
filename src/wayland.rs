@@ -14,7 +14,7 @@ use crate::{
 };
 use futures_lite::{
     StreamExt,
-    future::{block_on, race},
+    future::{block_on, pending, race},
 };
 use portal::{GLOBAL, Options, Portal, REMOTE, Result, SCREENS, Shortcuts, string};
 use std::{
@@ -444,6 +444,7 @@ async fn run_session(
         state.status.displays = displays;
         set_shortcuts(&mut state.status, &bound);
     });
+    let mut configuration = None;
     loop {
         let close = async {
             race(race(shortcut_closed.next(), remote_closed.next()), async {
@@ -465,19 +466,31 @@ async fn run_session(
             },
             race(
                 async { Ok(Next::Command(requests.recv().await.ok())) },
-                close,
+                race(close, async {
+                    match &mut configuration {
+                        Some(reply) => Ok(Next::Configuration(reply.await)),
+                        None => pending().await,
+                    }
+                }),
             ),
         )
         .await?;
         match next {
             Next::Command(Some(Command::Configure)) if version >= 2 => {
-                let result: zbus::Result<()> = global
-                    .call("ConfigureShortcuts", &(&shortcuts.path, "", Options::new()))
-                    .await;
+                if configuration.is_none() {
+                    configuration = Some(Box::pin(async {
+                        global
+                            .call("ConfigureShortcuts", &(&shortcuts.path, "", Options::new()))
+                            .await
+                    }));
+                }
+            }
+            Next::Configuration(result) => {
+                configuration = None;
                 if let Err(error) = result {
-                    update(callback, |state| {
-                        state.status.message = format!("Could not open shortcut settings. {error}")
-                    });
+                    STATE.lock().unwrap().status.message =
+                        format!("Could not open shortcut settings. {error}");
+                    callback(Action::PortalStatus);
                 }
             }
             Next::Command(_) => return Ok(()),
@@ -522,6 +535,7 @@ async fn run_session(
 
 enum Next {
     Command(Option<Command>),
+    Configuration(zbus::Result<()>),
     Signal(zbus::Message),
 }
 
