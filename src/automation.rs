@@ -23,6 +23,9 @@ use windows_sys::Win32::{
     },
 };
 
+pub(crate) const INHERITED_ROUTE_OUTPUT: &str =
+    "Select Mouse or Wheel for unedited route steps, or set an action on each step.";
+
 pub fn prepare(
     settings: &Settings,
     bound: Option<Binding>,
@@ -96,26 +99,47 @@ pub fn validated_schedule(settings: &Settings, bound: Option<Binding>) -> Result
 }
 
 pub fn low_cpu_available(settings: &Settings, bound: Option<Binding>) -> bool {
+    low_cpu_unavailable_reason(settings, bound).is_none()
+}
+
+pub fn low_cpu_unavailable_reason(
+    settings: &Settings,
+    bound: Option<Binding>,
+) -> Option<&'static str> {
     #[cfg(target_os = "linux")]
     if crate::wayland::active() {
-        return false;
+        return Some("Wayland delivers each action individually through the desktop portal.");
     }
-    !settings.keyboard
-        && !settings.scroll
-        && settings.click_count() == 1
-        && !settings.hold_down
-        && !settings.random_rate
-        && !settings.hold_activation
-        && !settings.route_enabled
-        && settings.edge_mode == 0
-        && settings.inside_zone.is_none()
-        && settings.stop_zone.is_none()
-        && settings.process_mode == 0
-        && !bound.is_some_and(Binding::has_modifiers)
-        && settings.press_duration() == Ok(Duration::ZERO)
-        && settings
-            .interval()
-            .is_ok_and(|interval| low_cpu_batch_size(interval) > 1)
+    if settings.keyboard || settings.scroll {
+        Some("Low CPU is available for mouse clicks only.")
+    } else if settings.click_count() != 1 {
+        Some("Low CPU requires Single click instead of Double or Triple.")
+    } else if settings.hold_down || settings.press_duration() != Ok(Duration::ZERO) {
+        Some("Low CPU requires Tap instead of Timed or Hold output.")
+    } else if settings.random_rate {
+        Some("Low CPU is unavailable while Variable rate is on.")
+    } else if settings.hold_activation {
+        Some("Low CPU requires Toggle instead of While held.")
+    } else if settings.route_enabled {
+        Some("Low CPU is unavailable while a route is enabled.")
+    } else if settings.edge_mode != 0
+        || settings.inside_zone.is_some()
+        || settings.stop_zone.is_some()
+        || settings.process_mode != 0
+    {
+        Some("Low CPU is unavailable while zones, screen stops, or app filters are enabled.")
+    } else if bound.is_some_and(Binding::has_modifiers) {
+        Some(
+            "Low CPU requires an activation shortcut without Ctrl, Alt, Shift, or other modifiers.",
+        )
+    } else if !settings
+        .interval()
+        .is_ok_and(|interval| low_cpu_batch_size(interval) > 1)
+    {
+        Some("Low CPU requires a fixed rate of 50–1,000 clicks/s.")
+    } else {
+        None
+    }
 }
 
 fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
@@ -156,7 +180,7 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
         }
         settings
             .target_timeout()
-            .map_err(|message| Issue::new("route", message))?;
+            .map_err(|message| Issue::new("target-timeout", message))?;
         if settings
             .route
             .iter()
@@ -203,13 +227,17 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
                 || settings.press_duration() != Ok(Duration::ZERO))
         {
             return Err(Issue::new(
-                "route",
+                if settings.keyboard {
+                    "input-mode"
+                } else {
+                    "press"
+                },
                 "Use mouse taps or wheel output for a route with control targets.",
             ));
         }
         if settings.radius() != Ok(0) {
             return Err(Issue::new(
-                "route",
+                "radius",
                 "Set the radius to zero for a route with control targets or per-step actions.",
             ));
         }
@@ -228,13 +256,11 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
         ));
     }
     schedule.low_cpu = schedule.low_cpu && low_cpu_available(settings, bound);
-    if settings.has_action_route()
-        && settings
-            .route
-            .iter()
-            .any(|step| !matches!(step, crate::targets::Step::Action(_)))
-    {
-        if settings.scroll && !settings.keyboard {
+    if settings.has_action_route() && settings.inherits_route_cadence() {
+        if settings.keyboard {
+            return Err(Issue::new("input-mode", INHERITED_ROUTE_OUTPUT));
+        }
+        if settings.scroll {
             settings
                 .scroll_ticks()
                 .map_err(|error| Issue::new("input", error))?;
@@ -321,7 +347,7 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
     let radius = if settings.route_enabled {
         settings
             .radius()
-            .map_err(|message| Issue::new("route", message))?
+            .map_err(|message| Issue::new("radius", message))?
     } else {
         0
     };
@@ -395,11 +421,11 @@ pub struct Guard {
 
 impl Guard {
     #[cfg(windows)]
-    pub fn check_route_key(&mut self) -> Gate {
-        let previous = std::mem::replace(&mut self.keyboard, true);
-        let gate = self.check_destination(None);
-        self.keyboard = previous;
-        gate
+    pub fn check_route_key(&mut self, recipient_pid: u32) -> Gate {
+        self.observe_safety(mouse::cursor, Binding::modifiers_pressed)
+            .and_then(|()| self.check_keyboard_recipient(recipient_pid))
+            .err()
+            .unwrap_or(Gate::Open)
     }
     pub fn enabled(&self) -> bool {
         self.hold.is_some()
@@ -530,6 +556,42 @@ impl Guard {
         cursor: impl FnOnce() -> io::Result<mouse::Point>,
         modifiers_pressed: impl FnOnce(Binding) -> bool,
     ) -> Result<Option<u32>, Gate> {
+        self.observe_safety(cursor, modifiers_pressed)?;
+        if self.keyboard {
+            #[cfg(target_os = "linux")]
+            if crate::wayland::active() {
+                return if crate::wayland::focused() {
+                    Err(Gate::Paused(PauseReason::KeyboardFocus))
+                } else {
+                    Ok(None)
+                };
+            }
+            let pid = foreground_pid();
+            self.check_keyboard_recipient(pid)?;
+            return Ok(Some(pid));
+        }
+        Ok(None)
+    }
+
+    fn check_keyboard_recipient(&mut self, pid: u32) -> Result<(), Gate> {
+        if pid == 0 || pid == std::process::id() {
+            return Err(Gate::Paused(PauseReason::KeyboardFocus));
+        }
+        if self
+            .processes
+            .as_mut()
+            .is_some_and(|filter| !filter.permits(pid))
+        {
+            return Err(Gate::Paused(PauseReason::KeyboardFilter));
+        }
+        Ok(())
+    }
+
+    fn observe_safety(
+        &mut self,
+        cursor: impl FnOnce() -> io::Result<mouse::Point>,
+        modifiers_pressed: impl FnOnce(Binding) -> bool,
+    ) -> Result<(), Gate> {
         if self.hold.is_some_and(|binding| !binding.pressed()) {
             return Err(Gate::Stop("Activation released."));
         }
@@ -553,29 +615,7 @@ impl Guard {
         if !matches!(cursor_gate, Gate::Open) {
             return Err(cursor_gate);
         }
-        if self.keyboard {
-            #[cfg(target_os = "linux")]
-            if crate::wayland::active() {
-                return if crate::wayland::focused() {
-                    Err(Gate::Paused(PauseReason::KeyboardFocus))
-                } else {
-                    Ok(None)
-                };
-            }
-            let pid = foreground_pid();
-            if pid == 0 || pid == std::process::id() {
-                return Err(Gate::Paused(PauseReason::KeyboardFocus));
-            }
-            if self
-                .processes
-                .as_mut()
-                .is_some_and(|filter| !filter.permits(pid))
-            {
-                return Err(Gate::Paused(PauseReason::KeyboardFilter));
-            }
-            return Ok(Some(pid));
-        }
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -774,6 +814,96 @@ pub(crate) fn process_image(process: &OwnedHandle) -> Option<String> {
 mod tests {
     use super::*;
     use crate::mouse::Point;
+
+    #[test]
+    fn low_cpu_explains_the_current_blocker_and_rate_boundaries() {
+        let mut settings = Settings {
+            interval: "10".into(),
+            ..Settings::default()
+        };
+        let plain = Binding::parse("F6");
+        for interval in ["1", "10", "20"] {
+            settings.interval = interval.into();
+            assert!(low_cpu_available(&settings, plain));
+            assert_eq!(low_cpu_unavailable_reason(&settings, plain), None);
+        }
+        for interval in ["0", "0.5", "21", "100", "invalid"] {
+            settings.interval = interval.into();
+            assert!(!low_cpu_available(&settings, plain));
+            assert!(
+                low_cpu_unavailable_reason(&settings, plain)
+                    .unwrap()
+                    .contains("50–1,000")
+            );
+        }
+        settings.interval = "10".into();
+        settings.random_rate = true;
+        assert!(
+            low_cpu_unavailable_reason(&settings, plain)
+                .unwrap()
+                .contains("Variable rate")
+        );
+        settings.random_rate = false;
+        settings.keyboard = true;
+        assert!(
+            low_cpu_unavailable_reason(&settings, plain)
+                .unwrap()
+                .contains("mouse clicks only")
+        );
+        settings.keyboard = false;
+        settings.route_enabled = true;
+        assert!(
+            low_cpu_unavailable_reason(&settings, plain)
+                .unwrap()
+                .contains("route")
+        );
+        settings.route_enabled = false;
+        assert!(
+            low_cpu_unavailable_reason(&settings, Binding::parse("Ctrl+F6"))
+                .unwrap()
+                .contains("modifiers")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_routes_require_mouse_or_wheel_for_inherited_steps() {
+        use crate::targets::{Action, ActionStep, Step};
+
+        let mut settings = Settings {
+            keyboard: true,
+            route_enabled: true,
+            route: vec![Step::Point(Point { x: 10, y: 10 })],
+            ..Settings::default()
+        };
+        assert!(validated_schedule(&settings, None).is_ok());
+        settings.route.push(Step::Action(Box::new(ActionStep {
+            action: Action::Wait,
+            target: None,
+            delay_ms: 50,
+        })));
+        assert_eq!(
+            validated_schedule(&settings, None).err().unwrap().message,
+            INHERITED_ROUTE_OUTPUT
+        );
+        assert!(prepare(&settings, None, None).is_err());
+
+        settings.keyboard = false;
+        assert!(validated_schedule(&settings, None).is_ok());
+        settings.scroll = true;
+        assert!(validated_schedule(&settings, None).is_ok());
+
+        settings.keyboard = true;
+        settings.scroll = false;
+        settings.route[0] = Step::Action(Box::new(ActionStep {
+            action: Action::Key {
+                key: "Enter".into(),
+            },
+            target: None,
+            delay_ms: 0,
+        }));
+        assert!(validated_schedule(&settings, None).is_ok());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

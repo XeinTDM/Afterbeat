@@ -120,7 +120,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Library {
     pub profiles: BTreeMap<String, Settings>,
@@ -226,6 +226,22 @@ impl Settings {
             .ok_or("Set point radius between 0 and 200 px.")
     }
 
+    pub fn action_limit(&self) -> Result<Option<u64>, Issue> {
+        if !self.limited {
+            return Ok(None);
+        }
+        self.count
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|v| (1..=100_000_000).contains(v))
+            .map(Some)
+            .ok_or(Issue::new(
+                "repeat",
+                "Set an action limit from 1 to 100,000,000.",
+            ))
+    }
+
     pub fn schedule(&self) -> Result<Schedule, Issue> {
         let inherits_cadence = self.inherits_route_cadence();
         let rates = if !inherits_cadence || (self.hold_down && !self.has_action_route()) {
@@ -248,21 +264,7 @@ impl Settings {
                 "time",
                 "Set a time limit from 0 to 86,400 seconds.",
             ))?;
-        let mut limit = if self.limited {
-            Some(
-                self.count
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|v| (1..=100_000_000).contains(v))
-                    .ok_or(Issue::new(
-                        "repeat",
-                        "Set an action limit from 1 to 100,000,000.",
-                    ))?,
-            )
-        } else {
-            None
-        };
+        let mut limit = self.action_limit()?;
         if self.route_enabled {
             if self.route.is_empty() || self.route.len() > MAX_POINTS {
                 return Err(Issue::new(
@@ -293,7 +295,7 @@ impl Settings {
         {
             return Err(Issue::new(
                 "press",
-                "Use continuous repeat and a single target for Hold down.",
+                "Use continuous repeat and a single target for Hold output.",
             ));
         }
         if !self.has_action_route()
@@ -304,7 +306,7 @@ impl Settings {
         {
             return Err(Issue::new(
                 "click-type",
-                "Select Single click for Hold down.",
+                "Select Single click for Hold output.",
             ));
         }
         Ok(Schedule {

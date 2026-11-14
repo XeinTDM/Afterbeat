@@ -1,7 +1,7 @@
 mod visual;
 
 use crate::{
-    automation::{Guard, process_image, window_pid},
+    automation::{Guard, INHERITED_ROUTE_OUTPUT, process_image, window_pid},
     engine::{Gate, Outcome, PauseReason, Random, RunControl, Schedule},
     mouse::{Injector, Point, RouteDelivery, RouteInput, Zone, on_monitor},
     targets::{
@@ -190,6 +190,27 @@ impl Resolution {
         }
     }
 
+    pub fn preview_status(&self, targeted_key: bool) -> (bool, &'static str) {
+        let (Self::Ready(target) | Self::Recovered(target)) = self else {
+            return (true, self.message());
+        };
+        if !targeted_key {
+            return (false, self.message());
+        }
+        if !target.supports_targeted_key() {
+            return (
+                true,
+                "This control has no distinct native focus handle. Use a foreground key step.",
+            );
+        }
+        let message = if matches!(self, Self::Recovered(_)) {
+            "Anchored match. Focus the control before the key step runs."
+        } else {
+            "Focus this control before the key step runs."
+        };
+        (false, message)
+    }
+
     fn pause(&self) -> PauseReason {
         match self {
             Self::Missing => PauseReason::TargetMissing,
@@ -213,6 +234,10 @@ pub struct Target {
 }
 
 impl Target {
+    fn supports_targeted_key(&self) -> bool {
+        self.control_window != 0 && self.control_window != self.native.window
+    }
+
     fn current(&self) -> bool {
         self.observed_at.elapsed() < FRESHNESS
             && NativeHit::at(self.point) == Some(self.native)
@@ -228,11 +253,23 @@ impl Target {
 struct Focus {
     window: usize,
     leaf: usize,
+    recipient_pid: u32,
 }
 
 impl Focus {
-    fn current(self) -> bool {
-        foreground_focus() == Some(self)
+    fn authorize_key(
+        read_focus: impl FnOnce() -> Option<Self>,
+        check_recipient: impl FnOnce(u32) -> Gate,
+    ) -> Result<Self, Gate> {
+        let focus = read_focus();
+        match check_recipient(focus.map_or(0, |focus| focus.recipient_pid)) {
+            Gate::Open => focus.ok_or(Gate::Paused(PauseReason::KeyboardFocus)),
+            gate => Err(gate),
+        }
+    }
+
+    fn current(self, read_focus: impl FnOnce() -> Option<Self>) -> bool {
+        read_focus() == Some(self)
     }
 }
 
@@ -253,6 +290,7 @@ fn foreground_focus() -> Option<Focus> {
         Some(Focus {
             window: window.0 as usize,
             leaf: info.hwndFocus.0 as usize,
+            recipient_pid: window_pid(info.hwndFocus.0),
         })
     }
 }
@@ -322,36 +360,29 @@ struct Automation {
 impl Automation {
     fn resolve_key(&self, selector: &Selector) -> Resolution {
         let result = self.resolve(selector, None);
-        let (target, recovered) = match result {
-            Resolution::Ready(target) => (target, false),
-            Resolution::Recovered(target) => (target, true),
+        let target = match &result {
+            Resolution::Ready(target) | Resolution::Recovered(target) => target,
             _ => return result,
         };
-        let Some(focus) = foreground_focus().filter(|focus| focus.window == target.native.window)
-        else {
-            return Resolution::Unavailable;
-        };
         // Only a distinct native focus handle can be rechecked on the sender.
-        if target.control_window == 0
-            || target.control_window != focus.leaf
-            || focus.leaf == focus.window
-        {
+        if !target.supports_targeted_key() {
             return Resolution::Unavailable;
         }
+        let Some(focus) = foreground_focus().filter(|focus| {
+            focus.window == target.native.window && focus.leaf == target.control_window
+        }) else {
+            return Resolution::Unavailable;
+        };
         let matches = unsafe {
             self.client
                 .GetFocusedElement()
                 .and_then(|element| element.CurrentNativeWindowHandle())
         }
         .is_ok_and(|handle| handle.0 as usize == focus.leaf);
-        if !matches || !focus.current() {
+        if !matches || !focus.current(foreground_focus) {
             return Resolution::Unavailable;
         }
-        if recovered {
-            Resolution::Recovered(target)
-        } else {
-            Resolution::Ready(target)
-        }
+        result
     }
     fn new() -> windows::core::Result<Self> {
         unsafe {
@@ -945,7 +976,8 @@ impl Route {
                             .ok_or("The route key is unavailable on this keyboard layout.")?,
                     )),
                 },
-                _ if settings.scroll && !settings.keyboard => Some(RouteInput::Scroll(
+                _ if settings.keyboard => return Err(INHERITED_ROUTE_OUTPUT.into()),
+                _ if settings.scroll => Some(RouteInput::Scroll(
                     settings.scroll_direction,
                     settings.scroll_ticks()?,
                 )),
@@ -1020,23 +1052,30 @@ impl Route {
                     {
                         self.validate_layout(point)?;
                     }
-                    let gate = if key {
-                        guard.check_route_key()
+                    let key_focus = if key {
+                        Focus::authorize_key(foreground_focus, |pid| guard.check_route_key(pid))
+                            .map(Some)
                     } else {
-                        guard.check_destination(point)
+                        match guard.check_destination(point) {
+                            Gate::Open => Ok(None),
+                            gate => Err(gate),
+                        }
                     };
-                    match gate {
-                        Gate::Stop(reason) => return Ok(StepResult::End(Outcome::Guarded(reason))),
-                        Gate::Paused(reason) => break 'ready (reason, RESPONSE_POLL),
-                        Gate::Open => {}
-                    }
+                    let key_focus = match key_focus {
+                        Ok(focus) => focus,
+                        Err(Gate::Stop(reason)) => {
+                            return Ok(StepResult::End(Outcome::Guarded(reason)));
+                        }
+                        Err(Gate::Paused(reason)) => break 'ready (reason, RESPONSE_POLL),
+                        Err(Gate::Open) => unreachable!(),
+                    };
                     if input.is_held() {
                         break 'ready (PauseReason::InputGrabbed, RESPONSE_POLL);
                     }
-                    let focus = if key || scroll {
+                    let focus = if scroll {
                         foreground_focus()
                     } else {
-                        None
+                        key_focus
                     };
                     let native = if !key {
                         point.and_then(NativeHit::at)
@@ -1080,7 +1119,7 @@ impl Route {
                     match input.send(destination, control, || {
                         !stop_pending()
                             && !input.is_held()
-                            && focus.is_none_or(Focus::current)
+                            && focus.is_none_or(|focus| focus.current(foreground_focus))
                             && (key || point.and_then(NativeHit::at) == native)
                     })? {
                         RouteDelivery::Retry => {
@@ -1094,6 +1133,8 @@ impl Route {
             if let Some(outcome) = control.wait_for_target(
                 reason,
                 retry.min(deadline.saturating_duration_since(Instant::now())),
+                self.index,
+                deadline,
             )? {
                 return Ok(StepResult::End(outcome));
             }
@@ -1177,6 +1218,8 @@ impl Route {
             if let Some(end) = control.wait_for_target(
                 reason,
                 retry.min(deadline.saturating_duration_since(Instant::now())),
+                self.index,
+                deadline,
             )? {
                 return Ok(Some(end));
             }
@@ -1217,7 +1260,10 @@ impl Route {
                 false,
             )?;
             match &result {
-                Some(Resolution::Missing) if missing => return Ok(None),
+                Some(Resolution::Missing) if missing => {
+                    control.clear_target_wait();
+                    return Ok(None);
+                }
                 Some(status) => missing = matches!(status, Resolution::Missing),
                 None => {}
             }
@@ -1235,6 +1281,8 @@ impl Route {
             if let Some(end) = control.wait_for_target(
                 PauseReason::VerifyingTarget,
                 retry.min(deadline.saturating_duration_since(Instant::now())),
+                self.index,
+                deadline,
             )? {
                 return Ok(Some(if end == Outcome::Completed {
                     Outcome::Guarded("Time limit reached before the last click could be verified.")
@@ -1311,5 +1359,103 @@ fn poll(
         }
         Err(TryRecvError::Empty) => Ok(None),
         Err(TryRecvError::Disconnected) => Err("The Windows UI Automation worker stopped.".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_key_rechecks_the_focus_used_for_authorization() {
+        use std::cell::Cell;
+
+        let allowed = Focus {
+            window: 100,
+            leaf: 101,
+            recipient_pid: 200,
+        };
+        let blocked = Focus {
+            window: 300,
+            leaf: 301,
+            recipient_pid: 400,
+        };
+        let foreground = Cell::new(Some(allowed));
+        let check_recipient = |pid| {
+            if pid == allowed.recipient_pid {
+                foreground.set(Some(blocked));
+                Gate::Open
+            } else {
+                Gate::Paused(PauseReason::KeyboardFilter)
+            }
+        };
+
+        let authorized = Focus::authorize_key(|| foreground.get(), check_recipient)
+            .ok()
+            .unwrap();
+        assert!(authorized.current(|| Some(allowed)));
+        assert!(!authorized.current(|| foreground.get()));
+        assert!(matches!(
+            Focus::authorize_key(|| foreground.get(), check_recipient),
+            Err(Gate::Paused(PauseReason::KeyboardFilter))
+        ));
+        assert!(!allowed.current(|| Some(Focus {
+            leaf: 102,
+            ..allowed
+        })));
+        // A reused HWND must not inherit authorization for the old process.
+        assert!(!allowed.current(|| Some(Focus {
+            recipient_pid: 400,
+            ..allowed
+        })));
+        assert!(!allowed.current(|| None));
+    }
+
+    #[test]
+    fn dry_run_reports_key_focus_requirements_for_resolved_controls() {
+        let target = Target {
+            point: Point { x: 10, y: 10 },
+            bounds: Zone {
+                from: Point { x: 0, y: 0 },
+                to: Point { x: 20, y: 20 },
+            },
+            native: NativeHit {
+                window: 1,
+                leaf: 1,
+                pid: 10,
+                rect: (0, 0, 20, 20),
+                leaf_rect: (0, 0, 20, 20),
+                dpi: 96,
+            },
+            observed_at: Instant::now(),
+            control_window: 1,
+            visual_check: None,
+        };
+        let shared_handle = Resolution::Ready(target.clone());
+        assert_eq!(
+            shared_handle.preview_status(false),
+            (false, "Control located and ready.")
+        );
+        for control_window in [0, 1] {
+            let resolution = Resolution::Ready(Target {
+                control_window,
+                ..target.clone()
+            });
+            assert_eq!(
+                resolution.preview_status(true),
+                (
+                    true,
+                    "This control has no distinct native focus handle. Use a foreground key step."
+                )
+            );
+        }
+        let distinct_handle = Resolution::Ready(Target {
+            control_window: 2,
+            ..target
+        });
+        assert_eq!(
+            distinct_handle.preview_status(true),
+            (false, "Focus this control before the key step runs.")
+        );
     }
 }

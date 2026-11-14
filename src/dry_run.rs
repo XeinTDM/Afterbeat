@@ -5,7 +5,8 @@ use crate::{
     mouse::{self, Point, Zone},
     point_label,
     settings::Settings,
-    targets::Step,
+    shared_output_label,
+    targets::{Action, Step},
 };
 use slint::{ModelRc, VecModel};
 
@@ -18,7 +19,7 @@ pub fn can_sample(settings: &Settings) -> bool {
 }
 
 pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), &'static str> {
-    show_targets(ui, settings, sample, |_: usize| Preview {
+    show_targets(ui, settings, sample, |_, _| Preview {
         point: None,
         bounds: None,
         landmark: None,
@@ -37,12 +38,10 @@ pub fn show_smart(
     results: &[crate::smart_targets::Resolution],
 ) -> Result<(), &'static str> {
     use crate::smart_targets::Resolution;
-    show_targets(ui, settings, None, |index| {
-        let result = results
-            .get(index)
-            .cloned()
-            .unwrap_or(Resolution::Unavailable);
-        let (point, bounds, landmark) = match &result {
+    show_targets(ui, settings, None, |index, key| {
+        let result = results.get(index).unwrap_or(&Resolution::Unavailable);
+        let (blocked, message) = result.preview_status(key);
+        let (point, bounds, landmark) = match result {
             Resolution::Ready(target)
             | Resolution::Recovered(target)
             | Resolution::Conflict(target) => (
@@ -56,9 +55,9 @@ pub fn show_smart(
             point,
             bounds,
             landmark,
-            message: result.message(),
+            message,
             repair: matches!(result, Resolution::Recovered(_) | Resolution::Conflict(_)),
-            blocked: !matches!(result, Resolution::Ready(_) | Resolution::Recovered(_)),
+            blocked,
         }
     })
 }
@@ -76,7 +75,7 @@ fn show_targets(
     ui: &App,
     settings: &Settings,
     sample: Option<Point>,
-    preview: impl Fn(usize) -> Preview,
+    preview: impl Fn(usize, bool) -> Preview,
 ) -> Result<(), &'static str> {
     let displays = mouse::display_areas();
     let Some(first) = displays.first() else {
@@ -137,10 +136,20 @@ fn show_targets(
         } else {
             0.0
         };
+    let shared_output = slint::SharedString::from(shared_output_label(settings));
     let points: Vec<_> = steps
         .iter()
         .enumerate()
         .map(|(index, step)| {
+            let counts_as_action =
+                !matches!(step, Step::Action(action) if action.action == Action::Wait);
+            let inherited_output = if settings.route_enabled && !matches!(step, Step::Action(_)) {
+                shared_output.clone()
+            } else {
+                Default::default()
+            };
+            let key =
+                matches!(step, Step::Action(step) if matches!(step.action, Action::Key { .. }));
             let preview = if let Some(point) = step.point() {
                 Preview {
                     point: Some(point),
@@ -151,19 +160,28 @@ fn show_targets(
                     blocked: false,
                 }
             } else if step.is_smart() {
-                preview(index)
+                preview(index, key)
             } else {
-                let wait = matches!(step, Step::Action(action) if action.action == crate::targets::Action::Wait);
                 Preview {
-                    point: None, bounds: None, landmark: None, repair: false, blocked: false,
-                    message: if wait { "Waits without sending input." } else { "Uses the focused app when the step runs." },
+                    point: None,
+                    bounds: None,
+                    landmark: None,
+                    repair: false,
+                    blocked: false,
+                    message: if !counts_as_action {
+                        "Waits without sending input."
+                    } else {
+                        "Uses the focused app when the step runs."
+                    },
                 }
             };
             let Some(point) = preview.point else {
                 return DryPoint {
                     blocked: preview.blocked,
+                    counts_as_action,
                     hidden: true,
                     location: step.label().into(),
+                    inherited_output,
                     result: preview.message.into(),
                     ..Default::default()
                 };
@@ -174,19 +192,22 @@ fn show_targets(
             if let Some(landmark) = preview.landmark {
                 areas.push(area(landmark, 4));
             }
-            let (blocked, message) = if mouse::on_monitor(point) {
+            let (blocked, terminal, message) = if preview.blocked || key {
+                // A pending control match has no confirmed destination. Keys use focus.
+                (preview.blocked, false, preview.message)
+            } else if mouse::on_monitor(point) {
                 match spatial_gate(
                     point,
                     settings.edge_mode,
                     settings.inside_zone,
                     settings.stop_zone,
                 ) {
-                    Gate::Open => (preview.blocked, preview.message),
-                    Gate::Paused(_) => (true, "Would pause outside the inside-only zone."),
-                    Gate::Stop(reason) => (true, reason),
+                    Gate::Open => (preview.blocked, false, preview.message),
+                    Gate::Paused(_) => (true, false, "Would pause outside the inside-only zone."),
+                    Gate::Stop(reason) => (true, true, reason),
                 }
             } else {
-                (true, "Point is outside your displays.")
+                (true, true, "Point is outside your displays.")
             };
             DryPoint {
                 x: x(point.x),
@@ -194,6 +215,8 @@ fn show_targets(
                 radius_x: radius / width,
                 radius_y: radius / height,
                 blocked,
+                terminal,
+                counts_as_action,
                 hidden: false,
                 repair: preview.repair,
                 location: if !matches!(step, Step::Point(_)) {
@@ -202,6 +225,7 @@ fn show_targets(
                     point_label(point)
                 }
                 .into(),
+                inherited_output,
                 result: message.into(),
             }
         })
@@ -225,6 +249,7 @@ fn show_targets(
     );
     ui.set_dry_areas(ModelRc::new(VecModel::from(areas)));
     ui.set_dry_points(ModelRc::new(VecModel::from(points)));
+    ui.set_dry_action_limit(settings.action_limit().ok().flatten().unwrap_or(0) as i32);
     ui.set_dry_aspect(width / height);
     Ok(())
 }

@@ -132,10 +132,122 @@ struct State {
     saved: Settings,
     settings_dirty: bool,
     library: Library,
+    active_preset: Option<String>,
+    pending_preset: Option<String>,
+    route_undo: Option<RouteUndo>,
     library_dirty: bool,
     run: Option<Run>,
     zone_origin: Option<(i32, Point)>,
     pad_hits: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct RouteSnapshot {
+    steps: Vec<Step>,
+    enabled: bool,
+    once: bool,
+    wayland: bool,
+}
+
+impl RouteSnapshot {
+    fn capture(settings: &Settings) -> Self {
+        Self {
+            steps: settings.route.clone(),
+            enabled: settings.route_enabled,
+            once: settings.route_once,
+            wayland: settings.route_wayland,
+        }
+    }
+
+    fn restore(self, settings: &mut Settings) {
+        settings.route = self.steps;
+        settings.route_enabled = self.enabled;
+        settings.route_once = self.once;
+        settings.route_wayland = self.wayland;
+    }
+
+    fn matches(&self, settings: &Settings) -> bool {
+        self.steps == settings.route
+            && self.enabled == settings.route_enabled
+            && self.once == settings.route_once
+            && self.wayland == settings.route_wayland
+    }
+}
+
+struct RouteUndo {
+    before: RouteSnapshot,
+    after: RouteSnapshot,
+    index: usize,
+}
+
+impl RouteUndo {
+    fn remove(settings: &mut Settings, index: usize) -> Self {
+        let before = RouteSnapshot::capture(settings);
+        settings.route.remove(index);
+        if settings.route.is_empty() {
+            settings.route_enabled = false;
+        }
+        Self {
+            before,
+            after: RouteSnapshot::capture(settings),
+            index,
+        }
+    }
+
+    fn restore(self, settings: &mut Settings) -> Option<usize> {
+        if !self.after.matches(settings) {
+            return None;
+        }
+        self.before.restore(settings);
+        Some(self.index)
+    }
+}
+
+fn setup_needs_preserving(settings: &Settings, library: &Library, active: bool) -> bool {
+    let saved_as_preset = library.profiles.values().any(|preset| {
+        let mut preset = preset.clone();
+        preset.normalize();
+        settings == &preset
+    });
+    !saved_as_preset && (active || settings != &Settings::default())
+}
+
+fn move_route_step(route: &mut Vec<Step>, from: usize, to: usize) -> bool {
+    if from >= route.len() || to >= route.len() || from == to {
+        return false;
+    }
+    let step = route.remove(from);
+    route.insert(to, step);
+    true
+}
+
+fn run_limit_summary(schedule: &Schedule) -> String {
+    let actions = schedule.limit.map_or_else(
+        || "No action limit".to_owned(),
+        |limit| format!("{} actions max", grouped(limit)),
+    );
+    let time = schedule.duration.map_or_else(
+        || "No time limit".to_owned(),
+        |duration| format!("{} s max", duration.as_secs_f64()),
+    );
+    format!("  ·  {actions}  ·  {time}")
+}
+
+fn new_preset(library: &Library, name: &str, settings: &Settings) -> Result<Library, &'static str> {
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err("Enter a preset name from 1 to 40 characters.");
+    }
+    if library.profiles.contains_key(name) {
+        return Err("That name is taken. Choose another name or select the preset to update it.");
+    }
+    if library.profiles.len() >= 100 {
+        return Err("Save up to 100 presets. Delete one to add another.");
+    }
+    let mut library = library.clone();
+    library
+        .set_profile(name, settings.clone())
+        .map_err(|_| "Presets are too large to save. Shorten the settings or delete a preset.")?;
+    Ok(library)
 }
 
 #[derive(Clone, Copy)]
@@ -262,9 +374,13 @@ fn launch() -> Result<(), Box<dyn Error>> {
     {
         app.set_process_example("firefox".into());
         app.set_native_wayland(wayland::active());
+        app.set_stop_fallback("Ctrl+Shift+F7".into());
     }
     #[cfg(target_os = "macos")]
-    app.set_process_example("Safari, Finder".into());
+    {
+        app.set_process_example("Safari, Finder".into());
+        app.set_stop_fallback("".into());
+    }
     run_app(app)
 }
 
@@ -315,6 +431,9 @@ fn run_app(app: App) -> Result<(), Box<dyn Error>> {
             settings_dirty: recovered_settings,
             settings,
             library,
+            active_preset: None,
+            pending_preset: None,
+            route_undo: None,
             library_dirty: recovered_library,
             run: None,
             zone_origin: None,
@@ -483,6 +602,8 @@ impl Controller {
         bind!(on_reset_pad, reset_pad);
         bind!(on_apply_shortcut, apply_shortcut);
         bind!(on_edit_route, edit_route, operation);
+        bind!(on_move_route_to, move_route_to);
+        bind!(on_undo_route_removal, undo_route_removal);
         #[cfg(windows)]
         bind!(on_toggle_target_verification, toggle_target_verification);
         #[cfg(windows)]
@@ -492,19 +613,36 @@ impl Controller {
         #[cfg(windows)]
         bind!(on_repair_target, repair_target);
         bind!(on_clear_zone, clear_zone, kind);
+        bind!(on_cancel_zone_replacement, cancel_zone_replacement, kind);
         bind!(on_open_dry_run, open_dry_run);
         bind!(on_sample_dry_run, sample_dry_run);
         bind!(on_profile_action, profile_action, operation);
+        bind!(on_resolve_preset_load, resolve_preset_load, operation);
         bind!(on_preset_interval, preset_interval, millis);
         bind!(on_select_unit, select_unit, unit);
         bind!(on_open_data_folder, open_data_folder);
         #[cfg(target_os = "linux")]
         bind!(on_wayland_action, wayland_action, operation);
 
+        let close_ui = ui.as_weak();
         let slot = self.stop_slot.clone();
         ui.window().on_close_requested(move || {
             signal_stop(&slot);
+            if let Some(ui) = close_ui.upgrade()
+                && ui.get_step_editing()
+                && ui.get_step_edited()
+                && !ui.get_active()
+            {
+                ui.invoke_confirm_close();
+                return CloseRequestResponse::KeepWindowShown;
+            }
             CloseRequestResponse::HideWindow
+        });
+        let close_ui = ui.as_weak();
+        ui.on_discard_and_close(move || {
+            if let Some(ui) = close_ui.upgrade() {
+                let _ = ui.hide();
+            }
         });
     }
 
@@ -629,12 +767,10 @@ impl Controller {
         ui.set_has_toggle(self.hotkeys.toggle_binding().is_some());
         #[cfg(target_os = "linux")]
         {
-            let stop = self.hotkeys.stop_label();
-            ui.set_stop_key(stop.as_deref().unwrap_or("—").into());
-            ui.set_capture_key(self.hotkeys.capture_label().unwrap_or("—").into());
-            ui.set_can_start(stop.is_some());
             if wayland::active() {
                 let state = wayland::status();
+                ui.set_stop_key(state.stop.as_deref().unwrap_or("—").into());
+                ui.set_capture_key("—".into());
                 ui.set_can_start(state.ready && state.stop.is_some());
                 ui.set_wayland_ready(state.ready);
                 ui.set_wayland_pending(state.pending);
@@ -642,6 +778,11 @@ impl Controller {
                 ui.set_wayland_displays(state.displays.into());
                 ui.set_wayland_status(state.message.into());
                 let _ = wayland::layout_unchanged(ui);
+            } else {
+                let stop = self.hotkeys.stop_label();
+                ui.set_stop_key(stop.as_deref().unwrap_or("—").into());
+                ui.set_capture_key(self.hotkeys.capture_label().unwrap_or("—").into());
+                ui.set_can_start(stop.is_some());
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -660,6 +801,7 @@ impl Controller {
                     if !ui.get_active() && !ui.get_wayland_pending() && !ui.get_wayland_ready() =>
                 {
                     if hotkeys.enable(operation == 1) {
+                        status(ui, "");
                         ui.set_wayland_pending(true);
                     } else {
                         failure(ui, "Could not start the Wayland permission request.");
@@ -694,10 +836,13 @@ impl Controller {
             Ok(()) => {
                 let mut state = self.state.borrow_mut();
                 state.settings.trigger = text.trim().into();
+                ui.set_saved_trigger(state.settings.trigger.as_str().into());
+                ui.set_trigger_text(state.settings.trigger.as_str().into());
                 self.update_configuration(ui, &state.settings);
                 self.display_shortcuts(ui);
                 ui.set_shortcut_error("".into());
                 status(ui, "");
+                drop(state);
                 self.queue_save();
             }
             Err(error) => ui.set_shortcut_error(error.into()),
@@ -705,13 +850,12 @@ impl Controller {
     }
 
     fn preset_interval(&self, ui: &App, millis: i32) {
-        if ui.get_active() || ui.get_capturing() {
+        if ui.get_active() || ui.get_capturing() || ui.get_step_editing() || ui.get_hold_down() {
             return;
         }
         ui.set_interval_text(millis.to_string().into());
         ui.set_interval_unit(0);
         ui.set_random_rate(false);
-        ui.set_hold_down(false);
         self.settings_edited(ui);
     }
 
@@ -750,6 +894,7 @@ impl Controller {
         ui.set_process_mode(settings.process_mode.into());
         ui.set_process_names(settings.process_names.as_str().into());
         ui.set_trigger_text(settings.trigger.as_str().into());
+        ui.set_saved_trigger(settings.trigger.as_str().into());
         ui.set_button_mode(settings.button.index());
         self.update_configuration(ui, settings);
         Self::display_points(ui, settings, None);
@@ -810,18 +955,17 @@ impl Controller {
         let schedule = automation::validated_schedule(settings, binding);
         let issue = schedule.as_ref().err();
         ui.set_low_cpu_available(automation::low_cpu_available(settings, binding));
+        ui.set_low_cpu_reason(
+            automation::low_cpu_unavailable_reason(settings, binding)
+                .unwrap_or_default()
+                .into(),
+        );
         ui.set_configuration_error(issue.map_or("", |issue| issue.message).into());
         ui.set_configuration_field(issue.map_or("", |issue| issue.field).into());
-        let mut limits = String::new();
-        if let Ok(schedule) = schedule {
-            if let Some(limit) = schedule.limit {
-                limits.push_str(&format!("  ·  {} actions", grouped(limit)));
-            }
-            if schedule.duration.is_some() {
-                limits.push_str(&format!("  ·  {} s limit", settings.time_limit.trim()));
-            }
-        }
-        ui.set_limit_summary(limits.into());
+        ui.set_limit_summary(schedule.as_ref().map_or_else(
+            |_| "  ·  Check run settings".into(),
+            |schedule| run_limit_summary(schedule).into(),
+        ));
         if ui.get_run_state() == "Last run" {
             ui.set_run_state("".into());
         }
@@ -850,15 +994,7 @@ impl Controller {
         } else if settings.hold_down {
             "Held down".into()
         } else {
-            match settings.rates() {
-                Ok(Some((low, high))) => format!("{}–{} /s", rate_label(low), rate_label(high)),
-                Ok(None) => match settings.interval() {
-                    Ok(interval) if interval.is_zero() => "Max speed".into(),
-                    Ok(interval) => format!("{} /s", rate_label(interval.as_secs_f64().recip())),
-                    Err(_) => "Check timing".into(),
-                },
-                Err(_) => "Check rate range".into(),
-            }
+            cadence_label(settings)
         };
         ui.set_pace_value(pace.into());
     }
@@ -885,27 +1021,38 @@ impl Controller {
         let index = ui.get_route_index().clamp(-1, model.len() as i32 - 1);
         ui.set_route_rows(slint::ModelRc::new(slint::VecModel::from(model)));
         ui.set_route_index(index);
+        ui.set_route_position((index.max(0) + 1).to_string().into());
+        ui.set_route_move_error("".into());
         for (kind, zone) in [(2, settings.inside_zone), (3, settings.stop_zone)] {
-            let text = if let Some((_, point)) = origin.filter(|(pending, _)| *pending == kind) {
-                format!(
-                    "First corner {}. Pick the opposite corner.",
-                    point_label(point)
-                )
-            } else if let Some(zone) = zone {
-                format!("{} to {}", point_label(zone.from), point_label(zone.to))
-            } else {
-                "Unset".into()
-            };
+            let text = zone.map_or_else(
+                || "Unset".into(),
+                |zone| format!("{} to {}", point_label(zone.from), point_label(zone.to)),
+            );
+            let pending = origin.filter(|(pending, _)| *pending == kind).map_or_else(
+                String::new,
+                |(_, point)| {
+                    format!(
+                        "First corner {}. Pick the opposite corner.",
+                        point_label(point)
+                    )
+                },
+            );
             if kind == 2 {
                 ui.set_inside_label(text.into());
+                ui.set_inside_pending(pending.into());
             } else {
                 ui.set_stop_zone_label(text.into());
+                ui.set_stop_zone_pending(pending.into());
             }
         }
     }
 
     fn edit_route(&self, ui: &App, operation: i32) {
-        if ui.get_active() || ui.get_capturing() {
+        if ui.get_active()
+            || ui.get_capturing()
+            || ui.get_step_editing()
+            || ui.get_preset_load_open()
+        {
             return;
         }
         let Ok(index) = usize::try_from(ui.get_route_index()) else {
@@ -926,18 +1073,85 @@ impl Controller {
                 index as i32 + 1
             }
             0 => {
-                route.remove(index);
-                (index as i32).min(route.len() as i32 - 1)
+                state.route_undo = Some(RouteUndo::remove(&mut state.settings, index));
+                status(ui, "Route step removed. Undo removal is available.");
+                (index as i32).min(state.settings.route.len() as i32 - 1)
             }
             _ => return,
         };
-        if route.is_empty() {
-            state.settings.route_enabled = false;
-            ui.set_route_enabled(false);
-        }
+        ui.set_route_enabled(state.settings.route_enabled);
+        ui.set_route_move_error("".into());
         ui.set_route_index(selected);
         Self::display_points(ui, &state.settings, state.zone_origin);
         self.update_configuration(ui, &state.settings);
+        drop(state);
+        self.queue_save();
+    }
+
+    fn move_route_to(&self, ui: &App) {
+        if ui.get_active()
+            || ui.get_capturing()
+            || ui.get_step_editing()
+            || ui.get_preset_load_open()
+        {
+            return;
+        }
+        let Ok(index) = usize::try_from(ui.get_route_index()) else {
+            return;
+        };
+        let mut state = self.state.borrow_mut();
+        let count = state.settings.route.len();
+        if index >= count {
+            return;
+        }
+        let destination = ui
+            .get_route_position()
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|position| (1..=count).contains(position));
+        let Some(destination) = destination else {
+            ui.set_route_move_error(format!("Enter a position from 1 to {count}.").into());
+            return;
+        };
+        ui.set_route_move_error("".into());
+        ui.set_route_position(destination.to_string().into());
+        if !move_route_step(&mut state.settings.route, index, destination - 1) {
+            return;
+        }
+        ui.set_route_index(destination as i32 - 1);
+        Self::display_points(ui, &state.settings, state.zone_origin);
+        self.update_configuration(ui, &state.settings);
+        status(
+            ui,
+            &format!("Moved step {} to position {destination}.", index + 1),
+        );
+        drop(state);
+        self.queue_save();
+    }
+
+    fn undo_route_removal(&self, ui: &App) {
+        if ui.get_active()
+            || ui.get_capturing()
+            || ui.get_step_editing()
+            || ui.get_preset_load_open()
+        {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let Some(undo) = state.route_undo.take() else {
+            return;
+        };
+        let Some(index) = undo.restore(&mut state.settings) else {
+            ui.set_can_undo_route(false);
+            return;
+        };
+        ui.set_route_enabled(state.settings.route_enabled);
+        ui.set_route_once(state.settings.route_once);
+        ui.set_route_index(index as i32);
+        Self::display_points(ui, &state.settings, state.zone_origin);
+        self.update_configuration(ui, &state.settings);
+        status(ui, "Route step restored.");
         drop(state);
         self.queue_save();
     }
@@ -967,7 +1181,7 @@ impl Controller {
 
     #[cfg(windows)]
     fn edit_step(&self, ui: &App, index: i32) {
-        use targets::{Action, Direction};
+        use targets::Action;
         if ui.get_active() || ui.get_capturing() {
             return;
         }
@@ -1000,12 +1214,7 @@ impl Controller {
                         direction: selected,
                         ticks,
                     } => {
-                        direction = match selected {
-                            Direction::Up => 0,
-                            Direction::Down => 1,
-                            Direction::Left => 2,
-                            Direction::Right => 3,
-                        };
+                        direction = selected.index();
                         count = *ticks;
                         2
                     }
@@ -1032,8 +1241,15 @@ impl Controller {
             }
         };
         ui.set_step_edit_index(index);
-        ui.set_step_has_target(step.is_some_and(|step| step.point().is_some() || step.is_smart()));
+        let has_target = step.is_some_and(|step| step.point().is_some() || step.is_smart());
+        ui.set_step_has_target(has_target);
         ui.set_step_control_target(step.is_some_and(Step::is_smart));
+        ui.set_step_inherits(step.is_some_and(|step| !matches!(step, Step::Action(_))));
+        if has_target {
+            let settings = &state.settings;
+            let output = shared_output_label(settings);
+            ui.set_step_inherited_summary(format!("{output} · {}", cadence_label(settings)).into());
+        }
         ui.set_step_kind(kind);
         ui.set_step_delay(delay.to_string().into());
         ui.set_step_count(count.to_string().into());
@@ -1041,59 +1257,67 @@ impl Controller {
         ui.set_step_direction(direction);
         ui.set_step_key(key.into());
         ui.set_step_error("".into());
+        ui.set_step_edited(false);
         ui.set_step_editing(true);
         ui.invoke_reveal_step_editor();
     }
 
     #[cfg(windows)]
     fn save_step(&self, ui: &App) {
-        use targets::{Action, ActionStep, Direction};
+        use targets::{Action, ActionStep, Destination, Direction};
         if !ui.get_step_editing() || ui.get_active() || ui.get_capturing() {
             return;
         }
         let mut state = self.state.borrow_mut();
         let settings = &mut state.settings;
         let index = usize::try_from(ui.get_step_edit_index()).ok();
-        let result = (|| {
-            let target = index
-                .and_then(|index| settings.route.get(index))
-                .and_then(Step::destination);
-            let delay_ms = ui
-                .get_step_delay()
-                .trim()
-                .parse()
-                .map_err(|_| "Enter a whole delay in milliseconds.")?;
-            let count = || {
-                ui.get_step_count()
-                    .trim()
-                    .parse::<u8>()
-                    .map_err(|_| "Enter a whole click or wheel tick count.")
-            };
-            let action = match ui.get_step_kind() {
-                0 => Action::Click {
-                    button: Button::from_index(ui.get_step_button()),
-                    count: count()?,
-                },
-                1 => Action::Wait,
-                2 => Action::Scroll {
-                    direction: Direction::from_index(ui.get_step_direction()),
-                    ticks: count()?,
-                },
-                _ => Action::Key {
-                    key: ui.get_step_key().trim().to_owned(),
-                },
-            };
-            if action == Action::Wait && target.is_some() {
-                return Err("Use Add step to insert a wait alongside this target.");
+        let existing = index.and_then(|index| settings.route.get(index));
+        let target = existing.and_then(Step::destination);
+        let result = if ui.get_step_inherits() {
+            match target {
+                Some(Destination::Point(point)) => Ok(Step::Point(point)),
+                Some(Destination::Control(control)) => Ok(Step::Control(control)),
+                None => Err("Only a saved point or control can use Clicker settings."),
             }
-            let step = ActionStep {
-                target,
-                action,
-                delay_ms,
-            };
-            automation::validate_action(&step, self.hotkeys.toggle_binding())?;
-            Ok::<_, &'static str>(Step::Action(Box::new(step)))
-        })();
+        } else {
+            (|| {
+                let delay_ms = ui
+                    .get_step_delay()
+                    .trim()
+                    .parse()
+                    .map_err(|_| "Enter a whole delay in milliseconds.")?;
+                let count = || {
+                    ui.get_step_count()
+                        .trim()
+                        .parse::<u8>()
+                        .map_err(|_| "Enter a whole click or wheel tick count.")
+                };
+                let action = match ui.get_step_kind() {
+                    0 => Action::Click {
+                        button: Button::from_index(ui.get_step_button()),
+                        count: count()?,
+                    },
+                    1 => Action::Wait,
+                    2 => Action::Scroll {
+                        direction: Direction::from_index(ui.get_step_direction()),
+                        ticks: count()?,
+                    },
+                    _ => Action::Key {
+                        key: ui.get_step_key().trim().to_owned(),
+                    },
+                };
+                if action == Action::Wait && target.is_some() {
+                    return Err("Use Add step to insert a wait alongside this target.");
+                }
+                let step = ActionStep {
+                    target,
+                    action,
+                    delay_ms,
+                };
+                automation::validate_action(&step, self.hotkeys.toggle_binding())?;
+                Ok(Step::Action(Box::new(step)))
+            })()
+        };
         let step = match result {
             Ok(step) => step,
             Err(error) => {
@@ -1105,6 +1329,10 @@ impl Controller {
             let Some(existing) = settings.route.get_mut(index) else {
                 return;
             };
+            if ui.get_step_inherits() && *existing == step {
+                ui.set_step_editing(false);
+                return;
+            }
             *existing = step;
             index
         } else {
@@ -1116,11 +1344,11 @@ impl Controller {
                 .ok()
                 .filter(|index| *index < settings.route.len())
                 .map_or(settings.route.len(), |index| index + 1);
+            settings.route_enabled |= settings.route.is_empty();
             settings.route.insert(selected, step);
             selected
         };
-        settings.route_enabled = true;
-        ui.set_route_enabled(true);
+        ui.set_route_enabled(settings.route_enabled);
         ui.set_route_index(selected as i32);
         ui.set_step_editing(false);
         Self::display_points(ui, &state.settings, state.zone_origin);
@@ -1152,6 +1380,20 @@ impl Controller {
         self.queue_save();
     }
 
+    fn cancel_zone_replacement(&self, ui: &App, kind: i32) {
+        if ui.get_active() || ui.get_capturing() || ui.get_step_editing() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        if state
+            .zone_origin
+            .is_some_and(|(pending, _)| pending == kind)
+        {
+            state.zone_origin = None;
+            Self::display_points(ui, &state.settings, state.zone_origin);
+        }
+    }
+
     fn display_library(ui: &App, library: &Library) {
         let name = ui.get_selected_preset();
         let selected = library
@@ -1164,6 +1406,12 @@ impl Controller {
             .map(|name| name.as_str().into())
             .collect();
         ui.set_profile_rows(slint::ModelRc::new(slint::VecModel::from(names)));
+        let summaries: Vec<slint::SharedString> = library
+            .profiles
+            .values()
+            .map(|settings| preset_preview(settings).into())
+            .collect();
+        ui.set_profile_summaries(slint::ModelRc::new(slint::VecModel::from(summaries)));
         ui.set_profile_index(selected.map_or(-1, |index| index as i32));
         Self::display_stats(ui, library);
     }
@@ -1181,7 +1429,38 @@ impl Controller {
     }
 
     fn profile_action(&self, ui: &App, operation: i32) {
-        if ui.get_active() || ui.get_capturing() {
+        if ui.get_active()
+            || ui.get_capturing()
+            || ui.get_step_editing()
+            || ui.get_preset_load_open()
+        {
+            return;
+        }
+        if operation == 1 {
+            let name = ui.get_selected_preset().to_string();
+            let mut state = self.state.borrow_mut();
+            if !state.library.profiles.contains_key(&name) {
+                failure(ui, "Choose a saved preset to load.");
+                return;
+            }
+            if setup_needs_preserving(
+                &state.settings,
+                &state.library,
+                state.active_preset.is_some(),
+            ) {
+                state.pending_preset = Some(name.clone());
+                ui.set_pending_preset(name.into());
+                ui.set_load_save_name("".into());
+                ui.set_load_error("".into());
+                ui.set_load_saved(false);
+                drop(state);
+                ui.invoke_confirm_preset_load();
+            } else {
+                drop(state);
+                if let Err(error) = self.load_preset(ui, &name) {
+                    failure(ui, &error);
+                }
+            }
             return;
         }
         let name = if operation == 0 {
@@ -1198,47 +1477,20 @@ impl Controller {
         let size_error = "Presets are too large to save. Shorten the settings or delete a preset.";
         let notice = match operation {
             0 => {
-                if name.is_empty() || name.chars().count() > 40 {
-                    ui.set_preset_error("Enter a preset name from 1 to 40 characters.".into());
-                    return;
-                }
-                if state.library.profiles.contains_key(name) {
-                    ui.set_preset_error("That name is taken. Choose another name or select the preset to update it.".into());
-                    return;
-                }
-                if state.library.profiles.len() >= 100 {
-                    ui.set_preset_error(
-                        "Save up to 100 presets. Delete one to add another.".into(),
-                    );
-                    return;
-                }
-                let settings = state.settings.clone();
-                if state.library.set_profile(name, settings).is_err() {
-                    ui.set_preset_error(size_error.into());
-                    return;
-                }
+                let library = match new_preset(&state.library, name, &state.settings) {
+                    Ok(library) => library,
+                    Err(error) => {
+                        ui.set_preset_error(error.into());
+                        return;
+                    }
+                };
+                state.library = library;
                 state.library_dirty = true;
+                state.active_preset = Some(name.to_owned());
                 ui.set_selected_preset(name.into());
                 ui.set_profile_name("".into());
                 ui.set_preset_error("".into());
                 "Preset saved."
-            }
-            1 => {
-                let Some(mut settings) = state.library.profiles.get(name).cloned() else {
-                    failure(ui, "Choose a saved preset to load.");
-                    return;
-                };
-                if let Err(error) = self.hotkeys.rebind(&settings.trigger) {
-                    failure(ui, error);
-                    return;
-                }
-                settings.normalize();
-                state.settings = settings;
-                state.zone_origin = None;
-                self.display_settings(ui, &state.settings);
-                self.display_shortcuts(ui);
-                ui.set_shortcut_error("".into());
-                "Preset loaded."
             }
             2 => {
                 if state.library.profiles.remove(name).is_none() {
@@ -1246,6 +1498,9 @@ impl Controller {
                     return;
                 }
                 state.library_dirty = true;
+                if state.active_preset.as_deref() == Some(name) {
+                    state.active_preset = None;
+                }
                 ui.set_selected_preset("".into());
                 "Preset deleted."
             }
@@ -1265,12 +1520,108 @@ impl Controller {
             _ => return,
         };
         Self::display_library(ui, &state.library);
+        Self::display_active_preset(ui, &state);
         drop(state);
         let saved = self.save();
-        status(ui, if saved || operation == 1 { notice } else { "" });
+        status(ui, if saved { notice } else { "" });
+    }
+
+    fn load_preset(&self, ui: &App, name: &str) -> Result<(), String> {
+        let mut state = self.state.borrow_mut();
+        let mut settings = state
+            .library
+            .profiles
+            .get(name)
+            .cloned()
+            .ok_or("Choose a saved preset to load.")?;
+        self.hotkeys.rebind(&settings.trigger)?;
+        settings.normalize();
+        state.settings = settings;
+        state.active_preset = Some(name.to_owned());
+        state.route_undo = None;
+        state.zone_origin = None;
+        ui.set_can_undo_route(false);
+        self.display_settings(ui, &state.settings);
+        Self::display_active_preset(ui, &state);
+        self.display_shortcuts(ui);
+        ui.set_shortcut_error("".into());
+        drop(state);
+        self.save();
+        status(ui, "Preset loaded.");
+        Ok(())
+    }
+
+    fn resolve_preset_load(&self, ui: &App, operation: i32) {
+        if ui.get_active() || ui.get_capturing() || ui.get_step_editing() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let Some(target) = state.pending_preset.clone() else {
+            return;
+        };
+        if operation == 0 {
+            state.pending_preset = None;
+            ui.invoke_close_preset_load();
+            return;
+        }
+        if !matches!(operation, 1 | 2) {
+            return;
+        }
+        if operation == 2 {
+            let name = ui.get_load_save_name();
+            let name = name.trim();
+            let candidate = match new_preset(&state.library, name, &state.settings) {
+                Ok(library) => library,
+                Err(error) => {
+                    ui.set_load_error(error.into());
+                    return;
+                }
+            };
+            // The current setup must be durable before loading can replace it.
+            let saved = self
+                .path
+                .as_ref()
+                .ok_or_else(|| io::Error::other("No data folder."))
+                .and_then(|path| settings::save(&path.with_file_name("library.json"), &candidate));
+            if let Err(error) = saved {
+                diagnostics::record(&format!("Save before loading preset: {error}"));
+                ui.set_load_error(
+                    "Could not save the current setup. Try again or cancel to keep it.".into(),
+                );
+                return;
+            }
+            state.library = candidate;
+            state.library_dirty = false;
+            state.active_preset = Some(name.to_owned());
+            Self::display_library(ui, &state.library);
+            Self::display_active_preset(ui, &state);
+            ui.set_load_saved(true);
+        }
+        drop(state);
+        match self.load_preset(ui, &target) {
+            Ok(()) => {
+                self.state.borrow_mut().pending_preset = None;
+                ui.invoke_close_preset_load();
+            }
+            Err(error) => {
+                ui.set_load_error(error.into());
+            }
+        }
     }
 
     fn queue_save(&self) {
+        if let Some(ui) = self.app.upgrade() {
+            let mut state = self.state.borrow_mut();
+            if state
+                .route_undo
+                .as_ref()
+                .is_some_and(|undo| !undo.after.matches(&state.settings))
+            {
+                state.route_undo = None;
+            }
+            ui.set_can_undo_route(state.route_undo.is_some());
+            Self::display_active_preset(&ui, &state);
+        }
         let controller = self.own.clone();
         self.save_timer.start(
             TimerMode::SingleShot,
@@ -1281,6 +1632,17 @@ impl Controller {
                 }
             },
         );
+    }
+
+    fn display_active_preset(ui: &App, state: &State) {
+        let name = state.active_preset.as_deref().unwrap_or_default();
+        let modified = state.library.profiles.get(name).is_some_and(|preset| {
+            let mut preset = preset.clone();
+            preset.normalize();
+            state.settings != preset
+        });
+        ui.set_active_preset(name.into());
+        ui.set_preset_modified(modified);
     }
 
     fn save(&self) -> bool {
@@ -1327,7 +1689,7 @@ impl Controller {
     }
 
     fn capture(&self, ui: &App, kind: i32) {
-        if ui.get_active() || ui.get_step_editing() {
+        if ui.get_active() || ui.get_step_editing() || ui.get_preset_load_open() {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -1385,7 +1747,8 @@ impl Controller {
     }
 
     fn capture_shortcut(&self, ui: &App, point: Point, requested_at: u64) {
-        if ui.get_step_editing() {
+        if ui.get_step_editing() || ui.get_preset_load_open() || ui.get_capture_shortcut_kind() < 0
+        {
             return;
         }
         #[cfg(windows)]
@@ -1626,10 +1989,10 @@ impl Controller {
         ui.set_route_index(state.settings.route.len() as i32);
         let step = Step::Control(Box::new(step));
         let message = format!("Captured {}.", step.label());
+        state.settings.route_enabled |= state.settings.route.is_empty();
         state.settings.route.push(step);
         state.settings.route_wayland = false;
-        state.settings.route_enabled = true;
-        ui.set_route_enabled(true);
+        ui.set_route_enabled(state.settings.route_enabled);
         self.update_configuration(ui, &state.settings);
         Self::display_points(ui, &state.settings, state.zone_origin);
         status(ui, &message);
@@ -1675,10 +2038,10 @@ impl Controller {
                     return;
                 }
                 ui.set_route_index(state.settings.route.len() as i32);
+                state.settings.route_enabled |= state.settings.route.is_empty();
                 state.settings.route.push(Step::Point(point));
                 state.settings.route_wayland = native_wayland;
-                state.settings.route_enabled = true;
-                ui.set_route_enabled(true);
+                ui.set_route_enabled(state.settings.route_enabled);
             }
             2 | 3 => {
                 if let Some((_, from)) = state.zone_origin.filter(|(pending, _)| *pending == kind) {
@@ -1728,10 +2091,12 @@ impl Controller {
             return;
         }
         if ui.get_page() == 4
+            || ui.get_shortcut_editing()
             || !ui.get_can_start()
             || !ui.get_input_ready()
             || ui.get_capturing()
             || ui.get_step_editing()
+            || ui.get_preset_load_open()
         {
             return;
         }
@@ -1871,15 +2236,22 @@ impl Controller {
                 };
                 #[cfg(windows)]
                 let result = if sequence {
-                    engine::run_sequence(schedule, &worker_stop, &worker_progress, |control| {
-                        smart.as_mut().unwrap().sequence(
-                            &settings,
-                            schedule,
-                            &mut guard.borrow_mut(),
-                            control,
-                            || dispatch_probe.as_mut().is_some_and(|probe| probe.pending()),
-                        )
-                    })
+                    let mut countdown_gate = || guard.borrow_mut().check();
+                    engine::run_sequence(
+                        schedule,
+                        &worker_stop,
+                        &worker_progress,
+                        guarded.then_some(&mut countdown_gate),
+                        |control| {
+                            smart.as_mut().unwrap().sequence(
+                                &settings,
+                                schedule,
+                                &mut guard.borrow_mut(),
+                                control,
+                                || dispatch_probe.as_mut().is_some_and(|probe| probe.pending()),
+                            )
+                        },
+                    )
                 } else {
                     run()
                 };
@@ -1997,7 +2369,24 @@ impl Controller {
             self.set_shell_run_state(RunState::Stopping);
         } else if let Some(reason) = run.progress.pause_reason() {
             ui.set_run_state("Paused".into());
-            status(ui, pause_hint(reason));
+            let hint = pause_hint(reason);
+            #[cfg(windows)]
+            if let Some((index, deadline)) = run.progress.target_wait(reason)
+                && let Some(step) = state.settings.route.get(index)
+            {
+                status(
+                    ui,
+                    &format!(
+                        "Step {} of {} · {} · {} s left. {hint}",
+                        index + 1,
+                        state.settings.route.len(),
+                        step.label(),
+                        seconds_left(deadline, now)
+                    ),
+                );
+                return;
+            }
+            status(ui, hint);
         } else if run.progress.started.get().is_some() {
             ui.set_run_state("Running".into());
             status(ui, "");
@@ -2220,6 +2609,144 @@ fn render_metrics(ui: &App, progress: &Progress, now: Instant, burst: bool) {
     ui.set_session_elapsed(time.into());
 }
 
+fn shared_output_label(settings: &Settings) -> String {
+    if settings.keyboard {
+        if settings.text_output {
+            format!("Type {}", targets::display_label(&settings.text_character))
+        } else {
+            format!("Press {}", targets::display_label(&settings.key))
+        }
+    } else if settings.scroll {
+        format!(
+            "Scroll {:?} · {} ticks",
+            settings.scroll_direction,
+            settings.scroll_ticks.trim()
+        )
+    } else {
+        format!("{:?} click ×{}", settings.button, settings.click_count())
+    }
+}
+
+fn cadence_label(settings: &Settings) -> String {
+    match settings.rates() {
+        Ok(Some((low, high))) => format!("{}–{} /s", rate_label(low), rate_label(high)),
+        Ok(None) => match settings.interval() {
+            Ok(interval) if interval.is_zero() => "Max speed".into(),
+            Ok(interval) => format!("{} /s", rate_label(interval.as_secs_f64().recip())),
+            Err(_) => "Check timing".into(),
+        },
+        Err(_) => "Check rate range".into(),
+    }
+}
+
+fn preset_preview(saved: &Settings) -> String {
+    let mut settings = saved.clone();
+    settings.normalize();
+    let output = if settings.has_action_route() {
+        "Custom route actions".into()
+    } else if settings.hold_down {
+        if settings.keyboard {
+            format!("Hold {}", targets::display_label(&settings.key))
+        } else {
+            format!("Hold {:?} button", settings.button)
+        }
+    } else {
+        shared_output_label(&settings)
+    };
+    let pace = if settings.has_action_route() {
+        "Step timing".into()
+    } else if settings.hold_down {
+        "Held down".into()
+    } else {
+        cadence_label(&settings)
+    };
+    let press = if !settings.has_action_route()
+        && !settings.hold_down
+        && settings
+            .press_duration()
+            .is_ok_and(|value| !value.is_zero())
+    {
+        format!(" · {} ms press", settings.press.trim())
+    } else {
+        String::new()
+    };
+    let target = if settings.route_enabled {
+        format!(
+            "{}-step route · {}",
+            settings.route.len(),
+            if settings.route_once { "Once" } else { "Loop" }
+        )
+    } else if settings.keyboard {
+        "Focused app".into()
+    } else if settings.fixed {
+        format!(
+            "Fixed point · {}",
+            settings
+                .point
+                .map_or_else(|| "Not captured".into(), point_label)
+        )
+    } else {
+        "Follow cursor".into()
+    };
+    let actions = match settings.action_limit() {
+        Ok(Some(count)) => format!("{} actions", grouped(count)),
+        Ok(None) => "No action limit".into(),
+        Err(_) => "Check action limit".into(),
+    };
+    let time = match settings.time_limit.trim().replace(',', ".").parse::<f64>() {
+        Ok(0.0) => "No time limit".into(),
+        Ok(value) if value.is_finite() && (0.0..=86_400.0).contains(&value) => {
+            format!("{} s limit", settings.time_limit.trim())
+        }
+        _ => "Check time limit".into(),
+    };
+    let activation = if settings.hold_activation {
+        format!(
+            "Hold {} · release to stop",
+            targets::display_label(&settings.trigger)
+        )
+    } else {
+        format!(
+            "Toggle {} · {} s start delay",
+            targets::display_label(&settings.trigger),
+            settings.delay_seconds
+        )
+    };
+    let mut guards = Vec::new();
+    if settings.edge_mode != 0 {
+        guards.push(if settings.edge_mode == 1 {
+            "Screen corners".into()
+        } else {
+            "Screen edges".into()
+        });
+    }
+    if settings.inside_zone.is_some() {
+        guards.push("Inside only".into());
+    }
+    if settings.stop_zone.is_some() {
+        guards.push("Stop zone".into());
+    }
+    if settings.process_mode != 0 {
+        guards.push(format!(
+            "{} apps: {}",
+            if settings.process_mode == 1 {
+                "Allow"
+            } else {
+                "Block"
+            },
+            targets::display_label(&settings.process_names)
+        ));
+    }
+    let guards = if guards.is_empty() {
+        "None".into()
+    } else {
+        guards.join(" · ")
+    };
+    format!(
+        "{output} · {pace}{press}\n{target} · {actions} · {time}\n{activation}\nGuards · {guards}"
+    )
+}
+
 fn rate_label(rate: f64) -> String {
     if rate >= 1_000.0 {
         grouped(rate.round() as u64)
@@ -2261,6 +2788,180 @@ fn alert(text: &str, icon: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_a_route_step_preserves_payload_and_every_other_steps_order() {
+        let custom = Step::Action(Box::new(targets::ActionStep {
+            action: targets::Action::Key {
+                key: "Enter".into(),
+            },
+            target: Some(targets::Destination::Point(Point { x: -100, y: 250 })),
+            delay_ms: 725,
+        }));
+        let mut route: Vec<_> = (0..64).map(|x| Step::Point(Point { x, y: 10 })).collect();
+        route[59] = custom.clone();
+        let mut expected = route.clone();
+        expected.remove(59);
+        expected.insert(1, custom);
+        assert!(move_route_step(&mut route, 59, 1));
+        assert_eq!(route, expected);
+        assert!(move_route_step(&mut route, 1, 63));
+        let unchanged = route.clone();
+        assert!(!move_route_step(&mut route, 63, 63));
+        assert!(!move_route_step(&mut route, 64, 0));
+        assert!(!move_route_step(&mut route, 0, 64));
+        assert_eq!(route, unchanged);
+    }
+
+    #[test]
+    fn run_limits_describe_unlimited_counted_timed_and_once_runs() {
+        let mut settings = Settings::default();
+        let describe = |settings: &Settings| run_limit_summary(&settings.schedule().unwrap());
+        assert_eq!(
+            describe(&settings),
+            "  ·  No action limit  ·  No time limit"
+        );
+        settings.limited = true;
+        settings.count = "25".into();
+        settings.time_limit = "12,5".into();
+        assert_eq!(describe(&settings), "  ·  25 actions max  ·  12.5 s max");
+        settings.route_enabled = true;
+        settings.route_once = true;
+        settings.route = vec![Step::Point(Point { x: 10, y: 20 }); 3];
+        assert!(describe(&settings).contains("3 actions max"));
+        settings.route_once = false;
+        assert!(describe(&settings).contains("25 actions max"));
+    }
+
+    #[test]
+    fn preset_preview_describes_saved_settings_without_changing_them() {
+        let settings = Settings {
+            keyboard: true,
+            key: "Enter".into(),
+            interval: "200".into(),
+            limited: true,
+            count: "25".into(),
+            time_limit: "12,5".into(),
+            hold_activation: true,
+            trigger: "F9".into(),
+            edge_mode: 2,
+            process_mode: 1,
+            process_names: "notepad.exe".into(),
+            ..Settings::default()
+        };
+        let original = settings.clone();
+        let preview = preset_preview(&settings);
+        for detail in [
+            "Press Enter",
+            "5 /s",
+            "Focused app",
+            "25 actions",
+            "12,5 s limit",
+            "Hold F9 · release to stop",
+            "Screen edges",
+            "Allow apps: notepad.exe",
+        ] {
+            assert!(preview.contains(detail), "Missing {detail}: {preview}");
+        }
+        assert!(!preview.contains("start delay"), "Hold starts immediately");
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn preset_preview_distinguishes_unlimited_runs_and_route_playback() {
+        let mut settings = Settings::default();
+        let preview = preset_preview(&settings);
+        assert!(preview.contains("No action limit · No time limit"));
+        assert!(preview.contains("Follow cursor"));
+        assert!(preview.contains("Guards · None"));
+
+        settings.route_enabled = true;
+        settings.route_once = true;
+        settings
+            .route
+            .push(Step::Action(Box::new(targets::ActionStep {
+                action: targets::Action::Wait,
+                target: None,
+                delay_ms: 500,
+            })));
+        let preview = preset_preview(&settings);
+        assert!(preview.contains("Custom route actions · Step timing"));
+        assert!(preview.contains("1-step route · Once"));
+        assert!(!preview.contains("10 /s"));
+    }
+
+    #[test]
+    fn preset_load_protects_modified_and_unnamed_setups() {
+        let mut settings = Settings::default();
+        let mut library = Library::default();
+        assert!(!setup_needs_preserving(&settings, &library, false));
+        settings.button = Button::Right;
+        assert!(setup_needs_preserving(&settings, &library, false));
+        library.set_profile("Saved", settings.clone()).unwrap();
+        assert!(!setup_needs_preserving(&settings, &library, true));
+        settings.interval = "725".into();
+        assert!(setup_needs_preserving(&settings, &library, true));
+        // Returning a loaded preset to the defaults is still a modified setup.
+        assert!(setup_needs_preserving(&Settings::default(), &library, true));
+    }
+
+    #[test]
+    fn saving_before_load_builds_a_candidate_without_replacing_existing_presets() {
+        let mut library = Library::default();
+        library
+            .set_profile("Original", Settings::default())
+            .unwrap();
+        let settings = Settings {
+            interval: "725".into(),
+            ..Settings::default()
+        };
+        assert!(new_preset(&library, "Original", &settings).is_err());
+        assert!(new_preset(&library, "", &settings).is_err());
+        let candidate = new_preset(&library, "New setup", &settings).unwrap();
+        assert_eq!(library.profiles.len(), 1);
+        assert_eq!(candidate.profiles["Original"], Settings::default());
+        assert_eq!(candidate.profiles["New setup"], settings);
+    }
+
+    #[test]
+    fn undo_last_route_step_restores_modes_and_preserves_other_edits() {
+        let step = Step::Action(Box::new(targets::ActionStep {
+            action: targets::Action::Wait,
+            target: None,
+            delay_ms: 725,
+        }));
+        let mut settings = Settings {
+            route: vec![step.clone()],
+            route_enabled: true,
+            route_once: true,
+            route_wayland: true,
+            ..Settings::default()
+        };
+        let undo = RouteUndo::remove(&mut settings, 0);
+        assert!(!settings.route_enabled);
+        settings.interval = "850".into();
+        assert_eq!(undo.restore(&mut settings), Some(0));
+        assert_eq!(settings.route, vec![step]);
+        assert!(settings.route_enabled && settings.route_once && settings.route_wayland);
+        assert_eq!(settings.interval, "850");
+    }
+
+    #[test]
+    fn route_undo_does_not_overwrite_subsequent_route_changes() {
+        let mut settings = Settings {
+            route: vec![
+                Step::Point(Point { x: 1, y: 2 }),
+                Step::Point(Point { x: 3, y: 4 }),
+            ],
+            route_enabled: true,
+            ..Settings::default()
+        };
+        let undo = RouteUndo::remove(&mut settings, 0);
+        settings.route.push(Step::Point(Point { x: 5, y: 6 }));
+        let changed = settings.clone();
+        assert_eq!(undo.restore(&mut settings), None);
+        assert_eq!(settings, changed);
+    }
 
     #[test]
     fn countdown_describes_the_effective_destination() {

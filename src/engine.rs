@@ -29,6 +29,8 @@ pub struct Progress {
     actions: AtomicU64,
     pause: AtomicU8,
     pub started: OnceLock<Instant>,
+    #[cfg(windows)]
+    target_wait: std::sync::Mutex<Option<(PauseReason, usize, Instant)>>,
 }
 
 impl Progress {
@@ -56,6 +58,15 @@ impl Progress {
         }
     }
 
+    #[cfg(windows)]
+    pub fn target_wait(&self, reason: PauseReason) -> Option<(usize, Instant)> {
+        self.target_wait
+            .lock()
+            .unwrap()
+            .filter(|(waiting, _, _)| *waiting == reason)
+            .map(|(_, index, deadline)| (index, deadline))
+    }
+
     fn pause(&self, reason: PauseReason) {
         self.pause.store(reason as u8, Ordering::Relaxed);
     }
@@ -63,6 +74,10 @@ impl Progress {
     fn clear_pause(&self) {
         if self.pause.load(Ordering::Relaxed) != 0 {
             self.pause.store(0, Ordering::Relaxed);
+            #[cfg(windows)]
+            {
+                *self.target_wait.lock().unwrap() = None;
+            }
         }
     }
 }
@@ -268,8 +283,16 @@ impl RunControl<'_> {
         &mut self,
         reason: PauseReason,
         interval: Duration,
+        index: usize,
+        deadline: Instant,
     ) -> Result<Option<Outcome>, String> {
+        *self.progress.target_wait.lock().unwrap() = Some((reason, index, deadline));
         self.retry_after(Gate::Paused(reason), interval)
+    }
+
+    #[cfg(windows)]
+    pub fn clear_target_wait(&self) {
+        self.progress.clear_pause();
     }
 
     #[cfg(windows)]
@@ -373,15 +396,16 @@ impl Random {
 }
 
 #[cfg(windows)]
-pub fn run_sequence(
+pub fn run_sequence<'a>(
     schedule: Schedule,
-    stop: &StopSignal,
-    progress: &Progress,
+    stop: &'a StopSignal,
+    progress: &'a Progress,
+    countdown_gate: Option<&'a mut dyn FnMut() -> Gate>,
     mut run: impl FnMut(&mut RunControl<'_>) -> Result<Outcome, String>,
 ) -> Result<Outcome, String> {
     let mut control = RunControl {
         stop,
-        gate: None,
+        gate: countdown_gate,
         guard_stop: None,
         pacer: Pacer::new(),
         progress,
@@ -391,6 +415,8 @@ pub fn run_sequence(
     if let Some(outcome) = control.wait_route(Instant::now() + schedule.delay)? {
         return Ok(outcome);
     }
+    // The sequence runner takes over guard checks after the countdown.
+    control.gate = None;
     if let Some(outcome) = control.begin_dispatch() {
         return Ok(outcome);
     }
@@ -912,6 +938,35 @@ mod tests {
         stop.request();
         assert_eq!(worker.join().unwrap(), Ok(Outcome::Stopped));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sequence_countdown_stops_on_a_transient_guard_trip() {
+        let stop = StopSignal::new().unwrap();
+        let progress = Progress::default();
+        let mut polls = 0;
+        let mut gate = || {
+            polls += 1;
+            match polls {
+                1 => Gate::Open,
+                2 => Gate::Stop("Stopped in the stop zone."),
+                _ => Gate::Open,
+            }
+        };
+        let result = run_sequence(
+            Schedule {
+                delay: Duration::from_millis(200),
+                ..Schedule::default()
+            },
+            &stop,
+            &progress,
+            Some(&mut gate),
+            |_| panic!("the route must not run after entering the stop zone"),
+        );
+        assert_eq!(result, Ok(Outcome::Guarded("Stopped in the stop zone.")));
+        assert_eq!(polls, 2);
+        assert!(progress.started.get().is_none());
     }
 
     #[test]
