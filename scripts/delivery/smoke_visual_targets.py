@@ -216,10 +216,14 @@ def check(output, manifest, windows):
                 if result.element_info.name == "Completed.":
                     raise RuntimeError("Afterbeat completed a case where it should have withheld input.")
 
+            def select_first_result(kind):
+                result = find(lambda name: name.startswith("1. ") and kind in name, "ListItem")
+                result.iface_selection_item.Select()
+                find(lambda name: name.startswith("Step 1 of 1 ·") and kind in name)
+
             def proposal(kind):
                 invoke("Dry run")
-                invoke("Step")
-                find(lambda name: name.startswith("Step 1 of 1 ·") and kind in name)
+                select_first_result(kind)
 
             def saved_identity():
                 try:
@@ -307,8 +311,7 @@ def check(output, manifest, windows):
                 stored = windows.wait_for(saved_identity, 4, "The route settings could not be read.")
                 assert stored[0]["selector"]["control"]["identity"] == saved[0]["selector"]["control"]["identity"]
                 invoke("Check again")
-                invoke("Step")
-                find(lambda name: name.startswith("Step 1 of 1 ·") and "visual evidence disagree" in name)
+                select_first_result("visual evidence disagree")
 
             case("repair rejects a stale preview", stale_repair, [])
 

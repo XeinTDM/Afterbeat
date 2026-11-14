@@ -12,6 +12,7 @@ def check(output, manifest, windows):
     from pywinauto import Desktop
 
     api, gui, con = windows.api, windows.gui, windows.con
+    test_desktop = windows.active_desktop()
     events = []
     fixture = {}
     ready = Event()
@@ -114,7 +115,29 @@ def check(output, manifest, windows):
                 return windows.wait_for(match, timeout, f"Could not find {kind} {name!r}.")
 
             def invoke(name):
-                find(name, "Button").iface_invoke.Invoke()
+                # Verification options can sit below the viewport in the longer
+                # route editor. Scroll to them as a user would, then return to
+                # the top before opening the preview.
+                if name in ("Wait until gone", "Dry run"):
+                    if windows.active_desktop() != test_desktop:
+                        raise RuntimeError("The isolated test desktop lost focus.")
+                    gui.ShowWindow(hwnd, con.SW_RESTORE)
+                    root.set_focus()
+                    bounds = gui.GetClientRect(hwnd)
+                    x, y = bounds[2] - 70, bounds[3] // 2
+                    point = gui.ClientToScreen(hwnd, (x, y))
+                    api.SetCursorPos(point)
+                    gui.SendMessage(hwnd, con.WM_MOUSEMOVE, 0, (x & 0xffff) | ((y & 0xffff) << 16))
+                    gui.SendMessage(hwnd, con.WM_MOUSEWHEEL,
+                                    ((1200 if name == "Dry run" else -1200) & 0xffff) << 16,
+                                    (point[0] & 0xffff) | ((point[1] & 0xffff) << 16))
+                    time.sleep(0.1)
+                def enabled():
+                    button = find(name, "Button")
+                    return button if button.is_enabled() else None
+
+                button = windows.wait_for(enabled, 4, f"Button {name!r} did not become enabled.")
+                button.iface_invoke.Invoke()
 
             def capture(name, control, first=False):
                 if first:
@@ -123,6 +146,13 @@ def check(output, manifest, windows):
                 api.SetCursorPos(((left + right) // 2, (top + bottom) // 2))
                 windows.tap_key(con.VK_F8)
                 find(name, "ListItem")
+
+            def paused_with(hint):
+                def paused():
+                    names = [item.element_info.name for item in root.descendants(control_type="Text")]
+                    return "Paused" in names and any(name.endswith(hint) for name in names)
+
+                windows.wait_for(paused, 4, f"The run did not pause with {hint!r}.")
 
             find("Targets", "Button").iface_toggle.Toggle()
             capture("1. Export", "export", first=True)
@@ -169,7 +199,7 @@ def check(output, manifest, windows):
             begin = len(events)
             gui.SendMessage(fixture["main"], con.WM_APP, 1, 0)
             windows.tap_key(con.VK_F6)
-            find("Multiple controls or windows match. Leave one match visible.")
+            paused_with("Multiple controls or windows match. Leave one match visible.")
             assert len(events) == begin, events
             gui.SendMessage(fixture["main"], con.WM_APP, 0, 0)
             windows.wait_for(lambda: len(events) == begin + 1, 2, "Export did not resume after removing the duplicate control.")
@@ -180,7 +210,7 @@ def check(output, manifest, windows):
 
             gui.ShowWindow(fixture["duplicate"], con.SW_SHOWNA)
             windows.tap_key(con.VK_F6)
-            find("Multiple controls or windows match. Leave one match visible.")
+            paused_with("Multiple controls or windows match. Leave one match visible.")
             requested = windows.tap_key(con.VK_F7, modifiers=stop_modifiers)
             find("Stopped.")
             evidence["stop_to_status_ms"] = (time.perf_counter_ns() - requested) / 1_000_000
@@ -196,7 +226,7 @@ def check(output, manifest, windows):
                 con.SWP_NOSIZE | con.SWP_SHOWWINDOW | con.SWP_NOACTIVATE,
             )
             windows.tap_key(con.VK_F6)
-            find("Waiting for the control to be enabled and unobstructed.")
+            paused_with("Waiting for the control to be enabled and unobstructed.")
             windows.tap_key(con.VK_F7, modifiers=stop_modifiers)
             find("Stopped.")
             gui.ShowWindow(fixture["duplicate"], con.SW_HIDE)
@@ -220,6 +250,7 @@ def check(output, manifest, windows):
             try:
                 if root is not None:
                     evidence["tree"] = [item.element_info.name for item in root.descendants()]
+                    root.capture_as_image().save(folder / "failure.png")
             except Exception as tree_error:
                 evidence["tree_error"] = str(tree_error)
             raise

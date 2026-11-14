@@ -155,7 +155,8 @@ def check(output, manifest, windows):
                     def query():
                         try:
                             return next((item for item in root.descendants(control_type=kind)
-                                         if item.element_info.name == label), None)
+                                         if (label(item.element_info.name) if callable(label)
+                                             else item.element_info.name == label)), None)
                         except KeyError:
                             return None
                     return windows.wait_for(query, timeout, f"Could not find {label!r}.")
@@ -246,12 +247,25 @@ def check(output, manifest, windows):
         def test_wrong_focus(find, focus, start, case):
             focus("start")
             windows.tap_key(con.VK_F6)
-            time.sleep(0.21)
+            find(lambda name: name.startswith("Step 1 of 1 · Press Enter · Finish") and "s left." in name,
+                 timeout=1.2)
             order(start, [])
             focus("finish")
             find("Completed.")
             order(start, [("keyDown", "finish", con.VK_RETURN), ("keyUp", "finish", con.VK_RETURN)])
         run_case("wrong-focus-withholds-key", [action("key", 80, target("finish"), key="Enter")], test_wrong_focus)
+
+        def test_key_preview(find, focus, start, case):
+            find("Targets", "Button").iface_toggle.Toggle()
+            find("Dry run", "Button").iface_invoke.Invoke()
+            step = find("Step", "Button")
+            windows.wait_for(step.is_enabled, 5, "The dry-run control check did not finish.")
+            step.iface_invoke.Invoke()
+            find("Step 1 of 1 · Press Enter · Finish · Focus this control before the key step runs.")
+            order(start, [])
+
+        run_case("dry-run-explains-key-focus", [action("key", 0, target("finish"), key="Enter")],
+                 test_key_preview)
 
         def test_stop(find, focus, start, case):
             focus("start")
@@ -262,6 +276,33 @@ def check(output, manifest, windows):
             time.sleep(0.55)
             order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)])
         run_case("stop-during-wait", [mixed[0], action("wait", 480), mixed[2]], test_stop)
+
+        def test_countdown_stop_zone(find, focus, start, case):
+            focus("start")
+            api.SetCursorPos(center("start"))
+            windows.tap_key(con.VK_F6)
+            find("Countdown")
+            api.SetCursorPos(center("finish"))
+            find("Stopped in the stop zone.")
+            api.SetCursorPos(center("start"))
+            order(start, [])
+
+        finish = {"x": x, "y": y}
+        stop_zone = {"from": finish, "to": finish}
+        run_case("stop-zone-during-mixed-countdown", [mixed[0], action("wait", 50)],
+                 test_countdown_stop_zone, delay_seconds=3, stop_zone=stop_zone)
+        run_case("stop-zone-during-smart-wheel-countdown", [target("start")],
+                 test_countdown_stop_zone, delay_seconds=3, stop_zone=stop_zone, scroll=True)
+
+        def test_inherited_key_blocked(find, focus, start, case):
+            find("Select Mouse or Wheel for unedited route steps, or set an action on each step.")
+            focus("finish")
+            windows.tap_key(con.VK_F6)
+            time.sleep(0.2)
+            order(start, [])
+
+        run_case("mixed-route-cannot-inherit-key-output", [finish, action("wait", 50)],
+                 test_inherited_key_blocked, keyboard=True)
 
         def test_limit(find, focus, start, case):
             focus("start")
@@ -286,6 +327,143 @@ def check(output, manifest, windows):
             action("scroll", 65, target("start"), direction="Up", ticks=1),
         ], test_loop_limit, route_once=False, limited=True, count="3")
 
+        def test_blocked_start_recovery(find, focus, start, case):
+            find("Clear the inside-only zone before running a route.")
+            find("Fix in Targets", "Button").iface_invoke.Invoke()
+            clear = find("Remove Inside only zone", "Button")
+            windows.wait_for(clear.has_keyboard_focus, 2, "Recovery did not focus Clear.")
+            windows.tap_key(con.VK_SPACE)
+            run = find("Start run", "Button")
+            windows.wait_for(run.is_enabled, 2, "Start remained disabled after clearing the zone.")
+            order(start, [])
+
+        run_case("blocked-start-opens-and-focuses-fix", [{"x": x, "y": y}],
+                 test_blocked_start_recovery,
+                 inside_zone={"from": {"x": 0, "y": 0}, "to": {"x": 200, "y": 200}})
+
+        def test_off_route(find, focus, start, case):
+            find("Targets", "Button").iface_toggle.Toggle()
+            find("Add in 3s", "Button").iface_invoke.Invoke()
+            api.SetCursorPos(center("start"))
+            windows.tap_key(con.VK_F8)
+            px, py = center("start")
+            find(f"2. X {px}  Y {py}", "ListItem")
+            find("Route off")
+            order(start, [])
+
+        run_case("adding-a-point-preserves-route-off", [{"x": x, "y": y}], test_off_route,
+                 route_enabled=False)
+
+        def test_zone_shortcut_context(find, focus, start, case):
+            def select(label):
+                radio = find(label, "RadioButton")
+                try:
+                    radio.iface_selection_item.Select()
+                except Exception:
+                    point = radio.rectangle().mid_point()
+                    gui.ShowWindow(fixture["window"], con.SW_HIDE)
+                    api.SetCursorPos((point.x, point.y))
+                    api.mouse_event(con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    api.mouse_event(con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                    time.sleep(0.08)
+                    gui.ShowWindow(fixture["window"], con.SW_SHOWNA)
+
+            find("Targets", "Button").iface_toggle.Toggle()
+            select("Zones & filters")
+            find("Choose a zone’s Pick or Replace button to capture its corners.")
+            api.SetCursorPos(center("start"))
+            windows.tap_key(con.VK_F8)
+            time.sleep(0.15)
+            select("Route")
+            find(f"1. X {x}  Y {y}", "ListItem")
+            assert len(find("Route steps", "List").descendants(control_type="ListItem")) == 1
+            find("Route off")
+
+            select("Zones & filters")
+            find("Pick corner", "Button").iface_invoke.Invoke()
+            api.SetCursorPos((25, 25))
+            windows.tap_key(con.VK_F8)
+            find("First corner X 25  Y 25. Pick the opposite corner.")
+            api.SetCursorPos((125, 125))
+            windows.tap_key(con.VK_F8)
+            find("X 25  Y 25 to X 125  Y 125")
+
+            select("Route")
+            api.SetCursorPos(center("start"))
+            windows.tap_key(con.VK_F8)
+            px, py = center("start")
+            find(f"2. X {px}  Y {py}", "ListItem")
+            find("Route off")
+            order(start, [])
+
+        run_case("f8-follows-the-visible-targets-tab", [{"x": x, "y": y}],
+                 test_zone_shortcut_context, route_enabled=False)
+
+        def test_zone_replacement(find, focus, start, case):
+            find("Fix in Targets", "Button").iface_invoke.Invoke()
+            find("Replace zone", "Button").iface_invoke.Invoke()
+            api.SetCursorPos((25, 25))
+            windows.tap_key(con.VK_F8)
+            find("First corner X 25  Y 25. Pick the opposite corner.")
+            saved = "X 0  Y 0 to X 200  Y 200"
+            find(saved)
+            find("Cancel Inside only zone replacement", "Button").iface_invoke.Invoke()
+            find(saved)
+            find("Replace zone", "Button")
+            order(start, [])
+
+        run_case("cancel-zone-replacement-keeps-saved-zone", [{"x": x, "y": y}],
+                 test_zone_replacement,
+                 inside_zone={"from": {"x": 0, "y": 0}, "to": {"x": 200, "y": 200}})
+
+        def test_active_preset(find, focus, start, case):
+            find("Presets", "Button").iface_toggle.Toggle()
+            find("New preset name", "Edit").iface_value.SetValue("Timing test")
+            find("Save as new", "Button").iface_invoke.Invoke()
+            find("Preset · Timing test")
+            find("Clicker", "Button").iface_toggle.Toggle()
+            field = find("Click interval or rate", "Edit")
+            field.iface_value.SetValue("200")
+            find("Preset · Timing test · Modified")
+            field.iface_value.SetValue("100")
+            find("Preset · Timing test")
+            order(start, [])
+
+        run_case("preset-status-reflects-current-settings", [], test_active_preset,
+                 route_enabled=False, interval="100")
+
+        def test_shortcut_and_close_drafts(find, focus, start, case):
+            find("Timing", "Button").iface_toggle.Toggle()
+            find("Active shortcut · F6")
+            field = find("Activation shortcut", "Edit")
+            field.iface_value.SetValue("F9")
+            find("Active shortcut · F6 · Unapplied change")
+            field.set_focus()
+            windows.tap_key(con.VK_ESCAPE)
+            find("Active shortcut · F6")
+            assert field.iface_value.CurrentValue == "F6"
+            field.iface_value.SetValue("F9")
+            windows.tap_key(con.VK_RETURN)
+            find("Active shortcut · F9")
+
+            nav = find("Targets", "Button")
+            hwnd = nav.top_level_parent().handle
+            nav.iface_toggle.Toggle()
+            find("Add step", "Button").iface_invoke.Invoke()
+            delay = find("Step delay", "Edit")
+            delay.iface_value.SetValue("725")
+            gui.PostMessage(hwnd, con.WM_CLOSE, 0, 0)
+            find("Discard step edits?")
+            find("Keep editing", "Button").iface_invoke.Invoke()
+            assert find("Step delay", "Edit").iface_value.CurrentValue == "725"
+            gui.PostMessage(hwnd, con.WM_CLOSE, 0, 0)
+            find("Discard edits", "Button").iface_invoke.Invoke()
+            windows.wait_for(lambda: not gui.IsWindow(hwnd) or not gui.IsWindowVisible(hwnd), 3,
+                             "Discarding the draft should close Afterbeat.")
+            order(start, [])
+
+        run_case("shortcut-and-close-drafts", [], test_shortcut_and_close_drafts, route_enabled=False)
+
         def test_editor(find, focus, start, case):
             find("Targets", "Button").iface_toggle.Toggle()
             find("Pick control", "Button").iface_invoke.Invoke()
@@ -293,9 +471,16 @@ def check(output, manifest, windows):
             windows.tap_key(con.VK_F8)
             find("1. Start", "ListItem")
             find("Edit step", "Button").iface_invoke.Invoke()
+            find("Right click ×2 · 10 /s")
+            find("Save step", "Button").iface_invoke.Invoke()
+            find("1. Start", "ListItem")
+            find("Edit step", "Button").iface_invoke.Invoke()
+            step_settings = find("Step settings", "ComboBox")
+            step_settings.set_focus()
+            windows.tap_key(con.VK_DOWN)
             find("Step delay", "Edit").iface_value.SetValue("125")
             find("Save step", "Button").iface_invoke.Invoke()
-            find("1. Left click ×1 · Start · 125 ms delay", "ListItem")
+            find("1. Right click ×2 · Start · 125 ms delay", "ListItem")
             find("Add step", "Button").iface_invoke.Invoke()
             find("Step delay", "Edit").iface_value.SetValue("245")
             find("Save step", "Button").iface_invoke.Invoke()
@@ -303,14 +488,15 @@ def check(output, manifest, windows):
             focus("start")
             started = windows.tap_key(con.VK_F6)
             find("Completed.")
-            order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)])
+            order(start, [("rightDown", "start", 0), ("rightUp", "start", 0)] * 2)
             first_gap = (events[start][3] - started) / 1_000_000
             assert 122 <= first_gap <= 300, first_gap
             case["first_delay_ms"] = first_gap
-            completed = (time.perf_counter_ns() - events[start+1][3]) / 1_000_000
+            completed = (time.perf_counter_ns() - events[start+3][3]) / 1_000_000
             assert 242 <= completed <= 370, completed
             case["trailing_wait_to_status_ms"] = completed
-        run_case("f8-and-editor-build-a-playable-route", [], test_editor, route_enabled=False)
+        run_case("f8-and-editor-build-a-playable-route", [], test_editor, route_enabled=False,
+                 button="Right", double=True, interval="100")
 
         def clicker_output(find, focus, start, case):
             focus("start")
