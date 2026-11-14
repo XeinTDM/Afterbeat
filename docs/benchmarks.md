@@ -20,6 +20,12 @@ py -3.12 -B scripts/delivery/results.py $run
 
 The runner reports p99 spacing error only when a trial has at least 100 measured gaps. The stop tail is a lower bound when marked censored. Receiver timestamps measure when the window processed each event. The historical peer comparison below uses a separate protocol with an F6 toggle stop.
 
+The Windows smoke run also checks Smart Targets against native Win32 controls. It runs ten Export → Save routes with relocated windows and varying delays before enabling Save. It also checks ambiguous controls and windows, an overlapping window, emergency stop, and verification timeout. Its `smart-targets/result.json` records route completion, unexpected clicks, individual and p95 enable-to-click latency, and the time from emergency stop to the on-screen stopped state.
+
+Run the targeted visual benchmark with `py -3.12 -B scripts/delivery/run.py visual-targets`. It writes `visual-targets/result.json` with combined accessibility ID and window-title changes, a decoy moved beside the saved position, a disabled intended control, reused IDs, duplicate or missing anchors, and stale and successful repairs. The harness redraws native controls at 150% size and separately attempts a real cross-monitor DPI transition. It records a skip with the observed DPI values when the desktop lacks differently scaled monitors. The Rust tests check normalized fingerprints and geometry at multiple pixel scales.
+
+Run `py -3.12 -B scripts/delivery/run.py route-actions` to check mixed routes and Clicker output on an isolated Windows desktop. The native fixture records tagged button and key edges and signed wheel deltas in receiver order. It checks timing, delayed targets, focus changes, stop during a wait, and a time limit before first input. The same fixture checks both side-button IDs, exact triple-click counts, wheel configuration from the Clicker UI, and wheel delivery to the intended window. Results go to `route-actions/result.json`.
+
 ## Run the peer comparison from a clean checkout
 
 Use the [Windows build prerequisites](build.md) and an interactive, disposable Windows profile with the clickers closed. The benchmark launches the pinned portable peer releases as the current user. It refuses to start if it finds existing peer settings in the known profile directories it uses. Keep the session untouched until the private test desktop returns.

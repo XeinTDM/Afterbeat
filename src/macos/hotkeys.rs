@@ -115,6 +115,15 @@ impl Binding {
     pub fn matches_key(self, key: Key) -> bool {
         self.trigger == Trigger::Key(key.code)
     }
+
+    pub fn matches_button(self, button: crate::mouse::Button) -> bool {
+        use crate::mouse::Button::*;
+        match button {
+            Mouse4 => self.trigger == Trigger::Mouse(3),
+            Mouse5 => self.trigger == Trigger::Mouse(4),
+            _ => false,
+        }
+    }
 }
 
 struct Choice {

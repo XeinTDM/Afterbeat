@@ -89,6 +89,10 @@ pub fn click_own_window() -> bool {
     }
 }
 
+pub fn pointer_over_own_window() -> bool {
+    matches!(*POINTER.lock().unwrap(), Pointer::Inside(_))
+}
+
 fn stop_at_pointer(app: &App) -> bool {
     let Pointer::Inside(Some((x, y))) = *POINTER.lock().unwrap() else {
         return false;
@@ -171,6 +175,9 @@ pub fn attach(app: &App, stop: StopSlot) {
                         click_own_window();
                     }
                 }
+                return EventResult::PreventDefault;
+            }
+            WindowEvent::MouseWheel { .. } if protection == MOUSE => {
                 return EventResult::PreventDefault;
             }
             _ => {}

@@ -7,7 +7,7 @@ use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
     CGDisplayBounds, CGError, CGEvent, CGEventField, CGEventFlags, CGEventSource,
     CGEventSourceStateID, CGEventTapLocation, CGEventType, CGGetActiveDisplayList, CGMouseButton,
-    CGWarpMouseCursorPosition,
+    CGScrollEventUnit, CGWarpMouseCursorPosition,
 };
 use std::{
     io,
@@ -106,6 +106,11 @@ impl Button {
                 CGEventType::OtherMouseDown,
                 CGEventType::OtherMouseUp,
             ),
+            Self::Mouse4 | Self::Mouse5 => (
+                CGMouseButton(if self == Self::Mouse4 { 3 } else { 4 }),
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+            ),
         }
     }
 }
@@ -174,6 +179,7 @@ fn event_pair(
                     }
                     event
                 }
+                Input::Wheel(..) => return None,
             };
             Some(event)
         };
@@ -227,7 +233,7 @@ pub struct Injector {
 impl Injector {
     pub fn new(
         input: Input,
-        double: bool,
+        repeats: u8,
         points: Vec<Point>,
         radius: i32,
         press: Press,
@@ -235,13 +241,13 @@ impl Injector {
         Ok(Self {
             input,
             press,
-            repeats: if double { 2 } else { 1 },
+            repeats: u32::from(repeats),
             route: Route::new(points, radius)?,
         })
     }
 
     pub fn batchable(&self) -> bool {
-        matches!(self.press, Press::Tap)
+        matches!(self.press, Press::Tap) && !matches!(self.input, Input::Wheel(..))
     }
 
     pub fn has_targets(&self) -> bool {
@@ -300,6 +306,38 @@ impl Injector {
                     }
                 }
             };
+            if let Input::Wheel(direction, ticks) = self.input {
+                use crate::targets::Direction::*;
+                let ticks = i32::from(ticks);
+                let (vertical, horizontal) = match direction {
+                    Up => (ticks, 0),
+                    Down => (-ticks, 0),
+                    Left => (0, ticks),
+                    Right => (0, -ticks),
+                };
+                let event = SOURCE
+                    .with(|source| {
+                        let source = source.as_deref()?;
+                        CGEvent::new_scroll_wheel_event2(
+                            Some(source),
+                            CGScrollEventUnit::Line,
+                            2,
+                            vertical,
+                            horizontal,
+                            0,
+                        )
+                    })
+                    .ok_or("Could not create a macOS scroll event.")?;
+                CGEvent::set_location(Some(&event), position);
+                if !input_filter::ready() {
+                    return Err(INPUT_LOST.into());
+                }
+                if let Some(outcome) = control.begin_dispatch() {
+                    return Ok(Some(outcome));
+                }
+                post(&event, pid);
+                continue;
+            }
             let clicks = i64::from(index % self.repeats + 1);
             let [down, up] = event_pair(self.input, position, clicks)?;
             if !input_filter::ready() {
@@ -375,7 +413,7 @@ fn dispatch(
             CGEventSource::button_state(CGEventSourceStateID::HIDSystemState, button.quartz().0)
         }
         Input::Key(key) => keys::down(key.code),
-        Input::Text(_) => false,
+        Input::Text(_) | Input::Wheel(..) => false,
     };
     if physically_held {
         return Err(Gate::Paused(PauseReason::InputGrabbed));

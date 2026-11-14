@@ -54,6 +54,7 @@ class Portal:
             ("Start", ["o", "s", OPTIONS], ["o"]),
             ("NotifyPointerMotionAbsolute", ["o", OPTIONS, "u", "d", "d"], []),
             ("NotifyPointerButton", ["o", OPTIONS, "i", "u"], []),
+            ("NotifyPointerAxisDiscrete", ["o", OPTIONS, "u", "i"], []),
             ("NotifyKeyboardKeysym", ["o", OPTIONS, "i", "u"], []),
         ], self.call, {"AvailableDeviceTypes": GLib.Variant("u", 3)})
         register(connection, SCREEN, [("SelectSources", ["o", OPTIONS], ["o"])], self.call)
@@ -102,7 +103,8 @@ class Portal:
                 if method == "NotifyPointerMotionAbsolute":
                     self.trace.append(f"move:{args[2]}:{args[3]:g}:{args[4]:g}")
                 else:
-                    name = "button" if method == "NotifyPointerButton" else "key"
+                    name = {"NotifyPointerButton": "button", "NotifyPointerAxisDiscrete": "wheel",
+                            "NotifyKeyboardKeysym": "key"}[method]
                     self.trace.append(f"{name}:{args[2]}:{args[3]}")
                 invocation.return_value(None)
                 return

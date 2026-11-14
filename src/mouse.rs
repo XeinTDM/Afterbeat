@@ -31,6 +31,26 @@ pub enum Button {
     Left,
     Right,
     Middle,
+    Mouse4,
+    Mouse5,
+}
+
+impl Button {
+    pub const ALL: [Self; 5] = [
+        Self::Left,
+        Self::Right,
+        Self::Middle,
+        Self::Mouse4,
+        Self::Mouse5,
+    ];
+
+    pub fn index(self) -> i32 {
+        Self::ALL.iter().position(|&button| button == self).unwrap() as i32
+    }
+
+    pub fn from_index(index: i32) -> Self {
+        Self::ALL.get(index as usize).copied().unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -49,6 +69,7 @@ impl Zone {
 #[derive(Clone, Copy)]
 pub enum Input {
     Mouse(Button),
+    Wheel(crate::targets::Direction, u8),
     Key(Key),
     Text(char),
 }

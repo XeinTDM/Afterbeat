@@ -18,8 +18,8 @@ use windows_sys::Win32::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     },
     UI::WindowsAndMessaging::{
-        GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
-        WindowFromPoint,
+        GA_ROOT, GUITHREADINFO, GetAncestor, GetForegroundWindow, GetGUIThreadInfo,
+        GetWindowThreadProcessId, WindowFromPoint,
     },
 };
 
@@ -55,7 +55,11 @@ pub fn prepare(
     };
     let injector = Injector::new(
         input,
-        settings.double && !settings.keyboard,
+        if settings.keyboard || settings.scroll || settings.has_action_route() {
+            1
+        } else {
+            settings.click_count()
+        },
         points,
         radius,
         press,
@@ -68,7 +72,9 @@ pub fn prepare(
         edge: settings.edge_mode,
         inside: settings.inside_zone,
         stop: settings.stop_zone,
-        keyboard: settings.keyboard,
+        keyboard: settings.keyboard && !settings.has_action_route(),
+        #[cfg(windows)]
+        wheel: matches!(input, Input::Wheel(..)) && !settings.has_smart_route(),
         processes,
         next_check: Instant::now(),
         cached: Gate::Open,
@@ -95,7 +101,8 @@ pub fn low_cpu_available(settings: &Settings, bound: Option<Binding>) -> bool {
         return false;
     }
     !settings.keyboard
-        && !settings.double
+        && !settings.scroll
+        && settings.click_count() == 1
         && !settings.hold_down
         && !settings.random_rate
         && !settings.hold_activation
@@ -140,9 +147,107 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
             "Set the fixed point again for this desktop coordinate system.",
         ));
     }
+    if settings.has_smart_route() || settings.has_action_route() {
+        if !cfg!(windows) {
+            return Err(Issue::new(
+                "route",
+                "Control targets and per-step actions require Windows.",
+            ));
+        }
+        settings
+            .target_timeout()
+            .map_err(|message| Issue::new("route", message))?;
+        if settings
+            .route
+            .iter()
+            .filter_map(crate::targets::Step::control)
+            .any(|control| !control.selector.valid())
+        {
+            return Err(Issue::new(
+                "route",
+                "A control has no saved identity. Capture it again.",
+            ));
+        }
+        if settings.has_action_route() && settings.route.iter().all(|step| matches!(step, crate::targets::Step::Action(action) if action.action == crate::targets::Action::Wait)) {
+            return Err(Issue::new("route", "Add an input action to the route."));
+        }
+        for step in &settings.route {
+            if let crate::targets::Step::Action(action) = step {
+                validate_action(action, bound).map_err(|error| Issue::new("route", error))?;
+            }
+        }
+        #[cfg(windows)]
+        if settings.has_action_route()
+            && settings.hold_activation
+            && let Some(binding) = bound
+        {
+            use crate::targets::{Action, Step};
+            if settings.route.iter().any(|step| match step {
+                Step::Action(step) => match step.action {
+                    Action::Key { .. } => binding.has_modifiers(),
+                    Action::Scroll { .. } => binding.has_modifiers() || binding.mouse(),
+                    _ => false,
+                },
+                _ => false,
+            }) {
+                return Err(Issue::new(
+                    "shortcut",
+                    "Use an unmodified keyboard shortcut for a Hold route with wheel output, or an unmodified shortcut for key output.",
+                ));
+            }
+        }
+        if settings.has_smart_route()
+            && !settings.has_action_route()
+            && (settings.keyboard
+                || settings.hold_down
+                || settings.press_duration() != Ok(Duration::ZERO))
+        {
+            return Err(Issue::new(
+                "route",
+                "Use mouse taps or wheel output for a route with control targets.",
+            ));
+        }
+        if settings.radius() != Ok(0) {
+            return Err(Issue::new(
+                "route",
+                "Set the radius to zero for a route with control targets or per-step actions.",
+            ));
+        }
+    }
     let mut schedule = settings.schedule()?;
+    #[cfg(windows)]
+    if settings.scroll
+        && !settings.keyboard
+        && settings.hold_activation
+        && bound.is_some_and(|binding| binding.has_modifiers() || binding.mouse())
+        && (!settings.has_action_route() || settings.inherits_route_cadence())
+    {
+        return Err(Issue::new(
+            "shortcut",
+            "Use an unmodified keyboard shortcut for Hold with wheel output.",
+        ));
+    }
     schedule.low_cpu = schedule.low_cpu && low_cpu_available(settings, bound);
-    let input = if settings.keyboard && settings.text_output {
+    if settings.has_action_route()
+        && settings
+            .route
+            .iter()
+            .any(|step| !matches!(step, crate::targets::Step::Action(_)))
+    {
+        if settings.scroll && !settings.keyboard {
+            settings
+                .scroll_ticks()
+                .map_err(|error| Issue::new("input", error))?;
+        } else if bound.is_some_and(|binding| binding.matches_button(settings.button)) {
+            return Err(Issue::new(
+                "input",
+                "Use a different mouse button for output and activation.",
+            ));
+        }
+    }
+    let input = if settings.has_action_route() {
+        Input::Mouse(settings.button)
+    } else if settings.keyboard && settings.text_output {
         let mut chars = settings.text_character.chars();
         let character = chars
             .next()
@@ -173,11 +278,38 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
             ));
         }
         Input::Key(key)
+    } else if settings.scroll {
+        if settings.hold_down || settings.press_duration() != Ok(Duration::ZERO) {
+            return Err(Issue::new("press", "Select Tap for wheel output."));
+        }
+        Input::Wheel(
+            settings.scroll_direction,
+            settings
+                .scroll_ticks()
+                .map_err(|error| Issue::new("input", error))?,
+        )
     } else {
         Input::Mouse(settings.button)
     };
+    if let Input::Mouse(button) = input
+        && !settings.has_action_route()
+        && bound.is_some_and(|binding| binding.matches_button(button))
+    {
+        return Err(Issue::new(
+            "input",
+            "Use a different mouse button for output and activation.",
+        ));
+    }
     let points = if settings.route_enabled {
-        settings.route.clone()
+        if settings.has_smart_route() || settings.has_action_route() {
+            Vec::new()
+        } else {
+            settings
+                .route
+                .iter()
+                .filter_map(crate::targets::Step::point)
+                .collect()
+        }
     } else if settings.fixed && !settings.keyboard {
         vec![settings.point.ok_or(Issue::new(
             "target",
@@ -193,7 +325,9 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
     } else {
         0
     };
-    let press = if settings.hold_down {
+    let press = if settings.has_action_route() {
+        Press::Tap
+    } else if settings.hold_down {
         Press::Held
     } else {
         let duration = settings
@@ -223,6 +357,28 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
     })
 }
 
+pub fn validate_action(
+    action: &crate::targets::ActionStep,
+    bound: Option<Binding>,
+) -> Result<(), &'static str> {
+    action.validate()?;
+    if let crate::targets::Action::Click { button, .. } = action.action
+        && bound.is_some_and(|binding| binding.matches_button(button))
+    {
+        return Err("Use a different mouse button for output and activation.");
+    }
+    if let crate::targets::Action::Key { key } = &action.action {
+        let key = keys::parse(key).ok_or("Enter one key such as Enter, Space, A, or F5.")?;
+        if key.is_safety_key() || bound.is_some_and(|binding| binding.matches_key(key)) {
+            return Err("Choose a key different from the activation, stop, and capture shortcuts.");
+        }
+        if action.target.as_ref().is_some_and(|target| matches!(target, crate::targets::Destination::Control(control) if control.selector.control.is_none())) {
+            return Err("A targeted key step needs a control that exposes a keyboard focus identity.");
+        }
+    }
+    Ok(())
+}
+
 pub struct Guard {
     hold: Option<Binding>,
     release_modifiers: Option<Binding>,
@@ -230,18 +386,39 @@ pub struct Guard {
     inside: Option<Zone>,
     stop: Option<Zone>,
     keyboard: bool,
+    #[cfg(windows)]
+    wheel: bool,
     processes: Option<ProcessFilter>,
     next_check: Instant,
     cached: Gate,
 }
 
 impl Guard {
+    #[cfg(windows)]
+    pub fn check_route_key(&mut self) -> Gate {
+        let previous = std::mem::replace(&mut self.keyboard, true);
+        let gate = self.check_destination(None);
+        self.keyboard = previous;
+        gate
+    }
     pub fn enabled(&self) -> bool {
         self.hold.is_some()
             || self.release_modifiers.is_some()
             || self.watch_cursor()
             || self.keyboard
             || self.processes.is_some()
+            || self.wheel_guard()
+    }
+
+    fn wheel_guard(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.wheel
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     fn watch_cursor(&self) -> bool {
@@ -279,12 +456,32 @@ impl Guard {
     ) -> Result<Option<u32>, Gate> {
         let foreground = self.observe_target(&cursor, Binding::modifiers_pressed)?;
         let follows_pointer = target.is_none();
-        let target = if follows_pointer && !self.keyboard && self.processes.is_some() {
+        let target = if follows_pointer
+            && !self.keyboard
+            && (self.processes.is_some() || self.wheel_guard())
+        {
             Some(cursor().map_err(|_| Gate::Stop("Cursor access was lost."))?)
         } else {
             target
         };
         if let Some(point) = target {
+            #[cfg(windows)]
+            if self.wheel {
+                let hwnd = unsafe {
+                    WindowFromPoint(POINT {
+                        x: point.x,
+                        y: point.y,
+                    })
+                };
+                let foreground = unsafe { GetForegroundWindow() };
+                if foreground.is_null()
+                    || hwnd.is_null()
+                    || unsafe { GetAncestor(hwnd, GA_ROOT) } != foreground
+                    || window_pid(foreground) == std::process::id()
+                {
+                    return Err(Gate::Paused(PauseReason::WheelFocus));
+                }
+            }
             let spatial = spatial_gate(point, self.edge, self.inside, self.stop);
             if !matches!(spatial, Gate::Open) {
                 return Err(spatial);
@@ -544,7 +741,7 @@ fn foreground_pid() -> u32 {
 }
 
 #[cfg(windows)]
-fn window_pid(window: HWND) -> u32 {
+pub(crate) fn window_pid(window: HWND) -> u32 {
     let mut pid = 0;
     if !window.is_null() {
         unsafe { GetWindowThreadProcessId(window, &mut pid) };
@@ -554,6 +751,14 @@ fn window_pid(window: HWND) -> u32 {
 
 #[cfg(windows)]
 fn process_name(process: &OwnedHandle) -> Option<String> {
+    process_image(process)
+        .as_deref()
+        .and_then(|path| path.rsplit('\\').next())
+        .map(str::to_lowercase)
+}
+
+#[cfg(windows)]
+pub(crate) fn process_image(process: &OwnedHandle) -> Option<String> {
     let mut path = [0; 1_024];
     let mut len = path.len() as u32;
     if unsafe {
@@ -562,10 +767,7 @@ fn process_name(process: &OwnedHandle) -> Option<String> {
     {
         return None;
     }
-    String::from_utf16_lossy(&path[..len as usize])
-        .rsplit('\\')
-        .next()
-        .map(str::to_lowercase)
+    String::from_utf16(&path[..len as usize]).ok()
 }
 
 #[cfg(test)]

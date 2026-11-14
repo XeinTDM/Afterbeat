@@ -22,7 +22,7 @@ try {
     New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
     Push-Location $artifacts
     try {
-        foreach ($mode in @('keyboard-check', 'dry-run', 'compact-dry-fix', 'compact-text-paused')) {
+        foreach ($mode in @('keyboard-check', 'dry-run', 'compact-dry-fix', 'compact-text-paused', 'smart-targets', 'compact-smart-targets', 'wheel', 'compact-triple')) {
             & $preview $mode
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }

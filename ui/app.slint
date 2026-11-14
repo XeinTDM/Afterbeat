@@ -476,6 +476,8 @@ export struct DryPoint {
     radius-x: float,
     radius-y: float,
     blocked: bool,
+    hidden: bool,
+    repair: bool,
     location: string,
     result: string,
 }
@@ -506,12 +508,12 @@ component DryMap inherits Rectangle {
             height: area.h * map.height;
             border-width: area.kind == 0 ? 1px : 2px;
             border-color: Theme.high-contrast ? Theme.text :
-                area.kind == 0 ? #465466 : area.kind == 1 ? #52bcad : #ed6976;
+                area.kind == 0 ? #465466 : area.kind == 1 ? #52bcad : area.kind == 3 ? #7ea9f1 : area.kind == 4 ? #dbad6c : #ed6976;
             background: Theme.high-contrast ? Theme.background :
-                area.kind == 0 ? #202833 : area.kind == 1 ? #16423e : #492730;
+                area.kind == 0 ? #202833 : area.kind == 1 ? #16423e : area.kind == 3 ? #31508088 : area.kind == 4 ? #624c3288 : #492730;
         }
         for point[index] in root.points: Path {
-            visible: index > 0;
+            visible: index > 0 && !point.hidden && !root.points[max(0, index - 1)].hidden;
             width: map.width;
             height: map.height;
             viewbox-width: map.width / 1px;
@@ -526,7 +528,7 @@ component DryMap inherits Rectangle {
             LineTo { x: point.x * map.width / 1px; y: point.y * map.height / 1px; }
         }
         for point in root.points: Rectangle {
-            visible: point.radius-x > 0;
+            visible: !point.hidden && point.radius-x > 0;
             x: (point.x - point.radius-x) * map.width;
             y: (point.y - point.radius-y) * map.height;
             width: point.radius-x * 2 * map.width;
@@ -536,6 +538,7 @@ component DryMap inherits Rectangle {
             border-color: Theme.high-contrast ? Theme.text : #7ea9f199;
         }
         for point[index] in root.points: Rectangle {
+            visible: !point.hidden;
             width: 24px;
             height: 24px;
             x: point.x * map.width - self.width / 2;
@@ -573,6 +576,10 @@ export component App inherits Window {
     in-out property <string> count-text: "100";
     in-out property <int> button-mode;
     in-out property <bool> double-click;
+    in-out property <bool> triple-click;
+    in-out property <bool> scroll-output;
+    in-out property <int> scroll-direction: 1;
+    in-out property <string> scroll-ticks: "1";
     in-out property <bool> limited;
     in-out property <bool> fixed-target;
     in-out property <int> delay: 3;
@@ -596,7 +603,27 @@ export component App inherits Window {
     in-out property <bool> route-enabled;
     in-out property <bool> route-once;
     in-out property <string> route-radius: "0";
+    in-out property <string> target-timeout: "10";
+    in-out property <bool> capture-visual;
     in-out property <int> route-index: -1;
+    in property <bool> smart-targets-available;
+    in property <bool> route-smart;
+    in property <bool> route-actions;
+    in property <[int]> route-control-rows;
+    in-out property <bool> step-editing;
+    in property <int> step-edit-index: -1;
+    in property <bool> step-has-target;
+    in property <bool> step-control-target;
+    in-out property <int> step-kind;
+    in-out property <int> step-button;
+    in-out property <int> step-direction;
+    in-out property <string> step-delay;
+    in-out property <string> step-count;
+    in-out property <string> step-key;
+    in property <string> step-error;
+    private property <int> selected-control:
+        root.route-index >= 0 && root.route-index < root.route-control-rows.length ?
+        root.route-control-rows[root.route-index] : 0;
     in-out property <int> edge-mode;
     in-out property <int> process-mode;
     in-out property <string> process-names;
@@ -629,13 +656,14 @@ export component App inherits Window {
     in property <string> dry-source: "Saved route centers";
     in property <string> dry-message;
     in property <bool> dry-error;
+    in property <bool> dry-checking;
     in property <float> dry-aspect: 1.8;
     in-out property <int> dry-step: -1;
     private property <int> dry-preview-point:
         !root.route-enabled && root.dry-points.length > 0 ? 0 : root.dry-step;
     private property <bool> dry-playing;
     private property <bool> dry-at-end: root.dry-step >= root.dry-points.length - 1 ||
-        (root.dry-step >= 0 && root.dry-points[root.dry-step].blocked);
+        (!root.route-smart && !root.route-actions && root.dry-step >= 0 && root.dry-points[root.dry-step].blocked);
     in-out property <string> shortcut-error;
     in-out property <string> preset-error;
     in property <string> run-state;
@@ -669,6 +697,10 @@ export component App inherits Window {
     callback reset-pad();
     callback apply-shortcut();
     callback edit-route(int);
+    callback toggle-target-verification();
+    callback repair-target();
+    callback edit-step(int);
+    callback save-step();
     callback clear-zone(int);
     callback open-dry-run();
     callback sample-dry-run();
@@ -697,12 +729,14 @@ export component App inherits Window {
     private property <int> guide-return-page;
     private property <string> reveal-field;
     out property <int> capture-shortcut-kind: root.capturing ? root.pick-kind :
-        root.page == 2 ? max(1, root.pick-kind) : root.route-enabled ? 1 : 0;
+        root.page == 2 ? max(1, root.pick-kind) : root.route-enabled ?
+        (root.pick-kind == 5 ? 5 : 1) : 0;
     private property <string> capture-hint: root.page == 4 ? "Sample pointer" : root.active ? "Pick" :
         root.capture-shortcut-kind == 1 ? "Add point" :
         root.capture-shortcut-kind == 2 ? "Inside corner" :
-        root.capture-shortcut-kind == 3 ? "Stop corner" : "Pick point";
-    private property <bool> locked: root.active || root.capturing;
+        root.capture-shortcut-kind == 3 ? "Stop corner" :
+        root.capture-shortcut-kind == 5 ? "Pick control" : "Pick point";
+    private property <bool> locked: root.active || root.capturing || root.step-editing;
     private property <bool> valid: root.configuration-error == "";
     private property <bool> available: root.can-start && root.input-ready;
     private property <bool> inline-configuration-error:
@@ -734,7 +768,7 @@ export component App inherits Window {
         root.message-error && !root.message-shown-inline ? root.message : "";
     private property <bool> show-run-button: root.page != 4 && (root.active || !root.hold-activation);
     private property <string> run-button-label: root.stopping ? "Stopping…" : root.active ? "Stop run" : "Start run";
-    private property <bool> run-button-enabled: root.page != 4 && !root.stopping && !root.capturing &&
+    private property <bool> run-button-enabled: root.page != 4 && !root.stopping && !root.capturing && !root.step-editing &&
         (root.active || (root.available && root.valid && root.armed && !root.hold-activation));
     private property <string> hold-instructions: root.page != 4 && root.hold-activation &&
         !root.active && !root.capturing && root.available && root.valid && root.armed && root.has-toggle ?
@@ -742,8 +776,8 @@ export component App inherits Window {
     private property <string> run-metrics: root.session-count + " actions  ·  " +
         (root.session-rate == "—" ? "—" : root.session-rate + "/s") + "  ·  " + root.session-elapsed;
     private property <string> setup-summary:
-        (root.keyboard ? "Keyboard" : root.double-click ? "Double click" : "Mouse") + "  ·  " + root.pace-value + "  ·  " +
-        (root.route-enabled ? "\{root.route-count}-point route" : root.keyboard ? "Foreground app" :
+        (root.keyboard ? "Keyboard" : root.scroll-output ? "Wheel" : root.triple-click ? "Triple click" : root.double-click ? "Double click" : "Mouse") + "  ·  " + root.pace-value + "  ·  " +
+        (root.route-enabled ? root.route-smart || root.route-actions ? "\{root.route-count}-step route" : "\{root.route-count}-point route" : root.keyboard ? "Foreground app" :
             root.fixed-target ? "Fixed point · " + root.point-label : "Follow cursor") +
         root.limit-summary +
         (!root.hold-activation && root.delay > 0 ? "  ·  \{root.delay} s delay" : "") +
@@ -761,8 +795,8 @@ export component App inherits Window {
     function has-field-row(field: string) -> bool {
         if (root.page == 0) {
             return field == "cadence" || field == "repeat" ||
-                (root.keyboard && field == "input") ||
-                (!root.keyboard && field == "click-type") ||
+                field == "input" ||
+                (!root.keyboard && !root.scroll-output && field == "click-type") ||
                 ((!root.keyboard || root.route-enabled) && field == "target");
         }
         if (root.page == 1) {
@@ -801,6 +835,10 @@ export component App inherits Window {
         if (root.page != 4) { root.show-page(4); }
     }
 
+    public function reveal-step-editor() {
+        root.reveal-field = "step-editor";
+    }
+
     function advance-dry-run() {
         if (!root.dry-at-end) {
             root.dry-step += 1;
@@ -817,6 +855,7 @@ export component App inherits Window {
     }
 
     function show-page(index: int) {
+        if (root.step-editing && index != 2) { root.step-editing = false; }
         root.dry-playing = false;
         root.page = index;
         root.confirm-preset = 0;
@@ -1082,18 +1121,56 @@ export component App inherits Window {
                             label-width: (root.large-text ? 82px : 108px) * Theme.text-scale;
                             label: "Input";
                             Choices {
-                                width: 129px * min(1.8, Theme.text-scale);
-                                labels: ["Mouse", "Key"];
-                                current: root.keyboard ? 1 : 0;
+                                width: 186px * min(1.8, Theme.text-scale);
+                                labels: ["Mouse", "Key", "Wheel"];
+                                current: root.keyboard ? 1 : root.scroll-output ? 2 : 0;
                                 enabled: !root.locked;
-                                selected(index) => { root.keyboard = index == 1; root.settings-edited(); }
+                                selected(index) => {
+                                    root.keyboard = index == 1;
+                                    root.scroll-output = index == 2;
+                                    if (root.scroll-output) {
+                                        root.hold-down = false;
+                                        root.timed-press = false;
+                                        root.press-text = "0";
+                                    }
+                                    root.settings-edited();
+                                }
                             }
-                            if (!root.keyboard): Choices {
-                                width: 225px * min(1.8, Theme.text-scale);
-                                labels: ["Left", "Right", "Middle"];
+                        }
+                        if (!root.keyboard && !root.scroll-output): FieldRow {
+                            compact: root.stack-fields && !root.large-text;
+                            label-width: (root.large-text ? 82px : 108px) * Theme.text-scale;
+                            label: "Mouse button";
+                            error: root.field-error("input");
+                            reveal: root.reveal-field == "input";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 343px * min(1.4, Theme.text-scale);
+                                labels: ["Left", "Right", "Middle", "Mouse4", "Mouse5"];
                                 current: root.button-mode;
                                 enabled: !root.locked;
                                 selected(index) => { root.button-mode = index; root.settings-edited(); }
+                            }
+                        }
+                        if (root.scroll-output): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Wheel output";
+                            error: root.field-error("input");
+                            reveal: root.reveal-field == "input";
+                            reveal-at(y) => { root.reveal-setting(y); }
+                            Choices {
+                                width: 227px * min(1.45, Theme.text-scale);
+                                labels: ["Up", "Down", "Left", "Right"];
+                                current: root.scroll-direction;
+                                enabled: !root.locked;
+                                selected(index) => { root.scroll-direction = index; root.settings-edited(); }
+                            }
+                            NumberField {
+                                width: 89px; label: "Scroll amount"; unit: "ticks";
+                                error: root.field-error("input");
+                                enabled: !root.locked;
+                                value <=> root.scroll-ticks;
+                                edited => { root.settings-edited(); }
                             }
                         }
                         if (root.keyboard): FieldRow {
@@ -1125,18 +1202,18 @@ export component App inherits Window {
                             }
                             Secondary { text: root.text-output ? "One literal character" : "e.g. Space, A, Enter"; }
                         }
-                        if (!root.compact && !root.keyboard): FieldRow {
+                        if (!root.compact && !root.keyboard && !root.scroll-output): FieldRow {
                             compact: root.stack-fields;
                             label: "Click type";
                             error: root.field-error("click-type");
                             reveal: root.reveal-field == "click-type";
                             reveal-at(y) => { root.reveal-setting(y); }
                             Choices {
-                                width: 168px * min(1.8, Theme.text-scale);
-                                labels: ["Single", "Double"];
-                                current: root.double-click ? 1 : 0;
+                                width: 218px * min(1.8, Theme.text-scale);
+                                labels: ["Single", "Double", "Triple"];
+                                current: root.triple-click ? 2 : root.double-click ? 1 : 0;
                                 enabled: !root.locked;
-                                selected(index) => { root.double-click = index == 1; root.settings-edited(); }
+                                selected(index) => { root.double-click = index == 1; root.triple-click = index == 2; root.settings-edited(); }
                             }
                         }
                         if (!root.compact): SectionTitle { text: "Target and limits"; }
@@ -1146,7 +1223,7 @@ export component App inherits Window {
                             error: root.field-error("target");
                             reveal: root.reveal-field == "target";
                             reveal-at(y) => { root.reveal-setting(y); }
-                            if (root.route-enabled): Secondary { text: "\{root.route-count} points"; }
+                            if (root.route-enabled): Secondary { text: root.route-smart || root.route-actions ? "\{root.route-count} steps" : "\{root.route-count} points"; }
                             if (root.route-enabled): ActionButton { label: "Edit route"; activated => { root.show-page(2); } }
                             if (!root.route-enabled): Choices {
                                 width: 202px * min(1.8, Theme.text-scale);
@@ -1209,18 +1286,18 @@ export component App inherits Window {
                                 selected(millis) => { root.preset-interval(millis); }
                             }
                         }
-                        if (root.compact && root.show-clicker-options && !root.keyboard): FieldRow {
+                        if (root.compact && root.show-clicker-options && !root.keyboard && !root.scroll-output): FieldRow {
                             compact: root.stack-fields;
                             label: "Click type";
                             error: root.field-error("click-type");
                             reveal: root.reveal-field == "click-type";
                             reveal-at(y) => { root.reveal-setting(y); }
                             Choices {
-                                width: 168px * min(1.8, Theme.text-scale);
-                                labels: ["Single", "Double"];
-                                current: root.double-click ? 1 : 0;
+                                width: 218px * min(1.8, Theme.text-scale);
+                                labels: ["Single", "Double", "Triple"];
+                                current: root.triple-click ? 2 : root.double-click ? 1 : 0;
                                 enabled: !root.locked;
-                                selected(index) => { root.double-click = index == 1; root.settings-edited(); }
+                                selected(index) => { root.double-click = index == 1; root.triple-click = index == 2; root.settings-edited(); }
                             }
                         }
                         if (root.show-clicker-options): FieldRow {
@@ -1267,7 +1344,7 @@ export component App inherits Window {
                             reveal-at(y) => { root.reveal-setting(y); }
                             Choices {
                                 width: 241px * min(1.8, Theme.text-scale);
-                                labels: ["Tap", "Timed", "Hold down"];
+                                labels: root.scroll-output ? ["Tap"] : ["Tap", "Timed", "Hold down"];
                                 current: root.hold-down ? 2 : root.timed-press ? 1 : 0;
                                 enabled: !root.locked;
                                 selected(index) => {
@@ -1416,23 +1493,130 @@ export component App inherits Window {
                         }
                         FieldRow {
                             compact: root.stack-fields;
-                            label: "Route points";
+                            label: "Route steps";
                             ActionButton {
                                 label: root.native-wayland ? "Add coordinates" : root.capturing && root.pick-kind == 1 ? "Cancel" : "Add in 3s";
-                                enabled: !root.active && (!root.capturing || root.pick-kind == 1) && (!root.native-wayland || root.wayland-displays != "");
+                                enabled: !root.step-editing && !root.active && (!root.capturing || root.pick-kind == 1) && (!root.native-wayland || root.wayland-displays != "");
                                 activated => { root.capture-point(1); }
+                            }
+                            if (root.smart-targets-available): ActionButton {
+                                label: root.capturing && root.pick-kind == 5 ? "Cancel" : "Pick control";
+                                enabled: !root.step-editing && !root.active && (!root.capturing || root.pick-kind == 5);
+                                activated => { root.capture-point(5); }
                             }
                             ActionButton { label: "Move up"; enabled: !root.locked && root.route-index > 0; activated => { root.edit-route(-1); } }
                             ActionButton { label: "Move down"; enabled: !root.locked && root.route-index >= 0 && root.route-index + 1 < root.route-count; activated => { root.edit-route(1); } }
                             ActionButton { label: "Remove"; enabled: !root.locked && root.route-index >= 0; activated => { root.edit-route(0); } }
                         }
                         SelectionList {
-                            label: "Route points";
+                            label: "Route steps";
                             rows: root.route-rows;
                             selected: root.route-index;
                             enabled: !root.locked;
                             empty-text: root.native-wayland ? "Enable with displays and enter logical coordinates." : "Add a point by moving the pointer to its position.";
                             chosen(index, name) => { root.route-index = index; }
+                        }
+                        if (root.smart-targets-available && !root.step-editing): HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            ActionButton { label: "Add step"; enabled: !root.locked; activated => { root.edit-step(-1); } }
+                            ActionButton { label: "Edit step"; enabled: !root.locked && root.route-index >= 0; activated => { root.edit-step(root.route-index); } }
+                        }
+                        if (root.step-editing): VerticalLayout {
+                            spacing: 6px;
+                            Timer {
+                                interval: 1ms;
+                                running: root.reveal-field == "step-editor";
+                                triggered => { root.reveal-setting(parent.absolute-position.y); }
+                            }
+                            SectionTitle { text: root.step-edit-index < 0 ? "Add a route step" : "Edit step \{root.step-edit-index + 1}"; }
+                            FieldRow {
+                                compact: root.stack-fields;
+                                label: "Action";
+                                Choices {
+                                    width: 275px * min(1.4, Theme.text-scale);
+                                    labels: root.step-control-target ? ["Click", "Scroll", "Key press"] :
+                                        root.step-has-target ? ["Click", "Scroll"] : ["Wait", "Key press"];
+                                    current: root.step-control-target ? (root.step-kind == 0 ? 0 : root.step-kind - 1) :
+                                        root.step-has-target ? root.step-kind / 2 : (root.step-kind == 1 ? 0 : 1);
+                                    selected(index) => {
+                                        if (root.step-has-target && ((root.step-kind == 2) != (index == 1))) {
+                                            root.step-count = "1";
+                                        }
+                                        root.step-kind = root.step-has-target ? (index == 0 ? 0 : index + 1) :
+                                            (index == 0 ? 1 : 3);
+                                    }
+                                }
+                            }
+                            if (root.step-kind == 0 || root.step-kind == 2): FieldRow {
+                                compact: root.stack-fields;
+                                label: root.step-kind == 0 ? "Mouse button" : "Direction";
+                                Choices {
+                                    width: 251px * min(1.4, Theme.text-scale);
+                                    labels: root.step-kind == 0 ? ["Left", "Right", "Middle", "Mouse4", "Mouse5"] : ["Up", "Down", "Left", "Right"];
+                                    current: root.step-kind == 0 ? root.step-button : root.step-direction;
+                                    selected(index) => {
+                                        if (root.step-kind == 0) { root.step-button = index; }
+                                        else { root.step-direction = index; }
+                                    }
+                                }
+                                NumberField {
+                                    width: 84px * min(1.5, Theme.text-scale);
+                                    label: root.step-kind == 0 ? "Clicks per step" : "Wheel ticks";
+                                    unit: root.step-kind == 0 ? "clicks" : "ticks";
+                                    value <=> root.step-count;
+                                }
+                            }
+                            if (root.step-kind == 3): FieldRow {
+                                compact: root.stack-fields;
+                                label: "Key press";
+                                NumberField { width: 125px; label: "Route key"; value <=> root.step-key; }
+                                Secondary { text: root.step-control-target ? "Requires the captured control to have focus." : "Sends to the focused app."; wrap: word-wrap; }
+                            }
+                            FieldRow {
+                                compact: root.stack-fields;
+                                label: root.step-kind == 1 ? "Wait duration" : "Delay before input";
+                                error: root.step-error;
+                                NumberField { width: 108px; label: "Step delay"; unit: "ms"; value <=> root.step-delay; }
+                            }
+                            HorizontalLayout {
+                                alignment: start;
+                                spacing: 8px;
+                                ActionButton { label: "Save step"; primary: true; activated => { root.save-step(); } }
+                                ActionButton { label: "Cancel edit"; activated => { root.step-editing = false; } }
+                            }
+                        }
+                        if (root.smart-targets-available): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Control capture";
+                            Choices {
+                                width: 222px * min(1.6, Theme.text-scale);
+                                labels: ["Accessibility", "With visual anchor"];
+                                current: root.capture-visual ? 1 : 0;
+                                enabled: !root.locked;
+                                selected(index) => {
+                                    root.capture-visual = index == 1;
+                                    root.settings-edited();
+                                }
+                            }
+                            if (root.capture-visual): Secondary { text: "Saves local image fingerprints."; }
+                        }
+                        if (root.smart-targets-available && root.route-smart): FieldRow {
+                            compact: root.stack-fields;
+                            label: "Target timeout";
+                            NumberField {
+                                width: 83px * min(1.6, Theme.text-scale);
+                                label: "Target timeout in seconds";
+                                unit: "s";
+                                enabled: !root.locked;
+                                value <=> root.target-timeout;
+                                edited => { root.settings-edited(); }
+                            }
+                            if (root.selected-control > 0): ActionButton {
+                                label: root.selected-control == 2 ? "Clear disappearance check" : "Wait until gone";
+                                enabled: !root.locked;
+                                activated => { root.toggle-target-verification(); }
+                            }
                         }
                         Rule {}
                         SectionTitle { text: "Zones and filters"; }
@@ -1490,7 +1674,8 @@ export component App inherits Window {
                         Secondary {
                             wrap: word-wrap;
                             text: root.capture-key + (root.capture-shortcut-kind == 2 ? " captures an inside-only corner" :
-                                  root.capture-shortcut-kind == 3 ? " captures a stop-zone corner" : " adds a route point");
+                                  root.capture-shortcut-kind == 3 ? " captures a stop-zone corner" :
+                                  root.capture-shortcut-kind == 5 ? " picks the control under the pointer" : " adds a route point");
                         }
                     }
 
@@ -1502,6 +1687,18 @@ export component App inherits Window {
                             flex-wrap: wrap;
                             spacing: 8px;
                             ActionButton { label: "Back to Targets"; enabled: !root.capturing; activated => { root.show-page(2); } }
+                            if (root.route-smart && root.smart-targets-available): ActionButton {
+                                label: "Check again";
+                                enabled: !root.dry-checking;
+                                activated => { root.open-dry-run(); }
+                            }
+                            if (root.dry-step >= 0 && root.dry-step < root.dry-points.length &&
+                                root.dry-points[root.dry-step].repair): ActionButton {
+                                label: "Repair target";
+                                primary: true;
+                                enabled: !root.dry-checking && !root.dry-playing;
+                                activated => { root.repair-target(); }
+                            }
                             if (root.dry-sample-allowed): ActionButton {
                                 label: root.capturing ? "Cancel sample" : "Sample pointer in 3 s";
                                 primary: !root.capturing;
@@ -1543,8 +1740,8 @@ export component App inherits Window {
                             text: root.dry-points.length == 0 ?
                                 (root.dry-sample-allowed ? "Sample the pointer to check a specific location." : "No saved target points to preview.") :
                                 !root.route-enabled ? root.dry-points[0].location + " · " + root.dry-points[0].result :
-                                root.dry-step < 0 ? "Ready to preview \{root.dry-points.length} saved point(s)." :
-                                "Point \{root.dry-step + 1} of \{root.dry-points.length} · " +
+                                root.dry-step < 0 ? "Ready to preview \{root.dry-points.length} route steps." :
+                                "Step \{root.dry-step + 1} of \{root.dry-points.length} · " +
                                 root.dry-points[root.dry-step].location + " · " + root.dry-points[root.dry-step].result;
                             color: root.dry-preview-point >= 0 &&
                                 root.dry-points[root.dry-preview-point].blocked ? Theme.error : Theme.text;
@@ -1559,11 +1756,12 @@ export component App inherits Window {
                             step: root.dry-preview-point;
                         }
                         Secondary {
-                            text: "Blue · preview points    Teal · inside-only zone    Red · stop zone or blocked point";
+                            text: root.route-smart ? "Blue outlines show targets. Gold outlines show their visual anchors." :
+                                "Blue · preview points    Teal · inside-only zone    Red · stop zone or blocked point";
                             wrap: word-wrap;
                         }
                         Secondary {
-                            text: root.dry-sample-allowed ?
+                            text: root.route-smart ? "Each step is checked against the current desktop. A later control may appear only after an earlier click." : root.dry-sample-allowed ?
                                 "Checks screen edges and zones at the sampled point. Live pointer movement and app filters can change a run." :
                                 "Checks saved point centers for screen edges and zones. Radius rings show possible offsets. Live pointer position and app filters can change a run.";
                             wrap: word-wrap;

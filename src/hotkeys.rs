@@ -79,7 +79,17 @@ impl Binding {
         self.vk == key.vk
     }
 
-    fn mouse(self) -> bool {
+    pub fn matches_button(self, button: crate::mouse::Button) -> bool {
+        use crate::mouse::Button::*;
+        self.mouse()
+            && match button {
+                Mouse4 => self.vk == VK_XBUTTON1,
+                Mouse5 => self.vk == VK_XBUTTON2,
+                _ => false,
+            }
+    }
+
+    pub(crate) fn mouse(self) -> bool {
         matches!(self.vk, VK_XBUTTON1 | VK_XBUTTON2)
     }
 
@@ -124,6 +134,7 @@ impl Binding {
     }
 }
 
+#[derive(Clone)]
 pub struct StopProbe {
     stop: Option<Binding>,
     toggle: Option<Binding>,

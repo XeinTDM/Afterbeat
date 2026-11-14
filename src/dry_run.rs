@@ -5,6 +5,7 @@ use crate::{
     mouse::{self, Point, Zone},
     point_label,
     settings::Settings,
+    targets::Step,
 };
 use slint::{ModelRc, VecModel};
 
@@ -17,6 +18,66 @@ pub fn can_sample(settings: &Settings) -> bool {
 }
 
 pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), &'static str> {
+    show_targets(ui, settings, sample, |_: usize| Preview {
+        point: None,
+        bounds: None,
+        landmark: None,
+        message: "Check the desktop to find this control.",
+        repair: false,
+        blocked: true,
+    })?;
+    ui.invoke_show_dry_run();
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn show_smart(
+    ui: &App,
+    settings: &Settings,
+    results: &[crate::smart_targets::Resolution],
+) -> Result<(), &'static str> {
+    use crate::smart_targets::Resolution;
+    show_targets(ui, settings, None, |index| {
+        let result = results
+            .get(index)
+            .cloned()
+            .unwrap_or(Resolution::Unavailable);
+        let (point, bounds, landmark) = match &result {
+            Resolution::Ready(target)
+            | Resolution::Recovered(target)
+            | Resolution::Conflict(target) => (
+                Some(target.point),
+                Some(target.bounds),
+                target.landmark_bounds(),
+            ),
+            _ => (None, None, None),
+        };
+        Preview {
+            point,
+            bounds,
+            landmark,
+            message: result.message(),
+            repair: matches!(result, Resolution::Recovered(_) | Resolution::Conflict(_)),
+            blocked: !matches!(result, Resolution::Ready(_) | Resolution::Recovered(_)),
+        }
+    })
+}
+
+struct Preview {
+    point: Option<Point>,
+    bounds: Option<Zone>,
+    landmark: Option<Zone>,
+    message: &'static str,
+    repair: bool,
+    blocked: bool,
+}
+
+fn show_targets(
+    ui: &App,
+    settings: &Settings,
+    sample: Option<Point>,
+    preview: impl Fn(usize) -> Preview,
+) -> Result<(), &'static str> {
     let displays = mouse::display_areas();
     let Some(first) = displays.first() else {
         #[cfg(target_os = "linux")]
@@ -51,28 +112,68 @@ pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), 
             kind,
         }
     };
-    let areas: Vec<_> = displays
+    let mut areas: Vec<_> = displays
         .into_iter()
         .map(|zone| area(zone, 0))
         .chain(settings.inside_zone.map(|zone| area(zone, 1)))
         .chain(settings.stop_zone.map(|zone| area(zone, 2)))
         .collect();
 
-    let points = if settings.route_enabled {
-        settings.route.clone()
+    let local_points = if settings.route_enabled {
+        Vec::new()
     } else if settings.fixed && !settings.keyboard {
-        settings.point.into_iter().collect()
+        settings.point.into_iter().map(Step::Point).collect()
     } else {
-        sample.into_iter().collect()
+        sample.into_iter().map(Step::Point).collect()
     };
-    let radius = if settings.route_enabled {
-        settings.radius().unwrap_or_default() as f32
+    let steps = if settings.route_enabled {
+        &settings.route
     } else {
-        0.0
+        &local_points
     };
-    let points: Vec<_> = points
-        .into_iter()
-        .map(|point| {
+    let radius =
+        if settings.route_enabled && !settings.has_smart_route() && !settings.has_action_route() {
+            settings.radius().unwrap_or_default() as f32
+        } else {
+            0.0
+        };
+    let points: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let preview = if let Some(point) = step.point() {
+                Preview {
+                    point: Some(point),
+                    bounds: None,
+                    landmark: None,
+                    message: "Spatial checks passed.",
+                    repair: false,
+                    blocked: false,
+                }
+            } else if step.is_smart() {
+                preview(index)
+            } else {
+                let wait = matches!(step, Step::Action(action) if action.action == crate::targets::Action::Wait);
+                Preview {
+                    point: None, bounds: None, landmark: None, repair: false, blocked: false,
+                    message: if wait { "Waits without sending input." } else { "Uses the focused app when the step runs." },
+                }
+            };
+            let Some(point) = preview.point else {
+                return DryPoint {
+                    blocked: preview.blocked,
+                    hidden: true,
+                    location: step.label().into(),
+                    result: preview.message.into(),
+                    ..Default::default()
+                };
+            };
+            if let Some(bounds) = preview.bounds {
+                areas.push(area(bounds, 3));
+            }
+            if let Some(landmark) = preview.landmark {
+                areas.push(area(landmark, 4));
+            }
             let (blocked, message) = if mouse::on_monitor(point) {
                 match spatial_gate(
                     point,
@@ -80,7 +181,7 @@ pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), 
                     settings.inside_zone,
                     settings.stop_zone,
                 ) {
-                    Gate::Open => (false, "Spatial checks passed."),
+                    Gate::Open => (preview.blocked, preview.message),
                     Gate::Paused(_) => (true, "Would pause outside the inside-only zone."),
                     Gate::Stop(reason) => (true, reason),
                 }
@@ -93,14 +194,25 @@ pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), 
                 radius_x: radius / width,
                 radius_y: radius / height,
                 blocked,
-                location: point_label(point).into(),
+                hidden: false,
+                repair: preview.repair,
+                location: if !matches!(step, Step::Point(_)) {
+                    step.label()
+                } else {
+                    point_label(point)
+                }
+                .into(),
                 result: message.into(),
             }
         })
         .collect();
     ui.set_dry_sample_allowed(can_sample(settings));
     ui.set_dry_source(
-        if settings.route_enabled {
+        if settings.has_action_route() {
+            "Route actions and targets"
+        } else if settings.has_smart_route() {
+            "Control targets and saved points"
+        } else if settings.route_enabled {
             "Saved route centers"
         } else if settings.keyboard {
             "Pointer sample for keyboard safety zones"
@@ -114,6 +226,5 @@ pub fn show(ui: &App, settings: &Settings, sample: Option<Point>) -> Result<(), 
     ui.set_dry_areas(ModelRc::new(VecModel::from(areas)));
     ui.set_dry_points(ModelRc::new(VecModel::from(points)));
     ui.set_dry_aspect(width / height);
-    ui.invoke_show_dry_run();
     Ok(())
 }

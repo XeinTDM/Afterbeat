@@ -1,6 +1,7 @@
 use crate::{
     engine::Schedule,
     mouse::{Button, Point, Zone},
+    targets::Step,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,6 +35,10 @@ pub struct Settings {
     pub count: String,
     pub button: Button,
     pub double: bool,
+    pub triple: bool,
+    pub scroll: bool,
+    pub scroll_direction: crate::targets::Direction,
+    pub scroll_ticks: String,
     pub limited: bool,
     pub fixed: bool,
     pub point: Option<Point>,
@@ -57,7 +62,9 @@ pub struct Settings {
     pub route_enabled: bool,
     pub route_once: bool,
     pub route_radius: String,
-    pub route: Vec<Point>,
+    pub route: Vec<Step>,
+    pub target_timeout: String,
+    pub capture_visual: bool,
     pub route_wayland: bool,
     pub edge_mode: u8,
     pub inside_zone: Option<Zone>,
@@ -73,6 +80,10 @@ impl Default for Settings {
             count: "100".into(),
             button: Button::Left,
             double: false,
+            triple: false,
+            scroll: false,
+            scroll_direction: crate::targets::Direction::Down,
+            scroll_ticks: "1".into(),
             limited: false,
             fixed: false,
             point: None,
@@ -97,6 +108,8 @@ impl Default for Settings {
             route_once: false,
             route_radius: "0".into(),
             route: Vec::new(),
+            target_timeout: "10".into(),
+            capture_visual: false,
             route_wayland: false,
             edge_mode: 0,
             inside_zone: None,
@@ -214,18 +227,21 @@ impl Settings {
     }
 
     pub fn schedule(&self) -> Result<Schedule, Issue> {
-        let rates = if self.hold_down {
+        let inherits_cadence = self.inherits_route_cadence();
+        let rates = if !inherits_cadence || (self.hold_down && !self.has_action_route()) {
             None
         } else {
             self.rates()
                 .map_err(|message| Issue::new("rate", message))?
         };
-        let interval = if rates.is_some() || self.hold_down {
-            Duration::ZERO
-        } else {
-            self.interval()
-                .map_err(|message| Issue::new("cadence", message))?
-        };
+        let interval =
+            if !inherits_cadence || rates.is_some() || (self.hold_down && !self.has_action_route())
+            {
+                Duration::ZERO
+            } else {
+                self.interval()
+                    .map_err(|message| Issue::new("cadence", message))?
+            };
         let time = number(&self.time_limit)
             .filter(|v| (0.0..=MAX_INTERVAL).contains(v))
             .ok_or(Issue::new(
@@ -254,7 +270,7 @@ impl Settings {
                     "Add between 1 and 64 points before running a route.",
                 ));
             }
-            if self.route_once {
+            if self.route_once && !self.has_action_route() {
                 let points = self.route.len() as u64;
                 limit = Some(limit.map_or(points, |count| count.min(points)));
             }
@@ -271,13 +287,21 @@ impl Settings {
                 "Use Follow cursor or clear the inside-only zone.",
             ));
         }
-        if self.hold_down && (self.limited || self.route_enabled || self.inside_zone.is_some()) {
+        if self.hold_down
+            && !self.has_action_route()
+            && (self.limited || self.route_enabled || self.inside_zone.is_some())
+        {
             return Err(Issue::new(
                 "press",
                 "Use continuous repeat and a single target for Hold down.",
             ));
         }
-        if !self.keyboard && self.double && self.hold_down {
+        if !self.has_action_route()
+            && !self.keyboard
+            && !self.scroll
+            && self.click_count() > 1
+            && self.hold_down
+        {
             return Err(Issue::new(
                 "click-type",
                 "Select Single click for Hold down.",
@@ -301,6 +325,52 @@ impl Settings {
         self.edge_mode = self.edge_mode.min(2);
         self.process_mode = self.process_mode.min(2);
         self.route.truncate(MAX_POINTS);
+    }
+
+    pub fn has_smart_route(&self) -> bool {
+        self.route_enabled && self.route.iter().any(Step::is_smart)
+    }
+
+    pub fn click_count(&self) -> u8 {
+        if self.triple {
+            3
+        } else if self.double {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub fn scroll_ticks(&self) -> Result<u8, &'static str> {
+        self.scroll_ticks
+            .trim()
+            .parse()
+            .ok()
+            .filter(|count| (1..=32).contains(count))
+            .ok_or("Set the scroll amount from 1 to 32 ticks.")
+    }
+
+    pub fn has_action_route(&self) -> bool {
+        self.route_enabled
+            && self
+                .route
+                .iter()
+                .any(|step| matches!(step, Step::Action(_)))
+    }
+
+    pub fn inherits_route_cadence(&self) -> bool {
+        !self.has_action_route()
+            || self
+                .route
+                .iter()
+                .any(|step| !matches!(step, Step::Action(_)))
+    }
+
+    pub fn target_timeout(&self) -> Result<Duration, &'static str> {
+        number(&self.target_timeout)
+            .filter(|seconds| (0.1..=120.0).contains(seconds))
+            .map(Duration::from_secs_f64)
+            .ok_or("Set a target timeout from 0.1 to 120 seconds.")
     }
 }
 
@@ -674,7 +744,10 @@ mod tests {
         let mut settings = Settings {
             route_enabled: true,
             route_once: true,
-            route: vec![Point { x: 0, y: 0 }, Point { x: 1, y: 1 }],
+            route: vec![
+                Step::Point(Point { x: 0, y: 0 }),
+                Step::Point(Point { x: 1, y: 1 }),
+            ],
             ..Settings::default()
         };
         assert_eq!(settings.schedule().unwrap().limit, Some(2));

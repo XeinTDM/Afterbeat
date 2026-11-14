@@ -58,6 +58,7 @@ fn disposition(message: u32, tagged: bool) -> (bool, bool) {
     let block = press
         || matches!(message,
             WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP |
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL |
             WM_NCLBUTTONDOWN..=WM_NCMBUTTONDBLCLK | WM_NCXBUTTONDOWN..=WM_NCXBUTTONDBLCLK |
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP |
             WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR

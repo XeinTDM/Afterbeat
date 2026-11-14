@@ -21,7 +21,10 @@ Afterbeat is a desktop auto-clicker and key repeater for x64 Windows 10 and 11, 
 ## Set up a run
 
 - Use fixed or variable intervals, counted repeats, time limits, and timed presses.
+- Repeat single, double, or triple clicks with five mouse buttons, or scroll vertically or horizontally.
 - Save up to 64 points in a route. Use **Targets → Dry run** to preview points and zones without sending input.
+- On Windows, mix clicks, waits, wheel scrolling, and key presses with a delay on each step. [Per-step actions](docs/usage.md#per-step-actions-on-windows)
+- On Windows, use **Targets → Pick control** to save an accessible control. Enable **With visual anchor** to locate the target after an ID or window title changes and review repairs in Dry Run. [Smart Targets](docs/usage.md#smart-targets-on-windows)
 - Use stop zones, monitor edges, and app filters to constrain a run. Save the whole setup under **Presets**.
 - Choose **Precise** for steadier click spacing or **Low CPU** to batch compatible mouse clicks. [Pacing and eligibility](docs/usage.md#precise-and-low-cpu)
 

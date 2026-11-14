@@ -47,6 +47,7 @@ pub fn tap() -> Option<CFRetained<CFMachPort>> {
         CGEventType::OtherMouseDown,
         CGEventType::OtherMouseUp,
         CGEventType::OtherMouseDragged,
+        CGEventType::ScrollWheel,
         CGEventType::KeyDown,
         CGEventType::KeyUp,
     ]);

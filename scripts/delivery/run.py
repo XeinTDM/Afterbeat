@@ -46,6 +46,8 @@ def fingerprint(path):
 
 
 def plan(args):
+    if args.command in ("visual-targets", "route-actions"):
+        return []
     if args.command == "smoke":
         cases = [
             {"mode": "counted", "condition": "idle", "rate": 100, "count": 12},
@@ -233,17 +235,29 @@ def capture(trial, sink, app, manifest, windows, stop_key, stop_modifiers):
 
 def worker(output, desktop_name, windows):
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    windows.USER32.SetProcessDPIAware()
+    if not windows.USER32.SetProcessDpiAwarenessContext(windows.c.c_void_p(-4)):
+        windows.USER32.SetProcessDPIAware()
     if manifest["receiver_affinity"] is not None:
         current = windows.api.GetCurrentProcess()
         windows.process.SetProcessAffinityMask(current, manifest["receiver_affinity"])
     sink = windows.Receiver(desktop_name)
     (output / "ready").touch()
     windows.wait_for(lambda: windows.active_desktop() == desktop_name, 15, "The isolated desktop did not activate.")
+    if manifest["command"] in ("visual-targets", "route-actions"):
+        if manifest["command"] == "visual-targets":
+            from smoke_visual_targets import check
+        else:
+            from smoke_route_actions import check
+        windows.gui.ShowWindow(sink.hwnd, windows.con.SW_HIDE)
+        check(output, manifest, windows)
+        return
     for case in manifest["cases"]:
         print(f"{case['id']} {case['mode']} {case['condition']} {case['rate']} CPS", flush=True)
         run_trial(output, manifest, case, sink, windows)
         time.sleep(0.12)
+    if manifest["command"] == "smoke":
+        from smoke_targets import check
+        check(output, manifest, windows)
 
 
 def launch_worker(output, manifest, windows):
@@ -271,6 +285,8 @@ def launch_worker(output, manifest, windows):
             isolated.SwitchDesktop()
             switched = True
             timeout = len(manifest["cases"]) * (manifest["seconds"] + 30) + 10
+            if manifest["command"] in ("smoke", "visual-targets", "route-actions"):
+                timeout += 120  # The native targeting scenarios run after delivery trials.
             windows.wait_for(
                 lambda: windows.event.WaitForSingleObject(handle, 0) == 0, timeout,
                 f"The delivery test exceeded its {timeout:g} second watchdog.",
@@ -304,7 +320,7 @@ def run(args, windows):
     available, _ = windows.process.GetProcessAffinityMask(current)
     cores = [1 << bit for bit in range(available.bit_length()) if available & (1 << bit)]
     affinity = None
-    benchmark = args.command != "smoke"
+    benchmark = args.command in ("benchmark", "peers")
     peers = args.command == "peers"
     if benchmark and len(cores) > 1:
         app_cores = min(2, len(cores) - 1)
@@ -317,8 +333,12 @@ def run(args, windows):
 
         harness += ["peer_assets.py", "peer_windows.py", LOCK.name]
         archives = {key: cached(args.cache.resolve(), key) for key in args.peer}
-    elif not benchmark:
-        harness.append("smoke_uia.py")
+    elif args.command == "smoke":
+        harness += ["smoke_uia.py", "smoke_targets.py"]
+    elif args.command == "visual-targets":
+        harness.append("smoke_visual_targets.py")
+    elif args.command == "route-actions":
+        harness.append("smoke_route_actions.py")
     dependencies = ("pywin32",) if args.command == "benchmark" else ("pywin32", "pywinauto", "comtypes", "six")
     try:
         versions = {name: version(name) for name in dependencies}
@@ -366,9 +386,12 @@ def run(args, windows):
                 executable = peer["executable"]
                 if fingerprint(Path(executable["path"])) != executable:
                     raise RuntimeError(f"{peer['name']} changed its staged executable during the run.")
-            rows = replay(output)
             manifest["status"] = "passed"
-            print(f"{len(rows)} delivery trials recorded. Reports are in {output}.")
+            if args.command in ("visual-targets", "route-actions"):
+                print(f"Results are in {output / args.command / 'result.json'}.")
+            else:
+                rows = replay(output)
+                print(f"{len(rows)} delivery trials recorded. Reports are in {output}.")
         except BaseException as error:
             manifest.update(status="failed", error=str(error))
             raise
@@ -393,7 +416,7 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("smoke", "benchmark", "peers"):
+    for name in ("smoke", "benchmark", "peers", "visual-targets", "route-actions"):
         command = commands.add_parser(name)
         command.add_argument("--exe", type=Path, default=ROOT / "target" / "release" / "afterbeat.exe")
         command.add_argument("--output", type=Path, help="New directory for this run.")

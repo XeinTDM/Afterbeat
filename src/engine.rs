@@ -46,6 +46,12 @@ impl Progress {
             6 => Some(PauseReason::TargetFilter),
             7 => Some(PauseReason::CursorConfined),
             8 => Some(PauseReason::InputGrabbed),
+            9 => Some(PauseReason::TargetMissing),
+            10 => Some(PauseReason::TargetAmbiguous),
+            11 => Some(PauseReason::TargetUnavailable),
+            12 => Some(PauseReason::VerifyingTarget),
+            13 => Some(PauseReason::TargetEvidence),
+            14 => Some(PauseReason::WheelFocus),
             _ => None,
         }
     }
@@ -124,6 +130,12 @@ pub enum PauseReason {
     TargetFilter = 6,
     CursorConfined = 7,
     InputGrabbed = 8,
+    TargetMissing = 9,
+    TargetAmbiguous = 10,
+    TargetUnavailable = 11,
+    VerifyingTarget = 12,
+    TargetEvidence = 13,
+    WheelFocus = 14,
 }
 
 #[derive(Default)]
@@ -236,15 +248,46 @@ impl RunControl<'_> {
     }
 
     pub fn retry_dispatch(&mut self, gate: Gate) -> Result<Option<Outcome>, String> {
+        self.retry_after(gate, GUARD_POLL_INTERVAL)
+    }
+
+    fn retry_after(&mut self, gate: Gate, interval: Duration) -> Result<Option<Outcome>, String> {
         if let Gate::Paused(reason) = gate {
             self.progress.pause(reason);
-            self.sleep(Instant::now() + GUARD_POLL_INTERVAL, Duration::ZERO)?;
+            self.sleep(Instant::now() + interval, Duration::ZERO)?;
         } else {
             self.allow_press(gate);
         }
         Ok(self
             .interruption()
             .or_else(|| self.expired().then_some(Outcome::Completed)))
+    }
+
+    #[cfg(windows)]
+    pub fn wait_for_target(
+        &mut self,
+        reason: PauseReason,
+        interval: Duration,
+    ) -> Result<Option<Outcome>, String> {
+        self.retry_after(Gate::Paused(reason), interval)
+    }
+
+    #[cfg(windows)]
+    pub fn record_tap(&self) {
+        self.progress.actions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(windows)]
+    pub fn wait_route(&mut self, deadline: Instant) -> Result<Option<Outcome>, String> {
+        match self.wait(deadline, Duration::ZERO, false, None)? {
+            Wait::End(outcome) => Ok(Some(outcome)),
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn route_actions(&self) -> u64 {
+        self.progress.actions()
     }
 
     pub fn hold(
@@ -327,6 +370,31 @@ impl Random {
         self.0 = bits;
         (bits >> 11) as f64 / (1u64 << 53) as f64
     }
+}
+
+#[cfg(windows)]
+pub fn run_sequence(
+    schedule: Schedule,
+    stop: &StopSignal,
+    progress: &Progress,
+    mut run: impl FnMut(&mut RunControl<'_>) -> Result<Outcome, String>,
+) -> Result<Outcome, String> {
+    let mut control = RunControl {
+        stop,
+        gate: None,
+        guard_stop: None,
+        pacer: Pacer::new(),
+        progress,
+        duration: schedule.duration,
+        expires: None,
+    };
+    if let Some(outcome) = control.wait_route(Instant::now() + schedule.delay)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = control.begin_dispatch() {
+        return Ok(outcome);
+    }
+    run(&mut control)
 }
 
 pub fn run_controlled<'a>(

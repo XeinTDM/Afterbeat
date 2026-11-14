@@ -170,6 +170,45 @@ fn portal_lifecycle() {
     }
 
     let remote = remote().unwrap();
+    for (settings, expected) in [
+        (
+            Settings {
+                button: crate::mouse::Button::Mouse5,
+                triple: true,
+                ..Settings::default()
+            },
+            ["button:276:1", "button:276:0"].repeat(3),
+        ),
+        (
+            Settings {
+                scroll: true,
+                scroll_direction: crate::targets::Direction::Left,
+                scroll_ticks: "3".into(),
+                ..Settings::default()
+            },
+            vec!["wheel:1:-3"],
+        ),
+    ] {
+        let previous = trace().len();
+        let (_, mut injector, _) = automation::prepare(&settings, toggle_binding(), None).unwrap();
+        let stop = StopSignal::new().unwrap();
+        let progress = Progress::default();
+        let outcome = engine::run_controlled(
+            engine::Schedule {
+                limit: Some(1),
+                ..Default::default()
+            },
+            &stop,
+            &progress,
+            false,
+            Checks::default(),
+            None,
+            |_, control| injector.send(1, control, None),
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Completed);
+        assert_eq!(&trace()[previous..], expected);
+    }
     let keyboard = Settings {
         keyboard: true,
         press: "30".into(),

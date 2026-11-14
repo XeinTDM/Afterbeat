@@ -32,16 +32,16 @@ enum Backend {
 impl Injector {
     pub fn new(
         input: Input,
-        double: bool,
+        repeats: u8,
         points: Vec<Point>,
         radius: i32,
         press: Press,
     ) -> Result<Self, String> {
         if wayland::active() {
-            super::wayland::Injector::new(input, double, points, radius, press)
+            super::wayland::Injector::new(input, repeats, points, radius, press)
                 .map(|injector| Self(Backend::Wayland(injector)))
         } else {
-            X11Injector::new(input, double, points, radius, press)
+            X11Injector::new(input, repeats, points, radius, press)
                 .map(|injector| Self(Backend::X11(injector)))
         }
     }
@@ -131,6 +131,18 @@ pub fn at_edge(point: Point, corners_only: bool) -> bool {
                     horizontal || vertical
                 }
             })
+}
+
+impl Button {
+    pub(crate) fn x11(self) -> u8 {
+        match self {
+            Self::Left => 1,
+            Self::Middle => 2,
+            Self::Right => 3,
+            Self::Mouse4 => 8,
+            Self::Mouse5 => 9,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,7 +357,7 @@ enum Attempt<'a> {
 impl X11Injector {
     pub fn new(
         input: Input,
-        double: bool,
+        repeats: u8,
         points: Vec<Point>,
         radius: i32,
         press: Press,
@@ -353,7 +365,10 @@ impl X11Injector {
         Ok(Self {
             input,
             press,
-            repeats: if double { 2 } else { 1 },
+            repeats: match input {
+                Input::Wheel(_, ticks) => u32::from(ticks),
+                _ => u32::from(repeats),
+            },
             route: Route::new(points, radius)?,
             text_mapping: None,
             stroke: None,
@@ -367,7 +382,7 @@ impl X11Injector {
     }
 
     pub fn batchable(&self) -> bool {
-        matches!(self.press, Press::Tap)
+        matches!(self.press, Press::Tap) && !matches!(self.input, Input::Wheel(..))
     }
 
     pub fn has_targets(&self) -> bool {
@@ -391,10 +406,15 @@ impl X11Injector {
     fn stroke(&mut self, desktop: &Desktop) -> XResult<Stroke> {
         let symbol = match self.input {
             Input::Mouse(button) => {
-                return Ok(Stroke::Button(match button {
-                    Button::Left => 1,
-                    Button::Middle => 2,
-                    Button::Right => 3,
+                return Ok(Stroke::Button(button.x11()));
+            }
+            Input::Wheel(direction, _) => {
+                use crate::targets::Direction::*;
+                return Ok(Stroke::Button(match direction {
+                    Up => 4,
+                    Down => 5,
+                    Left => 6,
+                    Right => 7,
                 }));
             }
             Input::Key(key) => key.0,
@@ -467,6 +487,7 @@ impl X11Injector {
                 Press::Held => Some(Duration::from_secs(365 * 86_400)),
             };
             let presses = if duration.is_some() { self.repeats } else { 1 };
+            let count_pad = !matches!(self.input, Input::Wheel(..));
             for index in 0..presses {
                 if index != 0 && !control.can_press()? {
                     break;
@@ -484,6 +505,7 @@ impl X11Injector {
                         || self.stroke(desktop),
                         target,
                         taps,
+                        count_pad,
                         control,
                         &mut check,
                     )? {
@@ -532,6 +554,7 @@ fn attempt<'a>(
     resolve_stroke: impl FnOnce() -> XResult<Stroke>,
     target: Option<Point>,
     taps: Option<u32>,
+    count_pad: bool,
     control: &mut RunControl<'_>,
     check: &mut impl FnMut() -> Gate,
 ) -> XResult<Attempt<'a>> {
@@ -595,7 +618,9 @@ fn attempt<'a>(
             emit(desktop, stroke.events(true))?;
             return Ok(Attempt::Sent(Some(release)));
         }
-    } else if let Hit::Client(x, y) = hit {
+    } else if let Hit::Client(x, y) = hit
+        && count_pad
+    {
         drop(grab);
         input_filter::count_pad(x, y, taps.unwrap_or(1));
     }

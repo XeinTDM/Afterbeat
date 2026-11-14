@@ -20,7 +20,12 @@ mod macos;
 mod mouse;
 mod settings;
 #[cfg(windows)]
+mod smart_targets;
+#[cfg(windows)]
 mod system_appearance;
+#[cfg(windows)]
+mod target_pixels;
+mod targets;
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(target_os = "linux")]
@@ -48,6 +53,7 @@ use std::{
     os::windows::io::{FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
 };
+use targets::Step;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
@@ -59,6 +65,8 @@ slint::include_modules!();
 
 const CAPTURE_DELAY: Duration = Duration::from_secs(3);
 const DRY_SAMPLE: i32 = 4;
+#[cfg(windows)]
+const CONTROL_CAPTURE: i32 = 5;
 const UI_INTERVAL: Duration = Duration::from_millis(80);
 type StopSlot = Arc<Mutex<StopState>>;
 type RunResult = (Instant, Result<Outcome, String>);
@@ -148,9 +156,37 @@ struct Controller {
     save_timer: Timer,
     hotkeys: Hotkeys,
     #[cfg(windows)]
+    target_service: OnceCell<smart_targets::Service>,
+    #[cfg(windows)]
+    target_job: RefCell<Option<TargetJob>>,
+    #[cfg(windows)]
+    target_proposals: RefCell<Vec<Option<smart_targets::Target>>>,
+    #[cfg(windows)]
     shell: RefCell<Option<DesktopShell>>,
     #[cfg(not(target_os = "macos"))]
     input_filter: RefCell<Option<input_filter::InputFilter>>,
+}
+
+#[cfg(windows)]
+use std::cell::OnceCell;
+
+#[cfg(windows)]
+enum TargetJob {
+    Capture {
+        requested_at: u64,
+        deadline: Instant,
+        reply: smart_targets::Request<targets::ControlStep>,
+    },
+    Preview {
+        deadline: Instant,
+        reply: smart_targets::Request<Vec<smart_targets::Resolution>>,
+    },
+    Repair {
+        index: usize,
+        original: Box<targets::ControlStep>,
+        deadline: Instant,
+        reply: smart_targets::Request<targets::ControlStep>,
+    },
 }
 
 fn main() {
@@ -290,6 +326,12 @@ fn run_app(app: App) -> Result<(), Box<dyn Error>> {
         save_timer: Timer::default(),
         hotkeys,
         #[cfg(windows)]
+        target_service: OnceCell::new(),
+        #[cfg(windows)]
+        target_job: RefCell::new(None),
+        #[cfg(windows)]
+        target_proposals: RefCell::new(Vec::new()),
+        #[cfg(windows)]
         shell: RefCell::new(None),
         #[cfg(not(target_os = "macos"))]
         input_filter: RefCell::new(None),
@@ -410,6 +452,7 @@ fn signal_stop(slot: &StopSlot) -> bool {
 
 impl Controller {
     fn wire(self: &Rc<Self>, ui: &App, load_notice: &str) {
+        ui.set_smart_targets_available(cfg!(windows));
         {
             let state = self.state.borrow();
             self.display_settings(ui, &state.settings);
@@ -440,6 +483,14 @@ impl Controller {
         bind!(on_reset_pad, reset_pad);
         bind!(on_apply_shortcut, apply_shortcut);
         bind!(on_edit_route, edit_route, operation);
+        #[cfg(windows)]
+        bind!(on_toggle_target_verification, toggle_target_verification);
+        #[cfg(windows)]
+        bind!(on_edit_step, edit_step, index);
+        #[cfg(windows)]
+        bind!(on_save_step, save_step);
+        #[cfg(windows)]
+        bind!(on_repair_target, repair_target);
         bind!(on_clear_zone, clear_zone, kind);
         bind!(on_open_dry_run, open_dry_run);
         bind!(on_sample_dry_run, sample_dry_run);
@@ -516,12 +567,39 @@ impl Controller {
         if ui.get_active() || ui.get_capturing() {
             return;
         }
+        #[cfg(windows)]
+        if ui.get_dry_checking() {
+            return;
+        }
+        #[cfg(windows)]
+        self.target_proposals.borrow_mut().clear();
         let settings = self.state.borrow().settings.clone();
         if let Err(error) = dry_run::show(ui, &settings, None) {
             failure(ui, error);
         } else {
             ui.set_dry_message("".into());
             ui.set_dry_error(false);
+            #[cfg(windows)]
+            if settings.has_smart_route() {
+                match self
+                    .target_service()
+                    .and_then(|service| service.preview(settings.route))
+                {
+                    Ok(reply) => {
+                        *self.target_job.borrow_mut() = Some(TargetJob::Preview {
+                            deadline: Instant::now() + Duration::from_secs(15),
+                            reply,
+                        });
+                        ui.set_dry_checking(true);
+                        ui.set_dry_message("Checking the route’s controls on the desktop…".into());
+                        self.start_tick();
+                    }
+                    Err(error) => {
+                        ui.set_dry_message(error.into());
+                        ui.set_dry_error(true);
+                    }
+                }
+            }
         }
     }
 
@@ -640,7 +718,13 @@ impl Controller {
         ui.set_min_rate(settings.min_rate.as_str().into());
         ui.set_max_rate(settings.max_rate.as_str().into());
         ui.set_route_radius(settings.route_radius.as_str().into());
+        ui.set_target_timeout(settings.target_timeout.as_str().into());
+        ui.set_capture_visual(settings.capture_visual);
         ui.set_double_click(settings.double);
+        ui.set_triple_click(settings.triple);
+        ui.set_scroll_output(settings.scroll && !settings.keyboard);
+        ui.set_scroll_direction(settings.scroll_direction.index());
+        ui.set_scroll_ticks(settings.scroll_ticks.as_str().into());
         ui.set_limited(settings.limited);
         ui.set_fixed_target(settings.fixed);
         ui.set_keyboard(settings.keyboard);
@@ -657,11 +741,7 @@ impl Controller {
         ui.set_process_mode(settings.process_mode.into());
         ui.set_process_names(settings.process_names.as_str().into());
         ui.set_trigger_text(settings.trigger.as_str().into());
-        ui.set_button_mode(match settings.button {
-            Button::Left => 0,
-            Button::Right => 1,
-            Button::Middle => 2,
-        });
+        ui.set_button_mode(settings.button.index());
         self.update_configuration(ui, settings);
         Self::display_points(ui, settings, None);
     }
@@ -682,7 +762,13 @@ impl Controller {
         settings.min_rate = ui.get_min_rate().to_string();
         settings.max_rate = ui.get_max_rate().to_string();
         settings.route_radius = ui.get_route_radius().to_string();
+        settings.target_timeout = ui.get_target_timeout().to_string();
+        settings.capture_visual = ui.get_capture_visual();
         settings.double = ui.get_double_click();
+        settings.triple = ui.get_triple_click();
+        settings.scroll = ui.get_scroll_output() && !ui.get_keyboard();
+        settings.scroll_direction = targets::Direction::from_index(ui.get_scroll_direction());
+        settings.scroll_ticks = ui.get_scroll_ticks().to_string();
         settings.limited = ui.get_limited();
         settings.fixed = ui.get_fixed_target();
         settings.keyboard = ui.get_keyboard();
@@ -698,11 +784,7 @@ impl Controller {
         settings.edge_mode = ui.get_edge_mode() as u8;
         settings.process_mode = ui.get_process_mode() as u8;
         settings.process_names = ui.get_process_names().to_string();
-        settings.button = match ui.get_button_mode() {
-            1 => Button::Right,
-            2 => Button::Middle,
-            _ => Button::Left,
-        };
+        settings.button = Button::from_index(ui.get_button_mode());
         self.update_configuration(ui, settings);
         status(ui, "");
         drop(state);
@@ -710,6 +792,7 @@ impl Controller {
     }
 
     fn update_configuration(&self, ui: &App, settings: &Settings) {
+        ui.set_route_actions(settings.has_action_route());
         #[cfg(target_os = "linux")]
         if wayland::active() {
             wayland::set_hold_mode(settings.hold_activation);
@@ -753,7 +836,9 @@ impl Controller {
                 .map_or_else(|| "No point captured".into(), point_label)
                 .into(),
         );
-        let pace = if settings.hold_down {
+        let pace = if settings.has_action_route() {
+            "Step timing".into()
+        } else if settings.hold_down {
             "Held down".into()
         } else {
             match settings.rates() {
@@ -774,8 +859,19 @@ impl Controller {
             .route
             .iter()
             .enumerate()
-            .map(|(i, point)| format!("{}. {}", i + 1, point_label(*point)).into())
+            .map(|(i, step)| format!("{}. {}", i + 1, step.label()).into())
             .collect();
+        ui.set_route_smart(settings.route.iter().any(Step::is_smart));
+        ui.set_route_control_rows(slint::ModelRc::new(slint::VecModel::from(
+            settings
+                .route
+                .iter()
+                .map(|step| {
+                    step.control()
+                        .map_or(0, |step| if step.wait_for_disappearance { 2 } else { 1 })
+                })
+                .collect::<Vec<i32>>(),
+        )));
         ui.set_route_count(model.len() as i32);
         let index = ui.get_route_index().clamp(-1, model.len() as i32 - 1);
         ui.set_route_rows(slint::ModelRc::new(slint::VecModel::from(model)));
@@ -831,6 +927,193 @@ impl Controller {
             ui.set_route_enabled(false);
         }
         ui.set_route_index(selected);
+        Self::display_points(ui, &state.settings, state.zone_origin);
+        self.update_configuration(ui, &state.settings);
+        drop(state);
+        self.queue_save();
+    }
+
+    #[cfg(windows)]
+    fn toggle_target_verification(&self, ui: &App) {
+        if ui.get_active() || ui.get_capturing() {
+            return;
+        }
+        let Ok(index) = usize::try_from(ui.get_route_index()) else {
+            return;
+        };
+        let mut state = self.state.borrow_mut();
+        let Some(step) = state
+            .settings
+            .route
+            .get_mut(index)
+            .and_then(Step::control_mut)
+        else {
+            return;
+        };
+        step.wait_for_disappearance = !step.wait_for_disappearance;
+        Self::display_points(ui, &state.settings, state.zone_origin);
+        drop(state);
+        self.queue_save();
+    }
+
+    #[cfg(windows)]
+    fn edit_step(&self, ui: &App, index: i32) {
+        use targets::{Action, Direction};
+        if ui.get_active() || ui.get_capturing() {
+            return;
+        }
+        let state = self.state.borrow();
+        let step = usize::try_from(index)
+            .ok()
+            .and_then(|index| state.settings.route.get(index));
+        if index >= 0 && step.is_none() {
+            return;
+        }
+        let mut delay = 0;
+        let mut count = 1;
+        let mut button = 0;
+        let mut direction = 0;
+        let mut key = "Enter";
+        let kind = match step {
+            Some(Step::Action(step)) => {
+                delay = step.delay_ms;
+                match &step.action {
+                    Action::Click {
+                        button: selected,
+                        count: selected_count,
+                    } => {
+                        count = *selected_count;
+                        button = selected.index();
+                        0
+                    }
+                    Action::Wait => 1,
+                    Action::Scroll {
+                        direction: selected,
+                        ticks,
+                    } => {
+                        direction = match selected {
+                            Direction::Up => 0,
+                            Direction::Down => 1,
+                            Direction::Left => 2,
+                            Direction::Right => 3,
+                        };
+                        count = *ticks;
+                        2
+                    }
+                    Action::Key { key: selected } => {
+                        key = selected;
+                        3
+                    }
+                }
+            }
+            Some(_) => {
+                button = state.settings.button.index();
+                count = state.settings.click_count();
+                if state.settings.scroll && !state.settings.keyboard {
+                    direction = state.settings.scroll_direction.index();
+                    count = state.settings.scroll_ticks().unwrap_or(1);
+                    2
+                } else {
+                    0
+                }
+            }
+            None => {
+                delay = 250;
+                1
+            }
+        };
+        ui.set_step_edit_index(index);
+        ui.set_step_has_target(step.is_some_and(|step| step.point().is_some() || step.is_smart()));
+        ui.set_step_control_target(step.is_some_and(Step::is_smart));
+        ui.set_step_kind(kind);
+        ui.set_step_delay(delay.to_string().into());
+        ui.set_step_count(count.to_string().into());
+        ui.set_step_button(button);
+        ui.set_step_direction(direction);
+        ui.set_step_key(key.into());
+        ui.set_step_error("".into());
+        ui.set_step_editing(true);
+        ui.invoke_reveal_step_editor();
+    }
+
+    #[cfg(windows)]
+    fn save_step(&self, ui: &App) {
+        use targets::{Action, ActionStep, Direction};
+        if !ui.get_step_editing() || ui.get_active() || ui.get_capturing() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let settings = &mut state.settings;
+        let index = usize::try_from(ui.get_step_edit_index()).ok();
+        let result = (|| {
+            let target = index
+                .and_then(|index| settings.route.get(index))
+                .and_then(Step::destination);
+            let delay_ms = ui
+                .get_step_delay()
+                .trim()
+                .parse()
+                .map_err(|_| "Enter a whole delay in milliseconds.")?;
+            let count = || {
+                ui.get_step_count()
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| "Enter a whole click or wheel tick count.")
+            };
+            let action = match ui.get_step_kind() {
+                0 => Action::Click {
+                    button: Button::from_index(ui.get_step_button()),
+                    count: count()?,
+                },
+                1 => Action::Wait,
+                2 => Action::Scroll {
+                    direction: Direction::from_index(ui.get_step_direction()),
+                    ticks: count()?,
+                },
+                _ => Action::Key {
+                    key: ui.get_step_key().trim().to_owned(),
+                },
+            };
+            if action == Action::Wait && target.is_some() {
+                return Err("Use Add step to insert a wait alongside this target.");
+            }
+            let step = ActionStep {
+                target,
+                action,
+                delay_ms,
+            };
+            automation::validate_action(&step, self.hotkeys.toggle_binding())?;
+            Ok::<_, &'static str>(Step::Action(Box::new(step)))
+        })();
+        let step = match result {
+            Ok(step) => step,
+            Err(error) => {
+                ui.set_step_error(error.into());
+                return;
+            }
+        };
+        let selected = if let Some(index) = index {
+            let Some(existing) = settings.route.get_mut(index) else {
+                return;
+            };
+            *existing = step;
+            index
+        } else {
+            if settings.route.len() >= settings::MAX_POINTS {
+                ui.set_step_error("The route has 64 steps. Remove a step to add another.".into());
+                return;
+            }
+            let selected = usize::try_from(ui.get_route_index())
+                .ok()
+                .filter(|index| *index < settings.route.len())
+                .map_or(settings.route.len(), |index| index + 1);
+            settings.route.insert(selected, step);
+            selected
+        };
+        settings.route_enabled = true;
+        ui.set_route_enabled(true);
+        ui.set_route_index(selected as i32);
+        ui.set_step_editing(false);
         Self::display_points(ui, &state.settings, state.zone_origin);
         self.update_configuration(ui, &state.settings);
         drop(state);
@@ -1035,7 +1318,7 @@ impl Controller {
     }
 
     fn capture(&self, ui: &App, kind: i32) {
-        if ui.get_active() {
+        if ui.get_active() || ui.get_step_editing() {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -1080,6 +1363,8 @@ impl Controller {
     }
 
     fn cancel_capture(&self, ui: &App) {
+        #[cfg(windows)]
+        self.target_job.borrow_mut().take();
         self.stop_slot.lock().unwrap().finish_capture();
         self.end_capture(ui);
         clear_capture_status(ui);
@@ -1091,6 +1376,13 @@ impl Controller {
     }
 
     fn capture_shortcut(&self, ui: &App, point: Point, requested_at: u64) {
+        if ui.get_step_editing() {
+            return;
+        }
+        #[cfg(windows)]
+        if matches!(*self.target_job.borrow(), Some(TargetJob::Capture { .. })) {
+            return;
+        }
         if self
             .stop_slot
             .lock()
@@ -1099,8 +1391,241 @@ impl Controller {
         {
             self.refresh(ui);
         } else {
-            self.set_point(ui, Some(point), ui.get_capture_shortcut_kind());
+            self.complete_capture(
+                ui,
+                Some(point),
+                ui.get_capture_shortcut_kind(),
+                requested_at,
+            );
         }
+    }
+
+    fn complete_capture(&self, ui: &App, point: Option<Point>, kind: i32, _requested_at: u64) {
+        #[cfg(windows)]
+        if kind == CONTROL_CAPTURE {
+            ui.set_dry_checking(false);
+            match point
+                .ok_or_else(|| "Could not read the cursor position.".to_owned())
+                .and_then(|point| {
+                    self.target_service()?
+                        .capture(point, ui.get_capture_visual())
+                }) {
+                Ok(reply) => {
+                    *self.target_job.borrow_mut() = Some(TargetJob::Capture {
+                        requested_at: _requested_at,
+                        deadline: Instant::now() + Duration::from_secs(5),
+                        reply,
+                    });
+                    ui.set_capturing(true);
+                    status(ui, "Reading the control under the pointer…");
+                    self.start_tick();
+                }
+                Err(error) => {
+                    self.end_capture(ui);
+                    failure(ui, &error);
+                }
+            }
+            return;
+        }
+        self.set_point(ui, point, kind);
+    }
+
+    #[cfg(windows)]
+    fn target_service(&self) -> Result<smart_targets::Service, String> {
+        if self.target_service.get().is_none() {
+            let service = smart_targets::Service::new()
+                .map_err(|err| format!("Could not start Windows UI Automation ({err})."))?;
+            let _ = self.target_service.set(service);
+        }
+        Ok(self.target_service.get().unwrap().clone())
+    }
+
+    #[cfg(windows)]
+    fn refresh_target_job(&self, ui: &App, now: Instant) {
+        let mut pending = self.target_job.borrow_mut();
+        match pending.as_ref() {
+            Some(TargetJob::Capture {
+                requested_at,
+                deadline,
+                reply,
+            }) => {
+                if self.stop_slot.lock().unwrap().cancelled(*requested_at) {
+                    pending.take();
+                    self.end_capture(ui);
+                    clear_capture_status(ui);
+                    return;
+                }
+                let Some(result) = target_reply(reply, now >= *deadline) else {
+                    return;
+                };
+                pending.take();
+                self.end_capture(ui);
+                match result {
+                    Ok(step) => self.add_control(ui, step),
+                    Err(error) => failure(ui, &error),
+                }
+            }
+            Some(TargetJob::Preview { deadline, reply }) => {
+                if ui.get_page() != 4 || ui.get_active() {
+                    pending.take();
+                    ui.set_dry_checking(false);
+                    if !ui.get_active() && !ui.get_capturing() {
+                        self.tick.stop();
+                    }
+                    return;
+                }
+                let Some(result) = target_reply(reply, now >= *deadline) else {
+                    return;
+                };
+                pending.take();
+                ui.set_dry_checking(false);
+                self.tick.stop();
+                let result = result.and_then(|results| {
+                    *self.target_proposals.borrow_mut() = results
+                        .iter()
+                        .map(|result| match result {
+                            smart_targets::Resolution::Recovered(target)
+                            | smart_targets::Resolution::Conflict(target) => Some(target.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    dry_run::show_smart(ui, &self.state.borrow().settings, &results)
+                        .map_err(str::to_owned)
+                });
+                ui.set_dry_error(result.is_err());
+                ui.set_dry_message(result.err().unwrap_or_default().into());
+            }
+            Some(TargetJob::Repair {
+                index,
+                original,
+                deadline,
+                reply,
+            }) => {
+                if ui.get_page() != 4 || ui.get_active() {
+                    pending.take();
+                    ui.set_dry_checking(false);
+                    if !ui.get_active() && !ui.get_capturing() {
+                        self.tick.stop();
+                    }
+                    return;
+                }
+                let Some(result) = target_reply(reply, now >= *deadline) else {
+                    return;
+                };
+                let (index, original) = (*index, original.clone());
+                pending.take();
+                drop(pending);
+                ui.set_dry_checking(false);
+                self.tick.stop();
+                let repaired = result.and_then(|repaired| {
+                    let mut state = self.state.borrow_mut();
+                    let Some(step) = state
+                        .settings
+                        .route
+                        .get_mut(index)
+                        .and_then(Step::control_mut)
+                    else {
+                        return Err("The route changed. Check the step again.".into());
+                    };
+                    if *step != *original {
+                        return Err("The route changed. Check the step again.".into());
+                    }
+                    *step = repaired;
+                    Self::display_points(ui, &state.settings, state.zone_origin);
+                    Ok(())
+                });
+                match repaired {
+                    Ok(()) => {
+                        self.queue_save();
+                        self.open_dry_run(ui);
+                        ui.set_dry_step(index as i32);
+                        ui.set_dry_message(
+                            format!("Repaired step {}. Checking the updated target…", index + 1)
+                                .into(),
+                        );
+                    }
+                    Err(error) => {
+                        ui.set_dry_error(true);
+                        ui.set_dry_message(error.into());
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    #[cfg(windows)]
+    fn repair_target(&self, ui: &App) {
+        if ui.get_page() != 4 || ui.get_active() || ui.get_capturing() || ui.get_dry_checking() {
+            return;
+        }
+        let Ok(index) = usize::try_from(ui.get_dry_step()) else {
+            return;
+        };
+        let Some(shown) = self.target_proposals.borrow().get(index).cloned().flatten() else {
+            return;
+        };
+        let Some(step) = self
+            .state
+            .borrow()
+            .settings
+            .route
+            .get(index)
+            .and_then(Step::control)
+            .cloned()
+            .map(Box::new)
+        else {
+            return;
+        };
+        match self
+            .target_service()
+            .and_then(|service| service.repair((*step).clone(), shown))
+        {
+            Ok(reply) => {
+                *self.target_job.borrow_mut() = Some(TargetJob::Repair {
+                    index,
+                    original: step,
+                    deadline: Instant::now() + Duration::from_secs(8),
+                    reply,
+                });
+                ui.set_dry_checking(true);
+                ui.set_dry_error(false);
+                ui.set_dry_message("Confirming that the proposed target is still present…".into());
+                self.start_tick();
+            }
+            Err(error) => {
+                ui.set_dry_error(true);
+                ui.set_dry_message(error.into());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn add_control(&self, ui: &App, step: targets::ControlStep) {
+        let mut state = self.state.borrow_mut();
+        if state.settings.route_wayland && !state.settings.route.is_empty() {
+            failure(
+                ui,
+                "Remove the route points from the other desktop coordinate system first.",
+            );
+            return;
+        }
+        if state.settings.route.len() >= settings::MAX_POINTS {
+            failure(ui, "The route has 64 steps. Remove a step to add another.");
+            return;
+        }
+        ui.set_route_index(state.settings.route.len() as i32);
+        let step = Step::Control(Box::new(step));
+        let message = format!("Captured {}.", step.label());
+        state.settings.route.push(step);
+        state.settings.route_wayland = false;
+        state.settings.route_enabled = true;
+        ui.set_route_enabled(true);
+        self.update_configuration(ui, &state.settings);
+        Self::display_points(ui, &state.settings, state.zone_origin);
+        status(ui, &message);
+        drop(state);
+        self.queue_save();
     }
 
     fn set_point(&self, ui: &App, point: Option<Point>, kind: i32) {
@@ -1141,7 +1666,7 @@ impl Controller {
                     return;
                 }
                 ui.set_route_index(state.settings.route.len() as i32);
-                state.settings.route.push(point);
+                state.settings.route.push(Step::Point(point));
                 state.settings.route_wayland = native_wayland;
                 state.settings.route_enabled = true;
                 ui.set_route_enabled(true);
@@ -1193,7 +1718,11 @@ impl Controller {
             self.refresh(ui);
             return;
         }
-        if ui.get_page() == 4 || !ui.get_can_start() || !ui.get_input_ready() || ui.get_capturing()
+        if ui.get_page() == 4
+            || !ui.get_can_start()
+            || !ui.get_input_ready()
+            || ui.get_capturing()
+            || ui.get_step_editing()
         {
             return;
         }
@@ -1214,20 +1743,40 @@ impl Controller {
         let settings = self.state.borrow().settings.clone();
         let (schedule, injector, guard) =
             automation::prepare(&settings, self.hotkeys.toggle_binding(), binding)?;
+        #[cfg(windows)]
+        let smart = if settings.has_smart_route() || settings.has_action_route() {
+            Some(smart_targets::Route::new(
+                settings
+                    .has_smart_route()
+                    .then(|| self.target_service())
+                    .transpose()?,
+                settings.route.clone(),
+                settings.target_timeout()?,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let smart_run = false;
+        #[cfg(windows)]
+        let smart_run = smart.is_some();
         let stop = Arc::new(
             StopSignal::new().map_err(|err| format!("Could not create a stop signal ({err})."))?,
         );
         let progress = Arc::new(Progress::default());
+        let sequence =
+            settings.has_action_route() || (settings.has_smart_route() && settings.scroll);
         let worker_stop = stop.clone();
         let worker_progress = progress.clone();
         let countdown = Instant::now() + schedule.delay;
+        let burst = !sequence && schedule.interval.is_zero() && schedule.rates.is_none();
         let guarded = guard.enabled();
         let needs_destination_check = guarded || injector.has_targets();
         let changing_targets = injector.has_changing_targets();
-        let batchable = injector.batchable();
+        let batchable = injector.batchable() && !smart_run;
         let load_pacing = schedule.uses_load_pacing(batchable, guarded || changing_targets);
         let priority_pacing = schedule.uses_priority_pacing(load_pacing);
-        let stop_probe = priority_pacing.then(|| self.hotkeys.stop_probe(binding));
+        let stop_probe = (priority_pacing || smart_run).then(|| self.hotkeys.stop_probe(binding));
         {
             let mut slot = self.stop_slot.lock().unwrap();
             if slot.cancelled(requested_at) {
@@ -1260,39 +1809,73 @@ impl Controller {
                 };
                 let checks = Checks {
                     poll: guarded.then_some(&mut poll),
-                    destination: needs_destination_check.then_some(&mut destination),
+                    destination: (needs_destination_check && !smart_run)
+                        .then_some(&mut destination),
                     batch_destination: !changing_targets,
                 };
+                #[cfg(windows)]
+                let mut smart = smart;
+                #[cfg(windows)]
+                let mut dispatch_probe = stop_probe.clone();
                 let mut stop_probe = stop_probe.map(|mut probe| move || probe.pending());
-                let result = engine::run_controlled(
-                    schedule,
-                    &worker_stop,
-                    &worker_progress,
-                    batchable,
-                    checks,
-                    stop_probe
-                        .as_mut()
-                        .map(|probe| probe as &mut dyn FnMut() -> bool),
-                    |count, control| {
-                        #[cfg(target_os = "macos")]
-                        let result =
-                            injector
-                                .borrow_mut()
-                                .send(count, control, &mut |target, cursor| {
-                                    guard.borrow_mut().dispatch_target(target, cursor)
-                                });
-                        #[cfg(not(target_os = "macos"))]
-                        let result = {
-                            let mut check = |target| guard.borrow_mut().check_destination(target);
-                            injector.borrow_mut().send(
+                let run = || {
+                    engine::run_controlled(
+                        schedule,
+                        &worker_stop,
+                        &worker_progress,
+                        batchable,
+                        checks,
+                        stop_probe
+                            .as_mut()
+                            .map(|probe| probe as &mut dyn FnMut() -> bool),
+                        |count, control| {
+                            #[cfg(windows)]
+                            if let Some(route) = &mut smart {
+                                return route.dispatch(
+                                    &injector.borrow(),
+                                    &mut guard.borrow_mut(),
+                                    control,
+                                    || dispatch_probe.as_mut().is_some_and(|probe| probe.pending()),
+                                );
+                            }
+                            #[cfg(target_os = "macos")]
+                            let result = injector.borrow_mut().send(
                                 count,
                                 control,
-                                needs_destination_check.then_some(&mut check),
-                            )
-                        };
-                        result
-                    },
-                );
+                                &mut |target, cursor| {
+                                    guard.borrow_mut().dispatch_target(target, cursor)
+                                },
+                            );
+                            #[cfg(not(target_os = "macos"))]
+                            let result = {
+                                let mut check =
+                                    |target| guard.borrow_mut().check_destination(target);
+                                injector.borrow_mut().send(
+                                    count,
+                                    control,
+                                    needs_destination_check.then_some(&mut check),
+                                )
+                            };
+                            result
+                        },
+                    )
+                };
+                #[cfg(windows)]
+                let result = if sequence {
+                    engine::run_sequence(schedule, &worker_stop, &worker_progress, |control| {
+                        smart.as_mut().unwrap().sequence(
+                            &settings,
+                            schedule,
+                            &mut guard.borrow_mut(),
+                            control,
+                            || dispatch_probe.as_mut().is_some_and(|probe| probe.pending()),
+                        )
+                    })
+                } else {
+                    run()
+                };
+                #[cfg(not(windows))]
+                let result = run();
                 let ended = Instant::now();
                 // X11 text output may still need to restore the keyboard mapping.
                 drop(injector);
@@ -1320,7 +1903,7 @@ impl Controller {
             worker,
             completion,
             countdown,
-            burst: schedule.interval.is_zero() && schedule.rates.is_none(),
+            burst,
         });
         ui.set_active(true);
         #[cfg(windows)]
@@ -1345,6 +1928,8 @@ impl Controller {
 
     fn refresh(&self, ui: &App) {
         let now = Instant::now();
+        #[cfg(windows)]
+        self.refresh_target_job(ui, now);
         #[cfg(target_os = "linux")]
         if ui.get_active() && wayland::active() && !wayland::layout_unchanged(ui) {
             self.wayland_action(ui, 2);
@@ -1434,7 +2019,7 @@ impl Controller {
                 clear_capture_status(ui);
             } else {
                 let point = capture.point.or_else(|| mouse::cursor().ok());
-                self.set_point(ui, point, capture.kind);
+                self.complete_capture(ui, point, capture.kind, capture.requested_at);
             }
         } else {
             drop(slot);
@@ -1520,11 +2105,34 @@ fn pause_hint(reason: PauseReason) -> &'static str {
             let message = "Release the output key or mouse button to resume.";
             message
         }
+        PauseReason::TargetMissing => "Waiting for the saved control to appear.",
+        PauseReason::TargetAmbiguous => {
+            "Multiple controls or windows match. Leave one match visible."
+        }
+        PauseReason::TargetUnavailable => "Waiting for the control to be enabled and unobstructed.",
+        PauseReason::VerifyingTarget => "Click sent. Waiting for the control to disappear.",
+        PauseReason::TargetEvidence => {
+            "Waiting for matching visual evidence. Check the target in Dry run."
+        }
+        PauseReason::WheelFocus => "Focus the window at the wheel target to resume.",
+    }
+}
+
+#[cfg(windows)]
+fn target_reply<T>(reply: &smart_targets::Request<T>, expired: bool) -> Option<Result<T, String>> {
+    match reply.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Empty) if !expired => None,
+        Err(_) => Some(Err("Windows UI Automation did not respond in time.".into())),
     }
 }
 
 fn countdown_target(settings: &Settings) -> String {
-    if settings.route_enabled {
+    if settings.has_action_route() {
+        "Running the saved action route.".into()
+    } else if settings.has_smart_route() {
+        "Waiting to start the saved control route.".into()
+    } else if settings.route_enabled {
         if settings.keyboard {
             "Using the saved route. Focus the app that should receive the keys."
         } else {

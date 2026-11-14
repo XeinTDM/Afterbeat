@@ -195,6 +195,10 @@ impl Binding {
     pub fn uses_code(self, code: u8) -> bool {
         !self.mouse() && self.code == code
     }
+
+    pub fn matches_button(self, button: crate::mouse::Button) -> bool {
+        self.locks != PORTAL_BINDING && self.mouse() && self.symbol == u32::from(button.x11())
+    }
 }
 
 #[derive(Clone)]

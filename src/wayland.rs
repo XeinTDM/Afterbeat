@@ -3,7 +3,10 @@ mod portal;
 mod tests;
 mod ui;
 
-pub use ui::{attach, click_own_window, focused, layout_unchanged, protect, select_backend};
+pub use ui::{
+    attach, click_own_window, focused, layout_unchanged, pointer_over_own_window, protect,
+    select_backend,
+};
 
 use crate::{
     diagnostics,
@@ -699,6 +702,25 @@ impl Remote {
         Ok(block_on(self.proxy.call(
             method,
             &(&self.session.path, Options::new(), code, u32::from(down)),
+        ))?)
+    }
+
+    pub fn scroll(&self, direction: crate::targets::Direction, ticks: u8) -> Result<()> {
+        use crate::targets::Direction::*;
+        let (axis, sign) = match direction {
+            Up => (0u32, -1),
+            Down => (0, 1),
+            Left => (1, -1),
+            Right => (1, 1),
+        };
+        Ok(block_on(self.proxy.call(
+            "NotifyPointerAxisDiscrete",
+            &(
+                &self.session.path,
+                Options::new(),
+                axis,
+                i32::from(ticks) * sign,
+            ),
         ))?)
     }
 

@@ -55,6 +55,15 @@ fn main() {
         window.dispatch_event(WindowEvent::PointerReleased { position, button });
     };
     match mode.as_str() {
+        "wheel" | "compact-wheel" => {
+            app.set_scroll_output(true);
+            app.set_scroll_direction(2);
+            app.set_scroll_ticks("3".into());
+        }
+        "triple" | "compact-triple" => {
+            app.set_button_mode(4);
+            app.set_triple_click(true);
+        }
         "running" | "compact-running" => {
             app.set_active(true);
             app.set_run_state("Running".into());
@@ -71,7 +80,7 @@ fn main() {
             app.set_time_limit("45".into());
             app.set_pace_value("8–12 /s".into());
         }
-        "points" | "compact" => {
+        "points" | "compact" | "smart-targets" | "compact-smart-targets" => {
             app.set_page(2);
             app.set_route_enabled(true);
             app.set_route_once(true);
@@ -82,11 +91,24 @@ fn main() {
                 "3. X -470  Y 370",
             ]));
             app.set_route_index(1);
+            if mode.ends_with("smart-targets") {
+                app.set_smart_targets_available(true);
+                app.set_route_smart(true);
+                app.set_capture_visual(true);
+                app.set_route_rows(list(&[
+                    "1. Export",
+                    "2. Save · Wait until gone",
+                    "3. X 470  Y 370",
+                ]));
+                app.set_route_control_rows(ModelRc::new(VecModel::from(vec![1, 2, 0])));
+                app.set_pick_kind(5);
+            } else {
+                app.set_pick_kind(2);
+            }
             app.set_stop_zone_label("X 900  Y 640 to X 1,050  Y 790".into());
             app.set_inside_label("First corner X 200  Y 550. Pick the opposite corner.".into());
             app.set_process_mode(1);
             app.set_process_names("notepad.exe".into());
-            app.set_pick_kind(2);
         }
         "presets" => {
             app.set_page(3);
@@ -153,6 +175,8 @@ fn main() {
                     radius_x: 0.036,
                     radius_y: 0.081,
                     blocked: i == 3,
+                    hidden: false,
+                    repair: false,
                     location: format!("X {}  Y {}", (x * 2400.0) as i32, (y * 1080.0) as i32)
                         .into(),
                     result: if i == 3 {

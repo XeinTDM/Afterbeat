@@ -12,12 +12,13 @@ pub struct Injector {
     keyboard: bool,
     code: i32,
     repeats: u32,
+    wheel: Option<(crate::targets::Direction, u8)>,
 }
 
 impl Injector {
     pub fn new(
         input: Input,
-        double: bool,
+        repeats: u8,
         points: Vec<Point>,
         radius: i32,
         press: Press,
@@ -30,10 +31,13 @@ impl Injector {
                     Button::Left => 0x110,
                     Button::Right => 0x111,
                     Button::Middle => 0x112,
+                    Button::Mouse4 => 0x113,
+                    Button::Mouse5 => 0x114,
                 },
             ),
             Input::Key(key) => (true, key.0 as i32),
             Input::Text(ch) => (true, xkeysym::Keysym::from_char(ch).raw() as i32),
+            Input::Wheel(..) => (false, 0),
         };
         Ok(Self {
             remote,
@@ -41,7 +45,11 @@ impl Injector {
             press,
             keyboard,
             code,
-            repeats: if double { 2 } else { 1 },
+            repeats: u32::from(repeats),
+            wheel: match input {
+                Input::Wheel(direction, ticks) => Some((direction, ticks)),
+                _ => None,
+            },
         })
     }
 
@@ -111,8 +119,19 @@ impl Injector {
                     return Ok(Some(outcome));
                 }
             }
+            if self.wheel.is_some() && wayland::pointer_over_own_window() {
+                return Ok(Some(Outcome::Guarded(
+                    "Move the pointer outside Afterbeat before sending wheel input.",
+                )));
+            }
             if let Some(outcome) = control.begin_dispatch() {
                 return Ok(Some(outcome));
+            }
+            if let Some((direction, ticks)) = self.wheel {
+                self.remote.scroll(direction, ticks).map_err(|error| {
+                    format!("The Wayland portal could not send wheel input. {error}")
+                })?;
+                break;
             }
             let local = target.is_none() && !self.keyboard && wayland::click_own_window();
             let mut release = Release {

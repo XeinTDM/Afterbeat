@@ -17,10 +17,12 @@ use windows_sys::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-            SendInput, VK_LBUTTON, VK_LSHIFT, VK_MBUTTON, VK_RBUTTON, VK_SHIFT,
+            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+            MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+            MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
+            VK_CONTROL, VK_LBUTTON, VK_LSHIFT, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN,
+            VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
         },
         WindowsAndMessaging::{
             GetClipCursor, GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -67,6 +69,8 @@ impl Button {
             Self::Left => VK_LBUTTON,
             Self::Right => VK_RBUTTON,
             Self::Middle => VK_MBUTTON,
+            Self::Mouse4 => VK_XBUTTON1,
+            Self::Mouse5 => VK_XBUTTON2,
         }
     }
 
@@ -75,6 +79,7 @@ impl Button {
             Self::Left => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
             Self::Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
             Self::Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+            Self::Mouse4 | Self::Mouse5 => (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP),
         }
     }
 }
@@ -195,6 +200,7 @@ struct Stroke {
     down: [INPUT; 2],
     up: [INPUT; 2],
     len: usize,
+    wheel: bool,
 }
 
 impl Stroke {
@@ -203,6 +209,7 @@ impl Stroke {
             down: [INPUT::default(); 2],
             up: [INPUT::default(); 2],
             len: 1,
+            wheel: false,
         };
         let origin = Point { x: 0, y: 0 };
         match input {
@@ -210,6 +217,17 @@ impl Stroke {
                 let (down, up) = button.flags();
                 stroke.down[0] = mouse_input(down, origin);
                 stroke.up[0] = mouse_input(up, origin);
+                let data = match button {
+                    Button::Mouse4 => 1,
+                    Button::Mouse5 => 2,
+                    _ => 0,
+                };
+                stroke.down[0].Anonymous.mi.mouseData = data;
+                stroke.up[0].Anonymous.mi.mouseData = data;
+            }
+            Input::Wheel(direction, ticks) => {
+                stroke.down[0] = wheel_input(direction, ticks);
+                stroke.wheel = true;
             }
             Input::Key(key) => {
                 let flags = if key.extended {
@@ -245,7 +263,7 @@ impl Stroke {
         &self.down[..self.len]
     }
     fn up(&self) -> &[INPUT] {
-        &self.up[..self.len]
+        &self.up[..if self.wheel { 0 } else { self.len }]
     }
 }
 
@@ -359,22 +377,48 @@ pub struct Injector {
 }
 
 impl Injector {
+    pub fn tap_at(
+        &self,
+        point: Point,
+        control: &mut RunControl<'_>,
+    ) -> Result<Option<Outcome>, String> {
+        let movement = Targets::move_to(&Desktop::current(), point)
+            .ok_or("The target moved outside the desktop.")?;
+        let mut events = [movement; 7];
+        let end = 1 + self.repeats * 2;
+        for pair in events[1..end].chunks_mut(2) {
+            pair.copy_from_slice(&[self.stroke.down()[0], self.stroke.up()[0]]);
+        }
+        if let Some(outcome) = control.begin_dispatch() {
+            return Ok(Some(outcome));
+        }
+        send(&events[..end], self.stroke.up())?;
+        control.record_tap();
+        Ok(None)
+    }
+
+    pub fn output_held(&self) -> bool {
+        matches!(self.input, Input::Mouse(button) if keys::down(button.virtual_key()))
+    }
+
     pub fn new(
         input: Input,
-        double: bool,
+        repeats: u8,
         points: Vec<Point>,
         radius: i32,
         press: Press,
     ) -> Result<Self, String> {
+        debug_assert!((1..=3).contains(&repeats));
+        debug_assert!(!matches!(input, Input::Wheel(..)) || matches!(press, Press::Tap));
         Ok(Self::with_targets(
             input,
-            double,
+            repeats,
             Targets::new(points, radius)?,
             press,
         ))
     }
 
-    fn with_targets(input: Input, double: bool, targets: Option<Targets>, press: Press) -> Self {
+    fn with_targets(input: Input, repeats: u8, targets: Option<Targets>, press: Press) -> Self {
         let stroke = Stroke::new(input);
         let dynamic = targets
             .as_ref()
@@ -385,7 +429,7 @@ impl Injector {
             stroke,
             input,
             press,
-            repeats: if double { 2 } else { 1 },
+            repeats: usize::from(repeats),
             targets,
             dynamic,
         };
@@ -413,8 +457,8 @@ impl Injector {
             } else {
                 action[used..used + stroke.len].copy_from_slice(stroke.down());
                 used += stroke.len;
-                action[used..used + stroke.len].copy_from_slice(stroke.up());
-                used += stroke.len;
+                action[used..used + stroke.up().len()].copy_from_slice(stroke.up());
+                used += stroke.up().len();
             }
         }
         for events in self.packet[..used * BURST_SIZE as usize].chunks_exact_mut(used) {
@@ -424,7 +468,7 @@ impl Injector {
     }
 
     pub fn batchable(&self) -> bool {
-        matches!(self.press, Press::Tap)
+        matches!(self.press, Press::Tap) && !matches!(self.input, Input::Wheel(..))
     }
 
     pub fn has_targets(&self) -> bool {
@@ -468,13 +512,14 @@ impl Injector {
         let output = match self.input {
             Input::Mouse(button) => Some(button.virtual_key()),
             Input::Key(key) => Some(key.vk),
-            Input::Text(_) => None,
+            Input::Text(_) | Input::Wheel(..) => None,
         };
+        let wheel = matches!(self.input, Input::Wheel(..));
         self.send_checked(
             actions,
             control,
             check_destination,
-            || output.is_some_and(keys::down),
+            || output.is_some_and(keys::down) || (wheel && scroll_input_held()),
             send,
         )
     }
@@ -503,6 +548,20 @@ impl Injector {
             if stroke.len != self.stroke.len {
                 self.stroke = stroke;
                 self.rebuild_packet();
+            }
+        }
+        if matches!(self.input, Input::Wheel(..))
+            && let Some(check) = &mut check_destination
+        {
+            loop {
+                let target = self.destination()?;
+                let gate = check(target);
+                if matches!(gate, Gate::Open) {
+                    break;
+                }
+                if let Some(outcome) = control.retry_dispatch(gate)? {
+                    return Ok(Some(outcome));
+                }
             }
         }
         match self.press {
@@ -593,6 +652,80 @@ impl Injector {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum RouteInput {
+    Click(Button, u8),
+    Scroll(crate::targets::Direction, u8),
+    Key(crate::keys::Key),
+}
+
+impl RouteInput {
+    pub fn is_held(self) -> bool {
+        match self {
+            Self::Click(button, _) => keys::down(button.virtual_key()),
+            Self::Key(key) => {
+                keys::down(key.vk)
+                    || [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                        .into_iter()
+                        .any(keys::down)
+            }
+            Self::Scroll(..) => scroll_input_held(),
+        }
+    }
+
+    pub fn send(
+        self,
+        point: Option<Point>,
+        control: &mut RunControl<'_>,
+        check: impl FnOnce() -> bool,
+    ) -> Result<RouteDelivery, String> {
+        let mut packet = [INPUT::default(); 7];
+        let mut used = 0;
+        if let Some(point) = point {
+            packet[0] = Targets::move_to(&Desktop::current(), point)
+                .ok_or("The target moved outside the desktop.")?;
+            used = 1;
+        }
+        let mut stroke = None;
+        match self {
+            Self::Click(button, count) => {
+                let tap = Stroke::new(Input::Mouse(button));
+                for event in packet[used..used + usize::from(count) * 2].chunks_mut(2) {
+                    event.copy_from_slice(&[tap.down()[0], tap.up()[0]]);
+                }
+                used += usize::from(count) * 2;
+                stroke = Some(tap);
+            }
+            Self::Key(key) => {
+                let tap = Stroke::new(Input::Key(key));
+                packet[..tap.len].copy_from_slice(tap.down());
+                packet[tap.len..2 * tap.len].copy_from_slice(tap.up());
+                used = 2 * tap.len;
+                stroke = Some(tap);
+            }
+            Self::Scroll(direction, ticks) => {
+                packet[used] = wheel_input(direction, ticks);
+                used += 1;
+            }
+        }
+        if !check() {
+            return Ok(RouteDelivery::Retry);
+        }
+        if let Some(outcome) = control.begin_dispatch() {
+            return Ok(RouteDelivery::End(outcome));
+        }
+        send(&packet[..used], stroke.as_ref().map_or(&[], Stroke::up))?;
+        control.record_tap();
+        Ok(RouteDelivery::Sent)
+    }
+}
+
+pub enum RouteDelivery {
+    Retry,
+    Sent,
+    End(Outcome),
+}
+
 fn wait_for_output(
     control: &mut RunControl<'_>,
     output_held: &mut impl FnMut() -> bool,
@@ -665,6 +798,36 @@ fn mouse_input(flags: u32, position: Point) -> INPUT {
     }
 }
 
+fn wheel_input(direction: crate::targets::Direction, ticks: u8) -> INPUT {
+    use crate::targets::Direction::*;
+    let (flags, sign) = match direction {
+        Up => (MOUSEEVENTF_WHEEL, 1),
+        Down => (MOUSEEVENTF_WHEEL, -1),
+        Left => (MOUSEEVENTF_HWHEEL, -1),
+        Right => (MOUSEEVENTF_HWHEEL, 1),
+    };
+    let mut wheel = mouse_input(flags, Point { x: 0, y: 0 });
+    wheel.Anonymous.mi.mouseData = (sign * i32::from(ticks) * 120) as u32;
+    wheel
+}
+
+fn scroll_input_held() -> bool {
+    [
+        VK_CONTROL,
+        VK_MENU,
+        VK_SHIFT,
+        VK_LWIN,
+        VK_RWIN,
+        VK_LBUTTON,
+        VK_RBUTTON,
+        VK_MBUTTON,
+        VK_XBUTTON1,
+        VK_XBUTTON2,
+    ]
+    .into_iter()
+    .any(keys::down)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,7 +883,7 @@ mod tests {
             pending: None,
         };
         let mut injector =
-            Injector::with_targets(Input::Mouse(Button::Left), false, Some(target), Press::Tap);
+            Injector::with_targets(Input::Mouse(Button::Left), 1, Some(target), Press::Tap);
         assert!(injector.batchable());
         let mut index = 0;
         for count in [BURST_SIZE, 3] {
@@ -772,7 +935,7 @@ mod tests {
         let duration = Duration::from_millis(1);
         let mut injector = Injector::with_targets(
             Input::Mouse(Button::Left),
-            true,
+            2,
             Some(targets),
             Press::Timed(duration),
         );
@@ -839,12 +1002,8 @@ mod tests {
         use crate::engine::{Checks, PauseReason, Progress, Schedule, StopSignal, run_controlled};
 
         let duration = Duration::from_secs(60);
-        let mut injector = Injector::with_targets(
-            Input::Mouse(Button::Left),
-            false,
-            None,
-            Press::Timed(duration),
-        );
+        let mut injector =
+            Injector::with_targets(Input::Mouse(Button::Left), 1, None, Press::Timed(duration));
         let mut rechecks = 0;
         let mut events = Vec::new();
         let progress = Progress::default();
@@ -907,12 +1066,8 @@ mod tests {
             random: Random::new(),
             pending: None,
         };
-        let mut injector = Injector::with_targets(
-            Input::Mouse(Button::Left),
-            false,
-            Some(targets),
-            Press::Held,
-        );
+        let mut injector =
+            Injector::with_targets(Input::Mouse(Button::Left), 1, Some(targets), Press::Held);
         let mut events = Vec::new();
         let progress = Progress::default();
         let result = run_controlled(
@@ -953,8 +1108,7 @@ mod tests {
         use crate::engine::{Checks, Progress, Schedule, StopSignal, run_controlled};
 
         for press in [Press::Tap, Press::Timed(Duration::from_millis(1))] {
-            let mut injector =
-                Injector::with_targets(Input::Mouse(Button::Left), false, None, press);
+            let mut injector = Injector::with_targets(Input::Mouse(Button::Left), 1, None, press);
             let progress = Progress::default();
             let mut samples = 0;
             let mut events = Vec::new();
@@ -1007,7 +1161,7 @@ mod tests {
         use crate::engine::{Checks, Progress, Schedule, StopSignal, run_controlled};
 
         let key = keys::parse("Space").unwrap();
-        let mut injector = Injector::with_targets(Input::Key(key), false, None, Press::Tap);
+        let mut injector = Injector::with_targets(Input::Key(key), 1, None, Press::Tap);
         let stop = StopSignal::new().unwrap();
         let progress = Progress::default();
         let result = run_controlled(
@@ -1036,7 +1190,7 @@ mod tests {
 
     #[test]
     fn text_emits_ordered_utf16_taps_without_virtual_keys() {
-        let injector = Injector::with_targets(Input::Text('🙂'), false, None, Press::Tap);
+        let injector = Injector::with_targets(Input::Text('🙂'), 1, None, Press::Tap);
         let events: Vec<_> = injector.packet[..injector.used]
             .iter()
             .map(|event| {

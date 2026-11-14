@@ -144,6 +144,17 @@ def smoke(executable):
         desktop.clicks(4)
         assert all(event[2:] == (90, 90) for event in desktop.buttons)
 
+    for button, detail in [("Mouse4", 8), ("Mouse5", 9)]:
+        with desktop.app(executable, limited=True, count="2", button=button, triple=True):
+            desktop.tap("F6")
+            desktop.clicks(6)
+            assert all(event[1] == detail for event in desktop.buttons), desktop.buttons
+
+    with desktop.app(executable, limited=True, count="2", scroll=True, scroll_direction="Left", scroll_ticks="3"):
+        desktop.tap("F6")
+        desktop.clicks(6)
+        assert all(event[1] == 6 for event in desktop.buttons), desktop.buttons
+
     route = [point, {"x": 150, "y": 120}]
     with desktop.app(executable, route_enabled=True, route_once=True, route=route,
                      process_mode=1, process_names=Path("/proc/self/exe").resolve().name):
