@@ -89,7 +89,7 @@ fn portal_lifecycle() {
     assert_eq!(status().stop.as_deref(), Some("F7"));
     assert_eq!(status().toggle.as_deref(), Some("F6"));
     assert_eq!(displays()[0].from, Point { x: -800, y: 0 });
-    shortcuts.configure();
+    assert!(shortcuts.configure());
     wait_for(
         || trace().iter().any(|entry| entry == "configure"),
         || "The portal did not receive ConfigureShortcuts.".into(),
@@ -229,6 +229,10 @@ fn portal_lifecycle() {
         || status().stop.is_none(),
         || "Stop removal was not observed.".into(),
     );
+    assert_eq!(
+        status().message,
+        "Bind an emergency stop shortcut in Desktop shortcuts."
+    );
     assert!(
         validate(&Settings {
             keyboard: true,
@@ -236,11 +240,18 @@ fn portal_lifecycle() {
         })
         .is_err()
     );
+    call("EnableStop", &(true,));
+    wait_for(
+        || status().stop.is_some(),
+        || "Stop restoration was not observed.".into(),
+    );
+    assert!(validate(&keyboard).is_ok());
     block_on(fixture.call::<_, _, ()>("Revoke", &())).unwrap();
     wait_for(
         || !status().ready && self::remote().is_none(),
         || status().message,
     );
+    call("EnableStop", &(false,));
     assert!(shortcuts.enable(false));
     wait_for(
         || status().message.contains("Bind the emergency stop"),

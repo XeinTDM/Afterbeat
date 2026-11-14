@@ -152,11 +152,20 @@ pub fn validate(settings: &Settings) -> std::result::Result<(), Issue> {
             "Wayland does not expose other apps' process identities. Turn off App filter for this setup.",
         ));
     }
-    if settings.edge_mode != 0 || settings.inside_zone.is_some() || settings.stop_zone.is_some() {
+    if settings.edge_mode != 0 {
         return Err(Issue::new(
-            "safety",
-            "Wayland does not expose the live desktop pointer. Turn off edges and clear the cursor zones for this setup.",
+            "edge",
+            "Wayland does not expose the live desktop pointer. Turn off Screen stop.",
         ));
+    }
+    if settings.inside_zone.is_some() {
+        return Err(Issue::new(
+            "inside",
+            "Clear the Inside only zone on Wayland.",
+        ));
+    }
+    if settings.stop_zone.is_some() {
+        return Err(Issue::new("stop-zone", "Clear the Stop zone on Wayland."));
     }
     let state = STATE.lock().unwrap();
     let Some(remote) = &state.remote else {
@@ -172,7 +181,7 @@ pub fn validate(settings: &Settings) -> std::result::Result<(), Issue> {
         && remote.monitors.is_empty()
     {
         return Err(Issue::new(
-            "target",
+            "wayland-access",
             "Reconnect with displays to use fixed points or routes on Wayland.",
         ));
     }
@@ -184,7 +193,7 @@ pub fn validate(settings: &Settings) -> std::result::Result<(), Issue> {
     };
     if remote.devices & required != required {
         return Err(Issue::new(
-            "input",
+            "wayland-access",
             "The desktop did not grant this input device. Reconnect and allow it in the permission dialog.",
         ));
     }
@@ -292,8 +301,8 @@ impl Hotkeys {
         let _ = self.commands.try_send(Command::Disable);
     }
 
-    pub fn configure(&self) {
-        let _ = self.commands.try_send(Command::Configure);
+    pub fn configure(&self) -> bool {
+        self.commands.try_send(Command::Configure).is_ok()
     }
 }
 
@@ -442,8 +451,6 @@ async fn run_session(
         state.status.pending = false;
         state.status.ready = true;
         state.status.configure = version >= 2;
-        state.status.message =
-            "Wayland input is enabled. Escape stops a run while Afterbeat has focus.".into();
         state.status.displays = displays;
         set_shortcuts(&mut state.status, &bound);
     });
@@ -479,8 +486,8 @@ async fn run_session(
         )
         .await?;
         match next {
-            Next::Command(Some(Command::Configure)) if version >= 2 => {
-                if configuration.is_none() {
+            Next::Command(Some(Command::Configure)) => {
+                if version >= 2 && configuration.is_none() {
                     configuration = Some(Box::pin(async {
                         global
                             .call("ConfigureShortcuts", &(&shortcuts.path, "", Options::new()))
@@ -491,8 +498,9 @@ async fn run_session(
             Next::Configuration(result) => {
                 configuration = None;
                 if let Err(error) = result {
-                    STATE.lock().unwrap().status.message =
-                        format!("Could not open shortcut settings. {error}");
+                    STATE.lock().unwrap().status.message = format!(
+                        "Could not open shortcut settings. Use your desktop’s settings or reconnect. {error}"
+                    );
                     callback(Action::PortalStatus);
                 }
             }
@@ -562,6 +570,18 @@ fn take_shortcuts(result: &mut Options) -> Result<Shortcuts> {
 fn set_shortcuts(status: &mut Status, shortcuts: &Shortcuts) {
     status.toggle = shortcut_label(shortcuts, ACTIVATE);
     status.stop = shortcut_label(shortcuts, STOP);
+    status.message = if status.stop.is_none() {
+        if status.configure {
+            "Bind an emergency stop shortcut in Desktop shortcuts."
+        } else {
+            "Bind an emergency stop shortcut in your desktop’s settings, or disconnect and enable input again."
+        }
+    } else if status.toggle.is_none() {
+        "Bind a Start/Stop shortcut in your desktop’s shortcut settings to use While held."
+    } else {
+        "Wayland input is enabled. Escape stops a run while Afterbeat has focus."
+    }
+    .into();
 }
 
 fn shortcut_label(shortcuts: &Shortcuts, id: &str) -> Option<String> {

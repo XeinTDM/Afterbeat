@@ -670,7 +670,16 @@ impl Controller {
                     ui.set_can_start(false);
                     hotkeys.disable();
                 }
-                3 if !ui.get_active() => hotkeys.configure(),
+                3 if !ui.get_active() && ui.get_wayland_ready() && ui.get_wayland_configure() => {
+                    if hotkeys.configure() {
+                        status(ui, "");
+                    } else {
+                        failure(
+                            ui,
+                            "Could not request desktop shortcut settings. Try again.",
+                        );
+                    }
+                }
                 _ => {}
             }
         }
