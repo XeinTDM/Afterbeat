@@ -61,6 +61,12 @@ bash scripts/package.sh
 
 The verification script runs formatting, Clippy, Rust tests, offscreen preview renders, and desktop entry validation. The Xvfb release test covers exact counts, fixed points, routes, process filters, emergency stop, held input, side-button shortcuts, keyboard output, and Unicode delivery. The Wayland checks map the release window under Weston and use an isolated D-Bus portal fixture to verify grant handling, global activation and release, emergency stop, input delivery requests, and revocation.
 
+Slint 1.18.1 forces its X11 backend when it detects WSL, including when Afterbeat
+requests Wayland. The native Wayland window check therefore fails under ordinary
+WSL without an X server. A private mount namespace that hides the WSL markers can
+exercise the Wayland window without changing the host, but this remains a test
+workaround; standalone desktop verification is still required.
+
 ### Wayland desktop verification
 
 The Ubuntu 24.04 x64 archive was tested on Debian 13 with KWin 6.3.6 and the KDE portal 6.3.5 in a nested Wayland session under WSL. Afterbeat opened the desktop permission prompt, delivered counted mouse clicks and keystrokes to a separate Wayland app, and released a held mouse button on F7 and on release of the Hold shortcut.
@@ -88,6 +94,38 @@ Run these checks from a local macOS desktop session with the packaged app.
 4. Capture fixed points on each connected display, including a display to the left of the primary one if available. Dry run the points, then run a short route with a stop zone. Confirm Dry run dispatches no clicks and that the live route ends before pressing inside the stop zone.
 5. Test allow and block filters with an external app’s executable name for both mouse and keyboard output. Switch recipients during a timed press and confirm the old recipient gets the release and the new one receives no press until its guard permits it.
 6. Test Hold activation by releasing the activation shortcut while the mouse button is down. Repeat with F7 and then with **Quit Afterbeat** from the Dock. Confirm the mouse button releases each time. If you have a side-button mouse, repeat Hold activation using Mouse4.
+
+## UI acceptance checks
+
+Use an isolated settings profile and record the source revision, local changes, platform,
+display scaling, and assistive technology version with each result. A compile check
+for another target does not replace running its interface on that platform.
+
+### Screen reader
+
+On Windows, navigate with NVDA and Tab, Shift+Tab, and arrow keys. Check that numeric
+fields announce their names and values; choice groups announce the selected option
+and each arrow-key change; and preset and route lists announce the selected row.
+Check validation errors, shortcut editing, and focus returning after a preset dialog.
+Keep any spoken-text evidence limited to Afterbeat. Close the portable reader when
+finished. UI Automation tree inspection alone does not verify spoken announcements.
+
+### First-use study
+
+Ask someone unfamiliar with Afterbeat to complete these tasks without coaching. Use
+a temporary profile, a prepared three-step route, and only the Test pad or a dedicated
+receiver for live output. Explain the emergency Stop shortcut before any live run.
+
+1. Describe the current input, pace, destination, and stopping condition before starting.
+2. Configure three counted mouse actions and confirm three presses on the Test pad.
+3. Explain the difference between **Hold output** and **While held** activation.
+4. Save a preset, change its interval, explain **Modified**, and load the saved preset.
+5. Move the last prepared route step to the first position and explain **Once** versus **Loop**.
+6. Find the keyboard-output guidance and recover from an invalid interval.
+
+Record completion, elapsed time, mistakes, requested help, and the participant's own
+words. Record the study as pending until a real participant completes it; a developer
+walkthrough is useful preparation but does not establish first-use usability.
 
 ## Credits
 

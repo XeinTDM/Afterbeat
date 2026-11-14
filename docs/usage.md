@@ -42,13 +42,14 @@ Use **Fn+F6**, **Fn+F7**, and **Fn+F8** if your keyboard uses those keys for med
 
 ## Input and timing
 
-Change units next to the interval on **Clicker** or **Timing**. In a compact window, **More options** on Clicker opens the quick intervals, click type, and start delay. Select **Shortcuts** to see the full key bindings.
+Change units next to the interval on **Clicker** or **Timing**. In a compact window, **More options** on Clicker opens the quick intervals, click type, and start delay. Active double or triple clicks and the start delay are shown beside the collapsed options. The run summary identifies the mouse button, key or character, or wheel direction and amount on every setup page, including While held mode. With larger text, **Run details** reveals the full setup and shortcuts on the current page. Select **Shortcuts** to see the full key bindings.
+When **Variable rate** is on, choose **Use fixed interval** before selecting a quick interval. **Hold output** disables quick intervals.
 
 - **Mouse** supports left, right, middle, **Mouse4**, and **Mouse5**. Choose **Single**, **Double**, or **Triple**. A double or triple click counts as one action. Use a different button for output and the activation shortcut.
 - **Wheel** scrolls up, down, left, or right. Each action sends 1–32 ticks. It works with Follow cursor, Fixed point, and routes. On Windows, focus the window at the wheel target. Wayland requires a portal backend that supports discrete scrolling. [Remote Desktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html#notifypointeraxisdiscrete)
 - **Key press** sends a key event, such as `Space`, `Enter`, or `F5`. For uppercase letters, Afterbeat uses Shift when needed. **Text** sends one Unicode character in Tap mode. Keyboard output pauses while Afterbeat is in the foreground. On macOS and X11, key presses use the active keyboard layout. On macOS, use **Text** for characters that require Option or a composition sequence. X11 Text can use a temporary unused keycode for characters outside the layout. On Wayland, the portal interprets the key symbol and the receiving app must support the character. Use recognizable desktop shortcut labels such as F6 and F7 so Afterbeat can detect key conflicts.
 - Set a delay or a rate per second, minute, hour, or day. Delays range from 0.1 ms to one day. Enter `Max` in any cadence unit or zero in a delay unit to select **Max speed**. **Variable rate** picks a rate from a range for each interval. Decimal points and commas are accepted.
-- **Tap** sends a quick press and release. **Timed** lets you set the press duration. **Hold down** keeps the input pressed while the run is active and its guards allow it. It requires continuous repeat and a single target. On X11, use **Tap** for keyboard output so a focus change during a held press cannot redirect the release.
+- **Tap** sends a quick press and release. **Timed** lets you set the press duration. **Hold output** keeps the input pressed while the run is active and its guards allow it. It requires continuous repeat and a single target. On X11, use **Tap** for keyboard output so a focus change during a held press cannot redirect the release.
 - A **Counted** run supports up to 100 million actions. A **Time limit** starts with the first dispatch and includes pauses. Set both to stop at whichever limit comes first.
 
 ### Precise and Low CPU
@@ -61,13 +62,21 @@ At 500–1,000 clicks per second, both modes can briefly shorten the gaps betwee
 
 ## Activation and stop
 
-- **Toggle** uses the selected start delay. **Hold** starts as soon as you hold the activation shortcut and stops when you release it. With **Key press** output, Hold requires a shortcut without modifiers.
-- Edit the shortcut in **Timing** and select **Apply**. Examples include `F6`, `Ctrl+Alt+G`, `Mouse4`, and `Mouse5`. For side-button chords, hold only the configured modifiers before pressing the button. Side-button events still reach the foreground app.
+- **Toggle** uses the selected start delay. **While held** starts as soon as you hold the activation shortcut and stops when you release it. With **Key press** output, While held requires a shortcut without modifiers.
+- In **Timing → Type shortcut**, type a shortcut name and select **Apply** or press Enter. This is a text field, not a shortcut recorder. New starts are blocked while the field has focus; emergency Stop remains available. The active binding is shown while you edit. Press Escape in the field to restore the active binding when one is registered. Examples include `F6`, `Ctrl+Alt+G`, `Mouse4`, and `Mouse5`. For side-button chords, hold only the configured modifiers before pressing the button. Side-button events still reach the foreground app.
 - **F7** stops the run or cancels capture. On Windows, the taskbar thumbnail also offers **Stop run** while active, and Afterbeat tries the corresponding Ctrl+Alt combination if F7 or F8 is occupied. Afterbeat requires a working stop shortcut to start. The shortcut bar shows the active bindings.
 - In compact mode, the **Stop run** button shows the emergency shortcut during a run. When a run pauses, the status explains what to do to resume.
 - Turn off the **Master switch** to prevent new runs. Input already submitted to the desktop can finish after Stop.
 
 ## Targets and guards
+
+On **Targets**, use **Route** to capture and edit steps, or **Zones & filters** to set run boundaries. The Zones & filters tab shows the number of active guards. **Dry run** is available from either tab, and **Fix in Targets** opens the tab containing the setting that needs attention.
+
+Select a route row to read its action, target, delay, and verification details in the wrapping summary below the list. While editing a step, save or cancel the edit to change Targets tabs.
+
+To reorder a route, select a step and enter its new one-based position under **Move to**, then press Enter or choose **Move step**. In the route list, **Alt+Up** and **Alt+Down** move the selected step one place. The selected step keeps its target, action, and delay. **Move up** and **Move down** remain available.
+
+In **Zones & filters**, choose **Pick corner** or **Replace zone** before using **F8**. F8 then captures corners for the selected zone. Switching to **Route** restores point or control capture for the visible route.
 
 | Control | Behavior |
 | --- | --- |
@@ -83,29 +92,43 @@ On Windows, X11, and macOS, runs with saved targets pause if the desktop confine
 
 Capture two opposite corners to define a zone. Saved points use desktop coordinates in pixels on Windows and X11 and logical points on macOS. Layouts can include negative coordinates on displays above or to the left of the primary display. **Targets → Dry run** shows setup blockers separately from the geometry results for the saved fixed point or route centers. If a setting blocks Start, use **Fix in Clicker**, **Fix in Timing**, or **Fix in Targets** to go to it. For Follow cursor or keyboard output without a route, choose **Sample pointer in 3 s** and move to the location you want to check. The preview shows the coordinates it checked and sends no input. Live pointer movement, app filters, randomized positions, and cadence can affect a real run.
 
+Adding to a saved route that is Off keeps it Off. Choose **Once** or **Loop** to use the route on the next run. When replacing a zone, the saved zone applies until both new corners are captured. **Cancel replacement** keeps the saved zone. **Remove zone** deletes it.
+
+After removing a route step, choose **Undo removal** to restore it, including its custom action and saved target. Undo remains available until you change the route or load a preset. Other settings can be edited without losing Undo.
+
+Dry run previews one traversal. Playback stops at a definite spatial stop or the action limit, and waits at a currently unavailable target. Steps after that point remain selectable. A **Wait** step uses none of the action limit.
+
 ### Smart Targets on Windows
 
 1. Open the target app and choose **Targets → Pick control** in Afterbeat. Point at a button or another accessible control and press **F8**, or keep the pointer there until the countdown ends. The shortcut bar shows the active capture binding and mode.
 2. Add the rest of the steps and choose **Once** or **Loop**. You can mix control targets and coordinate points. Use single mouse taps and a zero radius.
-3. Open **Dry run** to check the desktop. Select **Step** to see each result or **Check again** after changing the target app. Blue outlines show where Afterbeat found the controls. Open any dialogs you want to inspect before checking.
+3. Open **Dry run** to check the desktop. Choose a row under **Step results** to highlight its target, or use **Step** to advance through the route in order. Select **Check again** after changing the target app. Blue outlines show where Afterbeat found the controls. Open any dialogs you want to inspect before checking.
 4. Leave the target app visible and start the route. Afterbeat waits for each control to be uniquely identified, enabled, and unobstructed. **Target timeout** sets how long it waits for a step before ending the run. Select a control step and choose **Wait until gone** to give that step a second timeout after its click. If verification times out, Afterbeat stops with the click already counted. **F7** stops a waiting run.
 
 By default Afterbeat matches the app’s executable path, the captured window class and title, and the control’s type and automation ID or name. For duplicate controls it can save the identity of a unique enclosing control.
 
 Choose **Control capture → With visual anchor** to make new F8 captures survive a changed control ID or window title. Point at the target as usual. Afterbeat chooses a nearby unique accessible label and saves two small grayscale fingerprints, one for the target and one for the label. Both stay in local settings and in any presets you save.
 
-At run time, Afterbeat checks the label, both fingerprints, and the target’s position relative to the label at the current display scale. If the saved accessibility selector points somewhere else or the visual evidence is ambiguous, Afterbeat waits. In **Dry run**, choose **Step** to review the proposed location. Blue outlines mark targets, and gold outlines mark their anchors. **Repair target** rechecks the proposal and updates the current route if the target still matches. Save the repaired setup as a preset if you want to use it from **Presets** later.
+At run time, Afterbeat checks the label, both fingerprints, and the target’s position relative to the label at the current display scale. If the saved accessibility selector points somewhere else or the visual evidence is ambiguous, Afterbeat waits. In **Dry run**, select a result marked **Repair available** to review the proposed location. Blue outlines mark targets, and gold outlines mark their anchors. **Repair target** rechecks the proposal and updates the current route if the target still matches. Save the repaired setup as a preset if you want to use it from **Presets** later.
 
 ### Per-step actions on Windows
 
-- Capture a point or control with **F8** as usual. Select it and choose **Edit step** to set its action and delay. Use **Add step** to insert a wait or foreground key press after the selected row.
+- Capture a point or control with **F8** as usual. In **Edit step**, **Use Clicker settings** keeps the shared output and cadence. Choose **Custom action** to set a step’s action and delay. Use **Add step** to insert a wait or foreground key press after the selected row.
 - A click can send one, two, or three taps with the selected button. Scroll steps send vertical or horizontal wheel ticks while the target window is foreground. A control-targeted key waits for a distinct native keyboard focus handle. Click the control earlier in the route if the app requires that to give it focus. For controls that share their window's native handle, use a foreground key step.
 - A step delay is the minimum time before that step can send input. A **Wait** step adds its whole duration and sends no input. Target lookup and outcome verification can extend the route. The next step keeps its full delay.
-- **Once** traverses the route once. Counted runs count each dispatched click group, scroll, or key press as one action. Waits consume no actions. The mixed-route time limit starts after the countdown and includes waits and target lookup. Unedited points and controls in a mixed route use the shared mouse or wheel output and cadence.
+- **Once** traverses the route once. Counted runs count each dispatched click group, scroll, or key press as one action. Waits consume no actions. The mixed-route time limit starts after the countdown and includes waits and target lookup. If a mixed route has unedited points or controls, select Mouse or Wheel in Clicker. Those steps use the shared output and cadence.
 
 ## Presets, delivery, and recovery
 
 Save a named setup on **Presets**. Presets include the activation shortcut and pacing choice. If a preset's shortcut is occupied, Afterbeat keeps the current setup. The Presets page also shows lifetime runs, actions, and elapsed time.
+
+Select a preset to preview its saved input, pace, target, limits, activation shortcut, and guards before loading it. **Selected preset** describes the highlighted saved configuration; **Current setup** in the run bar describes the settings that will run. Selecting a preset does not load it.
+
+Loading a preset prompts before replacing a modified or unnamed custom setup. Choose **Save as new…** to open the naming form, enter a name, then choose **Save & load**. The name field receives focus, and validation or save errors scroll into view. **Back** returns to the choice screen and keeps the entered name. Choose **Discard & load** to replace the setup directly, or **Cancel** to keep working. A failed save leaves the current setup in place. Enter initially selects Cancel; Escape cancels from either step.
+
+The run bar shows the preset you loaded or saved during this session. **Modified** means the current settings differ from that preset.
+
+The run summary shows **Once** or **Loop** for routes and explicitly names action and time limits, including when no limit is set. When both limits apply, the first one reached stops the run. With enlarged text, **Modified** stays visible beside the shortened preset name; **Run details** shows the full current preset name.
 
 The session counter tracks dispatched actions. The **Test pad** counts presses that reach it. Windows allows input injection into apps at the same or a lower privilege level. Afterbeat keeps generated input away from its own controls and counts generated presses over the Test pad.
 
