@@ -2,7 +2,7 @@
 
 Afterbeat is a desktop auto-clicker and key repeater for x64 Windows 10 and 11, x64 Linux desktops running X11 or Wayland, and macOS 13 or later on Apple silicon and Intel. Click at the pointer, at a saved point, or along a route, or send repeated keystrokes to the focused app. Preview your targets and set where the run can operate and when it should stop.
 
-[Downloads](https://github.com/XeinTDM/Afterbeat/releases) · [User guide](docs/usage.md) · [Build from source](docs/build.md) · [Benchmarks](docs/benchmarks.md)
+[Downloads](https://github.com/XeinTDM/Afterbeat/releases) · [User guide](docs/usage.md) · [Build from source](docs/build.md) · [Platform feature matrix](docs/platform-matrix.md) · [Benchmarks](docs/benchmarks.md)
 
 ![Afterbeat’s Clicker page showing the default 100 ms interval, mouse input, three-second countdown, and Test pad.](docs/assets/afterbeat-clicker.png)
 
@@ -22,8 +22,9 @@ Afterbeat is a desktop auto-clicker and key repeater for x64 Windows 10 and 11, 
 
 - Use fixed or variable intervals, counted repeats, time limits, and timed presses.
 - Repeat single, double, or triple clicks with five mouse buttons, or scroll vertically or horizontally.
-- Save up to 64 points in a route. Use **Targets → Dry run** to preview points and zones without sending input.
-- On Windows, mix clicks, waits, wheel scrolling, and key presses with a delay on each step. [Per-step actions](docs/usage.md#per-step-actions-on-windows)
+- Save up to 256 points in a route and repeat point, control, or mixed-action routes a chosen number of times. Use **Targets → Dry run** to preview points and zones without sending input.
+- On Windows, mix clicks, waits, pixel-color conditions, wheel scrolling, key presses, and text with a delay on each step. [Per-step actions](docs/usage.md#per-step-actions-on-windows)
+- On Windows, X11, and macOS, record mouse movement and buttons, optionally include keys, and edit the resulting route timeline. [Recording a route](docs/usage.md#recording-a-route)
 - On Windows, use **Targets → Pick control** to save an accessible control. Enable **With visual anchor** to locate the target after an ID or window title changes and review repairs in Dry Run. [Smart Targets](docs/usage.md#smart-targets-on-windows)
 - Use stop zones, monitor edges, and app filters to constrain a run. Save the whole setup under **Presets**.
 - Choose **Precise** for steadier click spacing or **Low CPU** to batch compatible mouse clicks. [Pacing and eligibility](docs/usage.md#precise-and-low-cpu)
