@@ -171,6 +171,185 @@ fn main() {
                 );
             }
         }
+        "recording-check"
+        | "compact-text-recording-check"
+        | "recorded-step-editor"
+        | "compact-text-recorded-step-editor"
+        | "recorded-key-editor"
+        | "compact-text-recorded-key-editor"
+        | "compact-text-recorded-key-editor-bottom" => {
+            app.set_page(2);
+            app.set_smart_targets_available(true);
+            app.set_recording_available(true);
+            app.set_recording_windows(cfg!(windows));
+            app.set_recording_macos(cfg!(target_os = "macos"));
+            assert!(!app.get_record_keys(), "Keyboard capture must be opt-in.");
+            app.set_route_enabled(true);
+            app.set_route_recorded(true);
+            app.set_route_count(2);
+            app.set_route_rows(list(&[
+                "1. Left down · X 10 Y 20",
+                "2. Left up · X 30 Y 40 · 300 ms delay",
+            ]));
+            app.set_route_index(0);
+            if mode.ends_with("recorded-step-editor") || mode.contains("recorded-key-editor") {
+                if mode.starts_with("compact-text") {
+                    app.global::<Theme>().set_text_scale(2.25);
+                }
+                app.set_step_recorded(true);
+                app.set_recorded_kind(if mode.contains("recorded-key-editor") {
+                    2
+                } else {
+                    1
+                });
+                app.set_recorded_key("65".into());
+                app.set_recorded_x("10".into());
+                app.set_recorded_y("20".into());
+                app.set_recorded_down(true);
+                app.set_step_button(0);
+                app.set_step_delay("25".into());
+                app.set_step_edit_index(0);
+                app.set_step_editing(true);
+                app.invoke_reveal_step_editor();
+                settle();
+                if mode.ends_with("-bottom") {
+                    for _ in 0..100 {
+                        window.dispatch_event(WindowEvent::PointerScrolled {
+                            position: LogicalPosition::new(150.0, 200.0),
+                            delta_x: 0.0,
+                            delta_y: -2200.0,
+                        });
+                        settle();
+                    }
+                }
+            } else {
+                if mode.starts_with("compact-text") {
+                    app.global::<Theme>().set_text_scale(2.25);
+                }
+                settle();
+                assert!(
+                    app.get_run_button_enabled(),
+                    "Playback should be available before recording."
+                );
+                app.set_recording_state(1);
+                settle();
+                assert!(
+                    !app.get_run_button_enabled(),
+                    "Recording must block playback."
+                );
+                app.set_recording_state(2);
+                settle();
+                assert!(
+                    !app.get_run_button_enabled(),
+                    "Paused recording must block playback."
+                );
+                app.set_recorded_count(12);
+                let distance = args.next().map_or_else(
+                    || {
+                        if mode.starts_with("compact-text") {
+                            2200.0
+                        } else {
+                            900.0
+                        }
+                    },
+                    |value| value.parse().unwrap(),
+                );
+                let scroll_count = args.next().map_or_else(
+                    || {
+                        if mode.starts_with("compact-text") {
+                            100
+                        } else {
+                            1
+                        }
+                    },
+                    |value| value.parse().unwrap(),
+                );
+                for _ in 0..scroll_count {
+                    window.dispatch_event(WindowEvent::PointerScrolled {
+                        position: LogicalPosition::new(
+                            if mode.starts_with("compact-text") {
+                                150.0
+                            } else {
+                                400.0
+                            },
+                            200.0,
+                        ),
+                        delta_x: 0.0,
+                        delta_y: -distance,
+                    });
+                    settle();
+                }
+            }
+        }
+        "pixel-branch-editor"
+        | "compact-pixel-branch-editor"
+        | "pixel-check-editor"
+        | "compact-pixel-check-editor"
+        | "compact-image-editor"
+        | "compact-workflow-editor" => {
+            app.set_page(2);
+            app.set_smart_targets_available(true);
+            app.set_route_enabled(true);
+            app.set_route_actions(true);
+            app.set_route_count(2);
+            app.set_route_rows(list(&["1. Wait for pixel", "2. Click target"]));
+            app.set_route_index(0);
+            app.set_step_edit_index(0);
+            app.set_step_has_target(false);
+            app.set_step_inherits(false);
+            app.set_step_kind(match mode.as_str() {
+                "compact-image-editor" => 6,
+                "compact-workflow-editor" => 7,
+                _ => 5,
+            });
+            if mode == "compact-image-editor" {
+                app.set_step_image_output(2);
+                app.set_step_image_scaled(true);
+                app.set_step_image_template(
+                    format!(
+                        "{{\"width\":8,\"height\":8,\"pixels\":\"{}\"}}",
+                        "55aa".repeat(32)
+                    )
+                    .into(),
+                );
+                app.set_step_image_preview("Match at 120, 200 · 98%. Snapshot only.".into());
+                let mut pixels = slint::SharedPixelBuffer::<Rgb8Pixel>::new(8, 8);
+                for (index, pixel) in pixels.make_mut_slice().iter_mut().enumerate() {
+                    let value = if index % 2 == 0 { 85 } else { 170 };
+                    *pixel = Rgb8Pixel {
+                        r: value,
+                        g: value,
+                        b: value,
+                    };
+                }
+                let image = slint::Image::from_rgb8(pixels);
+                app.set_step_image_reference_image(image.clone());
+                app.set_step_image_match_image(image);
+                app.set_step_image_has_match(true);
+            }
+            app.set_step_key("100, 200, #00FF00".into());
+            app.set_step_pixel_tolerance("5".into());
+            app.set_step_pixel_retries("2".into());
+            app.set_step_pixel_preview(
+                "Sampled (100, 200): #00FF00. Condition matches at preview time.".into(),
+            );
+            let check_once = mode.ends_with("pixel-check-editor");
+            app.set_step_pixel_stable(if check_once { "0" } else { "250" }.into());
+            app.set_step_pixel_check_once(check_once);
+            app.set_step_pixel_skip_next(true);
+            app.set_step_editing(true);
+            settle();
+            window.dispatch_event(WindowEvent::PointerScrolled {
+                position: LogicalPosition::new(size.0 as f32 - 150.0, 220.0),
+                delta_x: 0.0,
+                delta_y: if mode == "compact-image-editor" {
+                    -460.0
+                } else {
+                    -2200.0
+                },
+            });
+            settle();
+        }
         "route-details"
         | "compact-route-details"
         | "compact-text-route-details"
@@ -618,6 +797,39 @@ fn main() {
             app.set_process_mode(1);
             app.set_process_names("notepad.exe".into());
         }
+        "sharing-review" | "compact-sharing-review" => {
+            app.set_page(3);
+            app.set_share_review_kind(2);
+            app.set_share_review_name("A route with a long shared name".into());
+            app.set_share_review_path("C:\\Users\\Example\\Documents\\Shared\\preset.json".into());
+            app.set_share_review_metadata("Transfer format: afterbeat-preset, version 3".into());
+            let mut buffer = slint::SharedPixelBuffer::<Rgb8Pixel>::new(20, 12);
+            for (index, pixel) in buffer.make_mut_slice().iter_mut().enumerate() {
+                let gray = ((index * 5) % 256) as u8;
+                *pixel = Rgb8Pixel {
+                    r: gray,
+                    g: gray,
+                    b: gray,
+                };
+            }
+            let preview = slint::Image::from_rgb8(buffer);
+            app.set_share_review_items(ModelRc::new(VecModel::from(vec![ShareReviewItem {
+                title: "Route step 1 of 1".into(),
+                details: "{\n  \"executable\": \"C:\\\\Example\\\\App.exe\",\n  \"title\": \"Private document\"\n}".into(),
+                has_visual: true,
+                visual_status: "Two saved 20 × 12 grayscale fingerprints.".into(),
+                target_image: preview.clone(),
+                landmark_image: preview,
+                ..Default::default()
+            }])));
+            settle();
+            window.dispatch_event(WindowEvent::PointerScrolled {
+                position: LogicalPosition::new(size.0 as f32 - 150.0, 220.0),
+                delta_x: 0.0,
+                delta_y: -2000.0,
+            });
+            settle();
+        }
         "presets" | "compact-presets" | "compact-text-presets" | "compact-text-preset-details" => {
             app.set_page(3);
             if mode.starts_with("compact-text") {
@@ -716,6 +928,7 @@ fn main() {
                     blocked: i == 3 || (waiting && i == 1),
                     terminal: i == 3,
                     counts_as_action: !(counted && i == 1),
+                    action_count: if counted && i == 1 { 0 } else { 1 },
                     hidden: (counted || waiting) && i == 1,
                     repair: mode == "dry-results-check" && i == 4,
                     location: format!("X {}  Y {}", (x * 2400.0) as i32, (y * 1080.0) as i32)

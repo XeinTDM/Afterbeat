@@ -224,6 +224,281 @@ def check(output, manifest, windows):
             ]
         run_case("mixed-order", mixed, test_mixed)
 
+        def test_finite_loops(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed.")
+            order(start, [
+                ("leftDown", "start", 0), ("leftUp", "start", 0),
+                ("leftDown", "start", 0), ("leftUp", "start", 0),
+            ])
+            last_click = events[start + 3][3]
+            assert (time.perf_counter_ns() - last_click) / 1_000_000 >= 110
+        run_case("finite-loops-include-final-wait", [mixed[0], action("wait", 150)],
+                 test_finite_loops, route_iterations="2", route_once=False)
+
+        # Sample a stable part of the fixture background. The window is topmost;
+        # the pixel condition must pass before the first click is dispatched.
+        pixel_x, pixel_y = gui.ClientToScreen(fixture["window"], (12, 120))
+        gdi = c.WinDLL("gdi32", use_last_error=True)
+        gdi.GetPixel.argtypes = [c.c_void_p, c.c_int, c.c_int]
+        gdi.GetPixel.restype = c.c_uint32
+        dc = gui.GetDC(0)
+        try:
+            colorref = gdi.GetPixel(dc, pixel_x, pixel_y)
+        finally:
+            gui.ReleaseDC(0, dc)
+        if colorref == 0xFFFFFFFF:
+            raise RuntimeError("Could not sample the fixture pixel.")
+        rgb = ((colorref & 0xFF) << 16) | (colorref & 0xFF00) | ((colorref >> 16) & 0xFF)
+
+        def test_pick_pixel(find, focus, start, case):
+            find("Targets", "Button").iface_toggle.Toggle()
+            find("Add step", "Button").iface_invoke.Invoke()
+            pixel = find("Pixel", "RadioButton")
+            try:
+                pixel.iface_selection_item.Select()
+            except Exception:
+                point = pixel.rectangle().mid_point()
+                gui.ShowWindow(fixture["window"], con.SW_HIDE)
+                api.SetCursorPos((point.x, point.y))
+                api.mouse_event(con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                api.mouse_event(con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                gui.ShowWindow(fixture["window"], con.SW_SHOWNA)
+            field = find("Pixel x, y, and RGB color", "Edit")
+            field.iface_value.SetValue("1, 2, #123456")
+            find("Pick pixel in 3s", "Button").iface_invoke.Invoke()
+            find("Cancel capture", "Button")
+            windows.tap_key(con.VK_F7, modifiers=modifiers)
+            find("Pick pixel in 3s", "Button")
+            assert field.iface_value.CurrentValue == "1, 2, #123456"
+            find("Pick pixel in 3s", "Button").iface_invoke.Invoke()
+            api.SetCursorPos((pixel_x, pixel_y))
+            windows.tap_key(con.VK_F8)
+            expected = f"{pixel_x}, {pixel_y}, #{rgb:06X}"
+            windows.wait_for(lambda: field.iface_value.CurrentValue == expected, 3,
+                             "Pixel capture did not populate the editor.")
+            find("Save step", "Button").iface_invoke.Invoke()
+            order(start, [])
+
+        run_case("pick-pixel-and-cancel", [mixed[0]], test_pick_pixel)
+
+        def test_pixel_match(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed.")
+            order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)])
+
+        run_case("pixel-match-before-click", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y}, rgb=rgb), mixed[0],
+        ], test_pixel_match)
+
+        # The fixture's background is a stable, uniform 8 × 8 reference.
+        gray = (29 * (rgb & 255) + 150 * ((rgb >> 8) & 255) + 77 * ((rgb >> 16) & 255)) >> 8
+        image_step = action("wait_image", 0,
+                            search={"x": pixel_x, "y": pixel_y, "width": 8, "height": 8},
+                            template={"width": 8, "height": 8, "pixels": f"{gray:02x}" * 64},
+                            threshold=100, timeout_ms=600)
+        run_case("image-match-before-click", [image_step, mixed[0]], test_pixel_match)
+
+        def test_image_timeout(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find(lambda name: "timed out waiting for" in name, timeout=3)
+            order(start, [])
+
+        different_image = action("wait_image", 0,
+                                 search=image_step["action"]["search"],
+                                 template={"width": 8, "height": 8,
+                                           "pixels": ("00" if gray else "ff") * 64},
+                                 threshold=100, timeout_ms=300)
+        run_case("image-timeout-sends-no-click", [different_image, mixed[0]], test_image_timeout)
+
+        def flow(kind, **fields):
+            return action("flow", 0, operation={"kind": kind, **fields})
+
+        pixel_test = {"point": {"x": pixel_x, "y": pixel_y}, "rgb": rgb,
+                      "tolerance": 0, "different": False}
+        start_click = [("leftDown", "start", 0), ("leftUp", "start", 0)]
+
+        def test_nested_workflow(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed.")
+            order(start, start_click * 2)
+
+        finish_click = action("click", 0, target("finish"), button="Left", count=1)
+        run_case("nested-repeat-branches-and-exit", [
+            flow("repeat", count=2),
+            flow("if", test=pixel_test),
+            flow("repeat", count=3),
+            mixed[0],
+            flow("break_if", test=pixel_test),
+            finish_click,
+            flow("end_repeat"),
+            flow("else"),
+            finish_click,
+            flow("end_if"),
+            flow("end_repeat"),
+        ], test_nested_workflow)
+
+        def test_image_recovery(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed. 1 step skipped. Last skipped: step 2.")
+            order(start, start_click)
+
+        run_case("image-timeout-retries-then-skips", [
+            flow("recover", retries=1, skip=True), different_image, mixed[0],
+        ], test_image_recovery)
+
+        image_if = action("wait_image", 0, **{
+            **{key: value for key, value in different_image["action"].items() if key != "kind"},
+            "output": "if",
+        })
+        run_case("image-absence-takes-else", [
+            image_if, finish_click, flow("else"), mixed[0], flow("end_if"),
+        ], test_pixel_match)
+
+        _, _, button_right, button_bottom = gui.GetWindowRect(fixture["start"])
+        image_x, image_y = button_right - 15, button_bottom - 15
+        dc = gui.GetDC(0)
+        try:
+            sample = [gdi.GetPixel(dc, image_x + x, image_y + y)
+                      for y in range(8) for x in range(8)]
+        finally:
+            gui.ReleaseDC(0, dc)
+        assert 0xFFFFFFFF not in sample
+        color_reference = "".join(f"{p & 255:02x}{(p >> 8) & 255:02x}{(p >> 16) & 255:02x}" for p in sample)
+        click_image = action("wait_image", 0,
+                             search={"x": image_x, "y": image_y, "width": 8, "height": 8},
+                             template={"width": 8, "height": 8, "pixels": color_reference},
+                             threshold=100, timeout_ms=1000, output="click")
+        run_case("unique-image-click-delivers-to-match", [click_image], test_pixel_match)
+        run_case("pixel-tolerance-before-click", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb ^ 0x010101, tolerance=1), mixed[0],
+        ], test_pixel_match)
+        run_case("pixel-different-before-click", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb ^ 0xFFFFFF, tolerance=0, different=True), mixed[0],
+        ], test_pixel_match)
+
+        def test_pixel_stability(find, focus, start, case):
+            focus("start")
+            started = time.perf_counter_ns()
+            windows.tap_key(con.VK_F6)
+            find("Completed.")
+            order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)])
+            assert (events[start][3] - started) / 1_000_000 >= 190
+
+        run_case("pixel-stability-before-click", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb, stable_ms=200), mixed[0],
+        ], test_pixel_stability)
+
+        def test_pixel_timeout(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find(lambda name: "timed out waiting for" in name, timeout=3)
+            order(start, [])
+
+        run_case("pixel-timeout-sends-no-click", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y}, rgb=rgb ^ 0xFFFFFF), mixed[0],
+        ], test_pixel_timeout, target_timeout="0.3")
+
+        def test_pixel_timeout_branch(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed. 1 step skipped. Last skipped: step 2.")
+            order(start, [("leftDown", "finish", 0), ("leftUp", "finish", 0)])
+
+        branch = [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb ^ 0xFFFFFF, skip_next_on_timeout=True),
+            mixed[0], action("click", 0, target("finish"), button="Left", count=1),
+        ]
+        run_case("pixel-timeout-skips-only-next-step", branch, test_pixel_timeout_branch, target_timeout="0.3")
+
+        def test_pixel_match_branch(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed.")
+            order(start, [
+                ("leftDown", "start", 0), ("leftUp", "start", 0),
+                ("leftDown", "finish", 0), ("leftUp", "finish", 0),
+            ])
+
+        run_case("pixel-match-keeps-next-step", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb, skip_next_on_timeout=True),
+            *branch[1:],
+        ], test_pixel_match_branch)
+
+        def test_pixel_check_mismatch(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed. 1 step skipped. Last skipped: step 2.", timeout=3)
+            order(start, [("leftDown", "finish", 0), ("leftUp", "finish", 0)])
+
+        run_case("pixel-check-mismatch-skips-immediately", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb ^ 0xFFFFFF, check_once=True, skip_next_on_mismatch=True),
+            *branch[1:],
+        ], test_pixel_check_mismatch, target_timeout="10")
+
+        run_case("pixel-check-match-keeps-next-step", [
+            action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                   rgb=rgb, check_once=True, skip_next_on_mismatch=True),
+            *branch[1:],
+        ], test_pixel_match_branch)
+
+        def test_pixel_retries_and_skip(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed. 1 step skipped. Last skipped: step 3. 2 click steps were retried.")
+            order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)] * 4)
+
+        retry_condition = action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                                 rgb=rgb ^ 0xFFFFFF, check_once=True,
+                                 skip_next_on_mismatch=True, retry_clicks=2)
+        run_case("pixel-check-retries-before-skip", [
+            mixed[0], retry_condition, action("click", 0, target("finish"), button="Left", count=1), mixed[0],
+        ], test_pixel_retries_and_skip)
+
+        def test_pixel_retry_action_limit(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            find("Completed. 1 click step was retried.")
+            order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)] * 2)
+
+        run_case("pixel-retry-respects-action-limit", [
+            mixed[0], retry_condition, mixed[0],
+        ], test_pixel_retry_action_limit, limited=True, count="2")
+
+        def test_stop_before_pixel_retry(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            windows.wait_for(lambda: len(events) >= start + 2, 2, "The first click was not received.")
+            windows.tap_key(con.VK_F7, modifiers=modifiers)
+            find("Stopped.")
+            order(start, [("leftDown", "start", 0), ("leftUp", "start", 0)])
+
+        run_case("stop-during-pixel-wait-prevents-retry", [
+            mixed[0], action("wait_color", 0, point={"x": pixel_x, "y": pixel_y},
+                             rgb=rgb ^ 0xFFFFFF, retry_clicks=2),
+        ], test_stop_before_pixel_retry)
+
+        def test_pixel_branch_stops(find, focus, start, case):
+            focus("start")
+            windows.tap_key(con.VK_F6)
+            time.sleep(0.12)
+            windows.tap_key(con.VK_F7, modifiers=modifiers)
+            find("Stopped.")
+            order(start, [])
+
+        run_case("stop-during-pixel-condition-does-not-branch", branch, test_pixel_branch_stops)
+
         def test_gate(find, focus, start, case):
             gui.EnableWindow(fixture["finish"], False)
             focus("start")
