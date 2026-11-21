@@ -18,6 +18,8 @@ mod keys;
 #[cfg(target_os = "macos")]
 mod macos;
 mod mouse;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod recording;
 mod settings;
 #[cfg(windows)]
 mod smart_targets;
@@ -28,6 +30,7 @@ mod target_pixels;
 mod targets;
 #[cfg(target_os = "linux")]
 mod wayland;
+mod workflow;
 #[cfg(target_os = "linux")]
 mod x11;
 
@@ -65,8 +68,20 @@ slint::include_modules!();
 
 const CAPTURE_DELAY: Duration = Duration::from_secs(3);
 const DRY_SAMPLE: i32 = 4;
-#[cfg(windows)]
 const CONTROL_CAPTURE: i32 = 5;
+const PIXEL_CAPTURE: i32 = 6;
+const PIXEL_PREVIEW: i32 = 7;
+const IMAGE_CAPTURE: i32 = 8;
+const IMAGE_PREVIEW: i32 = 9;
+const IMAGE_REFERENCE_FIRST: i32 = 10;
+#[cfg(windows)]
+const IMAGE_REFERENCE_SECOND: i32 = 11;
+const IMAGE_SEARCH_FIRST: i32 = 12;
+const IMAGE_SEARCH_SECOND: i32 = 13;
+
+fn image_capture_kind(kind: i32) -> bool {
+    (IMAGE_CAPTURE..=IMAGE_SEARCH_SECOND).contains(&kind)
+}
 const UI_INTERVAL: Duration = Duration::from_millis(80);
 type StopSlot = Arc<Mutex<StopState>>;
 type RunResult = (Instant, Result<Outcome, String>);
@@ -134,6 +149,8 @@ struct State {
     library: Library,
     active_preset: Option<String>,
     pending_preset: Option<String>,
+    pending_import: Option<Settings>,
+    pending_export: Option<(PathBuf, String, Settings)>,
     route_undo: Option<RouteUndo>,
     library_dirty: bool,
     run: Option<Run>,
@@ -147,6 +164,7 @@ struct RouteSnapshot {
     enabled: bool,
     once: bool,
     wayland: bool,
+    recording_origin: recording::Origin,
 }
 
 impl RouteSnapshot {
@@ -156,6 +174,7 @@ impl RouteSnapshot {
             enabled: settings.route_enabled,
             once: settings.route_once,
             wayland: settings.route_wayland,
+            recording_origin: settings.recording_origin,
         }
     }
 
@@ -164,6 +183,7 @@ impl RouteSnapshot {
         settings.route_enabled = self.enabled;
         settings.route_once = self.once;
         settings.route_wayland = self.wayland;
+        settings.recording_origin = self.recording_origin;
     }
 
     fn matches(&self, settings: &Settings) -> bool {
@@ -171,6 +191,7 @@ impl RouteSnapshot {
             && self.enabled == settings.route_enabled
             && self.once == settings.route_once
             && self.wayland == settings.route_wayland
+            && self.recording_origin == settings.recording_origin
     }
 }
 
@@ -250,6 +271,177 @@ fn new_preset(library: &Library, name: &str, settings: &Settings) -> Result<Libr
     Ok(library)
 }
 
+#[cfg(windows)]
+fn capture_pixel_value(
+    point: Option<Point>,
+    on_monitor: impl FnOnce(Point) -> bool,
+    read_pixel: impl FnOnce(Point) -> Option<u32>,
+) -> Option<String> {
+    let point = point.filter(|point| on_monitor(*point))?;
+    let rgb = read_pixel(point)?;
+    Some(format!("{}, {}, #{:06X}", point.x, point.y, rgb))
+}
+
+#[cfg(windows)]
+fn preview_pixel_condition(
+    value: &str,
+    tolerance: &str,
+    different: bool,
+    on_monitor: impl FnOnce(Point) -> bool,
+    read_pixel: impl FnOnce(Point) -> Option<u32>,
+) -> Result<String, &'static str> {
+    let (point, expected) = targets::parse_pixel(value).ok_or("Enter a pixel as x, y, #RRGGBB.")?;
+    let tolerance = tolerance
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| "Set pixel tolerance from 0 to 255.")?;
+    if different && tolerance == 255 {
+        return Err("Different requires a tolerance below 255.");
+    }
+    if !on_monitor(point) {
+        return Err("The pixel is outside your displays.");
+    }
+    let actual = read_pixel(point).ok_or("The screen pixel could not be read.")?;
+    let matched = target_pixels::pixel_condition_matches(actual, expected, tolerance, different);
+    Ok(format!(
+        "Sampled ({}, {}): #{actual:06X}. Condition {} at preview time.",
+        point.x,
+        point.y,
+        if matched { "matches" } else { "does not match" }
+    ))
+}
+
+fn import_preview(preset: &Settings) -> String {
+    let mut normalized = preset.clone();
+    normalized.normalize();
+    let mut summary = preset_preview(preset);
+    if normalized != *preset {
+        summary
+            .push_str("\nSome settings will be adjusted when loaded. Review them before starting.");
+    }
+    match Binding::parse(&normalized.trigger) {
+        None => summary.push_str("\nCheck the activation shortcut on this computer."),
+        Some(binding) => {
+            if let Err(issue) = automation::validated_schedule(&normalized, Some(binding)) {
+                summary.push_str(&format!("\nCheck before starting: {}", issue.message));
+            }
+        }
+    }
+    summary.push_str("\nTargets and shortcut availability may differ on this computer.");
+    summary
+}
+
+fn review_fingerprint(patch: &targets::Patch) -> Option<slint::Image> {
+    let bytes = patch.0.as_bytes();
+    if bytes.len() != 20 * 12 * 2 {
+        return None;
+    }
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(20, 12);
+    for (pixel, pair) in buffer
+        .make_mut_slice()
+        .iter_mut()
+        .zip(bytes.as_chunks::<2>().0)
+    {
+        let high = char::from(pair[0]).to_digit(16)? as u8;
+        let low = char::from(pair[1]).to_digit(16)? as u8;
+        let value = high * 16 + low;
+        *pixel = slint::Rgb8Pixel {
+            r: value,
+            g: value,
+            b: value,
+        };
+    }
+    Some(slint::Image::from_rgb8(buffer))
+}
+
+fn review_image_template(template: &targets::ImageTemplate) -> Option<slint::Image> {
+    if !template.valid() {
+        return None;
+    }
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(
+        template.width.into(),
+        template.height.into(),
+    );
+    let channels = if template.is_color() { 3 } else { 1 };
+    for (pixel, bytes) in buffer
+        .make_mut_slice()
+        .iter_mut()
+        .zip(template.pixels.as_bytes().chunks_exact(2 * channels))
+    {
+        let decode = |offset: usize| -> Option<u8> {
+            Some(
+                (char::from(bytes[offset]).to_digit(16)? * 16
+                    + char::from(bytes[offset + 1]).to_digit(16)?) as u8,
+            )
+        };
+        let r = decode(0)?;
+        let (g, b) = if channels == 3 {
+            (decode(2)?, decode(4)?)
+        } else {
+            (r, r)
+        };
+        *pixel = slint::Rgb8Pixel { r, g, b };
+    }
+    Some(slint::Image::from_rgb8(buffer))
+}
+
+fn share_review_items(preset: &Settings) -> Result<Vec<ShareReviewItem>, String> {
+    let mut value = serde_json::to_value(preset).map_err(|error| error.to_string())?;
+    let route = value
+        .as_object_mut()
+        .and_then(|object| object.remove("route"))
+        .and_then(|value| value.as_array().cloned())
+        .ok_or("Could not inspect the preset route.")?;
+    let mut items = Vec::with_capacity(route.len() + 1);
+    items.push(ShareReviewItem {
+        title: "All settings except route".into(),
+        details: serde_json::to_string_pretty(&value)
+            .map_err(|error| error.to_string())?
+            .into(),
+        ..Default::default()
+    });
+    for (index, (step, data)) in preset.route.iter().zip(route.iter()).enumerate() {
+        let visual = step
+            .control()
+            .and_then(|control| control.selector.visual.as_ref());
+        let image_template = match step {
+            Step::Action(action) => match &action.action {
+                targets::Action::WaitImage { template, .. } => Some(template),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (target, landmark, status) = match visual {
+            Some(visual) => {
+                let target = review_fingerprint(&visual.target);
+                let landmark = review_fingerprint(&visual.landmark);
+                let status = if target.is_some() && landmark.is_some() {
+                    "Two saved 20 × 12 grayscale fingerprints. Their full data is shown above."
+                } else {
+                    "A fingerprint is malformed and cannot be displayed. Its full data remains in the JSON."
+                };
+                (target, landmark, status)
+            }
+            None => (None, None, ""),
+        };
+        items.push(ShareReviewItem {
+            title: format!("Route step {} of {}", index + 1, route.len()).into(),
+            details: serde_json::to_string_pretty(data)
+                .map_err(|error| error.to_string())?
+                .into(),
+            has_visual: visual.is_some(),
+            visual_status: status.into(),
+            target_image: target.unwrap_or_default(),
+            landmark_image: landmark.unwrap_or_default(),
+            has_image_template: image_template.is_some(),
+            image_template: image_template
+                .and_then(review_image_template)
+                .unwrap_or_default(),
+        });
+    }
+    Ok(items)
+}
+
 #[derive(Clone, Copy)]
 struct Capture {
     deadline: Instant,
@@ -263,6 +455,7 @@ struct Controller {
     own: RcWeak<Self>,
     state: RefCell<State>,
     stop_slot: StopSlot,
+    recording_stop: Arc<recording::RecordingStop>,
     path: Option<PathBuf>,
     tick: Timer,
     save_timer: Timer,
@@ -275,6 +468,14 @@ struct Controller {
     target_proposals: RefCell<Vec<Option<smart_targets::Target>>>,
     #[cfg(windows)]
     shell: RefCell<Option<DesktopShell>>,
+    #[cfg(windows)]
+    recorder: RefCell<Option<recording::windows::Service>>,
+    #[cfg(target_os = "linux")]
+    recorder: RefCell<Option<recording::x11::Service>>,
+    #[cfg(target_os = "macos")]
+    recorder: RefCell<Option<recording::macos::Service>>,
+    recorded: RefCell<Vec<recording::Entry>>,
+    recording_timer: Timer,
     #[cfg(not(target_os = "macos"))]
     input_filter: RefCell<Option<input_filter::InputFilter>>,
 }
@@ -405,6 +606,7 @@ fn acquire_windows_instance() -> io::Result<Option<OwnedHandle>> {
 
 fn run_app(app: App) -> Result<(), Box<dyn Error>> {
     let stop_slot = StopSlot::default();
+    let recording_stop = Arc::new(recording::RecordingStop::default());
     let path = settings::path();
     let (mut settings, recovered_settings, settings_error) =
         load_store::<Settings>(path.as_deref());
@@ -421,7 +623,7 @@ fn run_app(app: App) -> Result<(), Box<dyn Error>> {
         ""
     };
     settings.normalize();
-    let hotkeys = connect_shortcuts(stop_slot.clone(), &settings.trigger)?;
+    let hotkeys = connect_shortcuts(stop_slot.clone(), recording_stop.clone(), &settings.trigger)?;
 
     let controller = Rc::new_cyclic(|own| Controller {
         app: app.as_weak(),
@@ -433,6 +635,8 @@ fn run_app(app: App) -> Result<(), Box<dyn Error>> {
             library,
             active_preset: None,
             pending_preset: None,
+            pending_import: None,
+            pending_export: None,
             route_undo: None,
             library_dirty: recovered_library,
             run: None,
@@ -440,6 +644,7 @@ fn run_app(app: App) -> Result<(), Box<dyn Error>> {
             pad_hits: 0,
         }),
         stop_slot,
+        recording_stop,
         path,
         tick: Timer::default(),
         save_timer: Timer::default(),
@@ -452,6 +657,9 @@ fn run_app(app: App) -> Result<(), Box<dyn Error>> {
         target_proposals: RefCell::new(Vec::new()),
         #[cfg(windows)]
         shell: RefCell::new(None),
+        recorder: RefCell::new(None),
+        recorded: RefCell::new(Vec::new()),
+        recording_timer: Timer::default(),
         #[cfg(not(target_os = "macos"))]
         input_filter: RefCell::new(None),
     });
@@ -500,7 +708,11 @@ thread_local! {
     static ACTIVE_CONTROLLER: RefCell<RcWeak<Controller>> = const { RefCell::new(RcWeak::new()) };
 }
 
-fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys> {
+fn connect_shortcuts(
+    stop_slot: StopSlot,
+    recording_stop: Arc<recording::RecordingStop>,
+    preferred: &str,
+) -> io::Result<Hotkeys> {
     Hotkeys::start(preferred, move |action| {
         let interrupted = match action {
             Action::Toggle(_, requested_at) => {
@@ -508,11 +720,15 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                 slot.cancelled(requested_at) || slot.signal()
             }
             Action::Stop(stopped_at) => {
+                recording_stop.request(stopped_at);
                 let mut slot = stop_slot.lock().unwrap();
                 slot.last_emergency = slot.last_emergency.max(Some(stopped_at));
                 slot.signal()
             }
-            Action::Unavailable => signal_stop(&stop_slot),
+            Action::Unavailable => {
+                recording_stop.request(hotkeys::tick_count());
+                signal_stop(&stop_slot)
+            }
             #[cfg(target_os = "linux")]
             Action::PortalChanged => signal_stop(&stop_slot),
             #[cfg(target_os = "linux")]
@@ -534,9 +750,18 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                         controller.toggle_with(&ui, Some(binding), requested_at)
                     }
                     Action::Toggle(..) => controller.refresh(&ui),
-                    Action::Stop(_) => controller.refresh(&ui),
+                    Action::Stop(_) => {
+                        if matches!(ui.get_recording_state(), 1 | 2) {
+                            controller.recording_action(&ui, 3);
+                        }
+                        controller.refresh(&ui)
+                    }
                     Action::Capture(point, requested_at)
-                        if !interrupted && !ui.get_active() && ui.get_page() != 4 =>
+                        if !interrupted
+                            && !ui.get_active()
+                            && ui.get_page() != 4
+                            && ui.get_recording_state() != 1
+                            && ui.get_recording_state() != 2 =>
                     {
                         controller.capture_shortcut(&ui, point, requested_at)
                     }
@@ -548,6 +773,9 @@ fn connect_shortcuts(stop_slot: StopSlot, preferred: &str) -> io::Result<Hotkeys
                         controller.refresh(&ui);
                     }
                     Action::Unavailable => {
+                        if matches!(ui.get_recording_state(), 1 | 2) {
+                            controller.recording_action(&ui, 3);
+                        }
                         ui.set_can_start(false);
                         ui.set_has_toggle(false);
                         ui.set_toggle_key("—".into());
@@ -572,6 +800,9 @@ fn signal_stop(slot: &StopSlot) -> bool {
 impl Controller {
     fn wire(self: &Rc<Self>, ui: &App, load_notice: &str) {
         ui.set_smart_targets_available(cfg!(windows));
+        ui.set_recording_available(recording::current_origin().is_some());
+        ui.set_recording_windows(cfg!(windows));
+        ui.set_recording_macos(cfg!(target_os = "macos"));
         {
             let state = self.state.borrow();
             self.display_settings(ui, &state.settings);
@@ -602,13 +833,12 @@ impl Controller {
         bind!(on_reset_pad, reset_pad);
         bind!(on_apply_shortcut, apply_shortcut);
         bind!(on_edit_route, edit_route, operation);
+        bind!(on_recording_action, recording_action, operation);
         bind!(on_move_route_to, move_route_to);
         bind!(on_undo_route_removal, undo_route_removal);
         #[cfg(windows)]
         bind!(on_toggle_target_verification, toggle_target_verification);
-        #[cfg(windows)]
         bind!(on_edit_step, edit_step, index);
-        #[cfg(windows)]
         bind!(on_save_step, save_step);
         #[cfg(windows)]
         bind!(on_repair_target, repair_target);
@@ -888,7 +1118,8 @@ impl Controller {
         ui.set_low_cpu(settings.low_cpu);
         ui.set_route_enabled(settings.route_enabled);
         ui.set_route_once(settings.route_once);
-        ui.set_delay(settings.delay_seconds.into());
+        ui.set_route_iterations(settings.route_iterations.as_str().into());
+        ui.set_delay(settings.delay_seconds as i32);
         ui.set_interval_unit(settings.unit.into());
         ui.set_edge_mode(settings.edge_mode.into());
         ui.set_process_mode(settings.process_mode.into());
@@ -933,7 +1164,8 @@ impl Controller {
         settings.low_cpu = ui.get_low_cpu();
         settings.route_enabled = ui.get_route_enabled();
         settings.route_once = ui.get_route_once();
-        settings.delay_seconds = ui.get_delay() as u8;
+        settings.route_iterations = ui.get_route_iterations().to_string();
+        settings.delay_seconds = ui.get_delay().max(0) as u32;
         settings.unit = ui.get_interval_unit() as u8;
         settings.edge_mode = ui.get_edge_mode() as u8;
         settings.process_mode = ui.get_process_mode() as u8;
@@ -1007,6 +1239,17 @@ impl Controller {
             .map(|(i, step)| format!("{}. {}", i + 1, step.label()).into())
             .collect();
         ui.set_route_smart(settings.route.iter().any(Step::is_smart));
+        ui.set_route_recorded(settings.has_recording());
+        ui.set_recording_windows(if settings.has_recording() {
+            settings.recording_origin == recording::Origin::Windows
+        } else {
+            cfg!(windows)
+        });
+        ui.set_recording_macos(if settings.has_recording() {
+            settings.recording_origin == recording::Origin::Macos
+        } else {
+            cfg!(target_os = "macos")
+        });
         ui.set_route_control_rows(slint::ModelRc::new(slint::VecModel::from(
             settings
                 .route
@@ -1179,7 +1422,204 @@ impl Controller {
         self.queue_save();
     }
 
-    #[cfg(windows)]
+    fn recording_action(&self, ui: &App, operation: i32) {
+        use recording::CaptureOptions;
+        use targets::{Action, ActionStep};
+        match operation {
+            0 => {
+                if ui.get_active()
+                    || ui.get_capturing()
+                    || ui.get_step_editing()
+                    || ui.get_preset_load_open()
+                    || self.recorder.borrow().is_some()
+                {
+                    return;
+                }
+                if !ui.get_can_start() || !self.hotkeys.listening() {
+                    failure(
+                        ui,
+                        "The emergency stop shortcut is unavailable. Restore it before recording.",
+                    );
+                    return;
+                }
+                let options = CaptureOptions {
+                    movement: ui.get_record_movement(),
+                    buttons: ui.get_record_buttons(),
+                    keys: ui.get_record_keys(),
+                };
+                if !options.movement && !options.buttons && !options.keys {
+                    failure(ui, "Choose at least one input type to record.");
+                    return;
+                }
+                let binding = self.hotkeys.toggle_binding();
+                self.recording_stop.reset();
+                #[cfg(windows)]
+                let mut reserved_keys = vec![u32::from(keys::F7), u32::from(keys::F8)];
+                #[cfg(windows)]
+                if let Some(binding) = binding {
+                    reserved_keys.push(u32::from(binding.vk));
+                }
+                #[cfg(windows)]
+                let reserved_buttons = Button::ALL
+                    .into_iter()
+                    .filter(|button| binding.is_some_and(|binding| binding.matches_button(*button)))
+                    .collect();
+                #[cfg(windows)]
+                let started = recording::windows::Service::start(
+                    options,
+                    reserved_keys,
+                    reserved_buttons,
+                    self.recording_stop.clone(),
+                );
+                #[cfg(target_os = "linux")]
+                let started =
+                    recording::x11::Service::start(options, binding, self.recording_stop.clone());
+                #[cfg(target_os = "macos")]
+                let started =
+                    recording::macos::Service::start(options, binding, self.recording_stop.clone());
+                match started {
+                    Ok(service) => {
+                        if self.recording_stop.timestamp().is_some() {
+                            drop(service);
+                            status(ui, "Recording cancelled by the emergency stop.");
+                            return;
+                        }
+                        *self.recorder.borrow_mut() = Some(service);
+                        self.recorded.borrow_mut().clear();
+                        ui.set_recorded_count(0);
+                        ui.set_recording_state(1);
+                        let controller = self.own.clone();
+                        self.recording_timer.start(TimerMode::Repeated, UI_INTERVAL, move || {
+                            if let Some(controller) = controller.upgrade() && let Some(ui) = controller.app.upgrade() {
+                                let progress = controller.recorder.borrow().as_ref().map(|recorder| recorder.count());
+                                #[cfg(any(windows, target_os = "linux"))]
+                                let progress = progress.map(|(count, limit, stopped)| (count, limit, stopped, false));
+                                if let Some((count, limit, stopped, secure_pause)) = progress {
+                                    ui.set_recorded_count(count as i32);
+                                    if limit || stopped {
+                                        controller.recording_action(&ui, 3);
+                                        status(&ui, if limit { "Recording stopped at the event limit. Review the timeline before using it." } else { "The recording listener stopped. Review the timeline." });
+                                    } else if secure_pause && ui.get_recording_state() == 1 {
+                                        ui.set_recording_state(2);
+                                        status(&ui, "Recording paused while macOS Secure Input is active.");
+                                    }
+                                }
+                            }
+                        });
+                        status(
+                            ui,
+                            "Recording. Pause before entering sensitive information.",
+                        );
+                    }
+                    Err(error) => failure(ui, &format!("Could not start recording ({error}).")),
+                }
+            }
+            1 if ui.get_recording_state() == 1 => {
+                if let Some(recorder) = self.recorder.borrow().as_ref() {
+                    recorder.pause();
+                }
+                ui.set_recording_state(2);
+                status(ui, "Recording paused.");
+            }
+            2 if ui.get_recording_state() == 2 => {
+                if let Some(recorder) = self.recorder.borrow().as_ref()
+                    && let Err(error) = recorder.resume()
+                {
+                    failure(ui, &format!("Could not resume recording ({error})."));
+                    return;
+                }
+                ui.set_recording_state(1);
+                status(ui, "Recording resumed.");
+            }
+            3 => {
+                self.recording_stop.request(hotkeys::tick_count());
+                let service = self.recorder.borrow_mut().take();
+                if let Some(service) = service {
+                    self.recording_timer.stop();
+                    let entries = service.finish();
+                    ui.set_recorded_count(entries.len() as i32);
+                    *self.recorded.borrow_mut() = entries;
+                    ui.set_recording_state(3);
+                    status(
+                        ui,
+                        "Recording stopped. Replace the route to edit and play it.",
+                    );
+                }
+            }
+            4 if ui.get_recording_state() == 3
+                && !ui.get_active()
+                && !ui.get_capturing()
+                && !ui.get_step_editing() =>
+            {
+                let recorded = self.recorded.borrow();
+                if recorded.is_empty() {
+                    failure(ui, "The recording has no events.");
+                    return;
+                }
+                let Some(origin) = recording::current_origin() else {
+                    failure(ui, "Recording is unavailable on this desktop.");
+                    return;
+                };
+                if let Err(error) = recording::validate_for(&recorded, origin) {
+                    failure(ui, error);
+                    return;
+                }
+                let mut steps = Vec::with_capacity(recorded.len());
+                for entry in recorded.iter() {
+                    let Ok(delay_ms) = u32::try_from(entry.delay_ms) else {
+                        failure(ui, "A recorded delay is too long.");
+                        return;
+                    };
+                    let step = ActionStep {
+                        action: Action::Recorded {
+                            event: entry.event.clone(),
+                        },
+                        target: None,
+                        delay_ms,
+                    };
+                    if let Err(error) =
+                        automation::validate_action(&step, self.hotkeys.toggle_binding())
+                    {
+                        failure(ui, error);
+                        return;
+                    }
+                    steps.push(Step::Action(Box::new(step)));
+                }
+                let mut state = self.state.borrow_mut();
+                state.route_undo = None;
+                state.settings.route = steps;
+                state.settings.route_enabled = true;
+                state.settings.route_once = true;
+                state.settings.route_radius = "0".into();
+                state.settings.route_wayland = false;
+                state.settings.recording_origin = origin;
+                ui.set_route_enabled(true);
+                ui.set_route_once(true);
+                ui.set_route_radius("0".into());
+                ui.set_route_index(0);
+                Self::display_points(ui, &state.settings, state.zone_origin);
+                self.update_configuration(ui, &state.settings);
+                drop(state);
+                drop(recorded);
+                self.recorded.borrow_mut().clear();
+                ui.set_recording_state(0);
+                ui.set_recorded_count(0);
+                status(
+                    ui,
+                    "Recording added to the route. Review it before playback.",
+                );
+                self.queue_save();
+            }
+            5 if ui.get_recording_state() == 3 => {
+                self.recorded.borrow_mut().clear();
+                ui.set_recorded_count(0);
+                ui.set_recording_state(0);
+                status(ui, "Recording discarded.");
+            }
+            _ => {}
+        }
+    }
+
     fn edit_step(&self, ui: &App, index: i32) {
         use targets::Action;
         if ui.get_active() || ui.get_capturing() {
@@ -1192,11 +1632,83 @@ impl Controller {
         if index >= 0 && step.is_none() {
             return;
         }
+        ui.set_step_recorded(false);
+        if let Some(Step::Action(step)) = step
+            && let targets::Action::Recorded { event } = &step.action
+        {
+            use recording::Event;
+            ui.set_step_recorded(true);
+            ui.set_step_edit_index(index);
+            ui.set_step_has_target(false);
+            ui.set_step_control_target(false);
+            ui.set_step_inherits(false);
+            ui.set_step_kind(0);
+            ui.set_step_delay(step.delay_ms.to_string().into());
+            match event {
+                Event::Move(point) => {
+                    ui.set_recorded_kind(0);
+                    ui.set_recorded_x(point.x.to_string().into());
+                    ui.set_recorded_y(point.y.to_string().into());
+                }
+                Event::Scroll {
+                    point,
+                    horizontal,
+                    delta,
+                } => {
+                    ui.set_recorded_kind(3);
+                    ui.set_recorded_x(point.x.to_string().into());
+                    ui.set_recorded_y(point.y.to_string().into());
+                    ui.set_step_direction(i32::from(*horizontal));
+                    ui.set_step_count(delta.to_string().into());
+                }
+                Event::Button {
+                    button,
+                    down,
+                    point,
+                } => {
+                    ui.set_recorded_kind(1);
+                    ui.set_step_button(button.index());
+                    ui.set_recorded_down(*down);
+                    ui.set_recorded_x(point.x.to_string().into());
+                    ui.set_recorded_y(point.y.to_string().into());
+                }
+                Event::Key {
+                    code,
+                    extended,
+                    down,
+                } => {
+                    ui.set_recorded_kind(2);
+                    ui.set_recorded_key(code.to_string().into());
+                    ui.set_recorded_extended(*extended);
+                    ui.set_recorded_down(*down);
+                }
+            }
+            ui.set_step_error("".into());
+            ui.set_step_edited(false);
+            ui.set_step_editing(true);
+            ui.invoke_reveal_step_editor();
+            return;
+        }
         let mut delay = 0;
         let mut count = 1;
         let mut button = 0;
         let mut direction = 0;
-        let mut key = "Enter";
+        let mut key = "Enter".to_owned();
+        let mut pixel_tolerance = 0u8;
+        let mut pixel_different = false;
+        let mut pixel_stable_ms = 0u32;
+        let mut pixel_skip_next = false;
+        let mut pixel_check_once = false;
+        let mut pixel_retry_clicks = 0u8;
+        let mut image_search = "0, 0, 320, 240".to_owned();
+        let mut image_template = String::new();
+        let mut image_threshold = 90u8;
+        let mut image_timeout = 10_000u32;
+        let mut image_output = targets::ImageOutput::Wait;
+        let mut image_scaled = false;
+        let mut flow_kind = 0;
+        let mut flow_count = 2;
+        let mut flow_skip = false;
         let kind = match step {
             Some(Step::Action(step)) => {
                 delay = step.delay_ms;
@@ -1219,9 +1731,82 @@ impl Controller {
                         2
                     }
                     Action::Key { key: selected } => {
-                        key = selected;
+                        key = selected.clone();
                         3
                     }
+                    Action::Text { text } => {
+                        key = text.clone();
+                        4
+                    }
+                    Action::WaitImage {
+                        search,
+                        template,
+                        threshold,
+                        timeout_ms,
+                        output,
+                        scaled,
+                    } => {
+                        image_search = format!(
+                            "{}, {}, {}, {}",
+                            search.x, search.y, search.width, search.height
+                        );
+                        image_template = serde_json::to_string(template).unwrap_or_default();
+                        image_threshold = *threshold;
+                        image_timeout = *timeout_ms;
+                        image_output = *output;
+                        image_scaled = *scaled;
+                        6
+                    }
+                    Action::WaitColor {
+                        point,
+                        rgb,
+                        tolerance,
+                        different,
+                        stable_ms,
+                        skip_next_on_timeout,
+                        check_once,
+                        skip_next_on_mismatch,
+                        retry_clicks,
+                    } => {
+                        key = format!("{},{},#{:06X}", point.x, point.y, rgb);
+                        pixel_tolerance = *tolerance;
+                        pixel_different = *different;
+                        pixel_stable_ms = *stable_ms;
+                        pixel_check_once = *check_once;
+                        pixel_retry_clicks = *retry_clicks;
+                        pixel_skip_next = if *check_once {
+                            *skip_next_on_mismatch
+                        } else {
+                            *skip_next_on_timeout
+                        };
+                        5
+                    }
+                    Action::Flow { operation } => {
+                        use workflow::Operation;
+                        if let Operation::If { test } | Operation::BreakIf { test } = operation {
+                            key = format!("{}, {}, #{:06X}", test.point.x, test.point.y, test.rgb);
+                            pixel_tolerance = test.tolerance;
+                            pixel_different = test.different;
+                        }
+                        flow_kind = match operation {
+                            Operation::If { .. } => 0,
+                            Operation::Else => 1,
+                            Operation::EndIf => 2,
+                            Operation::Repeat { count } => {
+                                flow_count = *count;
+                                3
+                            }
+                            Operation::EndRepeat => 4,
+                            Operation::BreakIf { .. } => 5,
+                            Operation::Recover { retries, skip } => {
+                                flow_count = (*retries).into();
+                                flow_skip = *skip;
+                                6
+                            }
+                        };
+                        7
+                    }
+                    Action::Recorded { .. } => unreachable!(),
                 }
             }
             Some(_) => {
@@ -1256,13 +1841,43 @@ impl Controller {
         ui.set_step_button(button);
         ui.set_step_direction(direction);
         ui.set_step_key(key.into());
+        ui.set_step_pixel_preview("".into());
+        ui.set_step_image_capture_rect("0, 0, 32, 32".into());
+        ui.set_step_image_search(image_search.into());
+        ui.set_step_image_template(image_template.into());
+        if let Ok(template) =
+            serde_json::from_str::<targets::ImageTemplate>(&ui.get_step_image_template())
+        {
+            ui.set_step_image_reference_image(review_image_template(&template).unwrap_or_default());
+        } else {
+            ui.set_step_image_reference_image(Default::default());
+        }
+        ui.set_step_image_has_match(false);
+        ui.set_step_image_threshold(image_threshold.to_string().into());
+        ui.set_step_image_timeout(image_timeout.to_string().into());
+        ui.set_step_image_preview("".into());
+        ui.set_step_image_output(match image_output {
+            targets::ImageOutput::Wait => 0,
+            targets::ImageOutput::Move => 1,
+            targets::ImageOutput::Click => 2,
+            targets::ImageOutput::If => 3,
+        });
+        ui.set_step_image_scaled(image_scaled);
+        ui.set_step_flow_kind(flow_kind);
+        ui.set_step_flow_count(flow_count.to_string().into());
+        ui.set_step_flow_skip(flow_skip);
+        ui.set_step_pixel_tolerance(pixel_tolerance.to_string().into());
+        ui.set_step_pixel_different(pixel_different);
+        ui.set_step_pixel_stable(pixel_stable_ms.to_string().into());
+        ui.set_step_pixel_skip_next(pixel_skip_next);
+        ui.set_step_pixel_check_once(pixel_check_once);
+        ui.set_step_pixel_retries(pixel_retry_clicks.to_string().into());
         ui.set_step_error("".into());
         ui.set_step_edited(false);
         ui.set_step_editing(true);
         ui.invoke_reveal_step_editor();
     }
 
-    #[cfg(windows)]
     fn save_step(&self, ui: &App) {
         use targets::{Action, ActionStep, Destination, Direction};
         if !ui.get_step_editing() || ui.get_active() || ui.get_capturing() {
@@ -1273,7 +1888,87 @@ impl Controller {
         let index = usize::try_from(ui.get_step_edit_index()).ok();
         let existing = index.and_then(|index| settings.route.get(index));
         let target = existing.and_then(Step::destination);
-        let result = if ui.get_step_inherits() {
+        let result = if ui.get_step_recorded() {
+            (|| {
+                let existing = existing.ok_or("The recorded step no longer exists.")?;
+                if !matches!(existing, Step::Action(step) if matches!(step.action, Action::Recorded { .. }))
+                {
+                    return Err("The recorded step no longer exists.");
+                }
+                let delay_ms = ui
+                    .get_step_delay()
+                    .trim()
+                    .parse()
+                    .map_err(|_| "Enter a whole delay in milliseconds.")?;
+                let point = || -> Result<Point, &'static str> {
+                    Ok(Point {
+                        x: ui
+                            .get_recorded_x()
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Enter a whole X coordinate.")?,
+                        y: ui
+                            .get_recorded_y()
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Enter a whole Y coordinate.")?,
+                    })
+                };
+                let event = match ui.get_recorded_kind() {
+                    0 => recording::Event::Move(point()?),
+                    1 => recording::Event::Button {
+                        button: Button::from_index(ui.get_step_button()),
+                        down: ui.get_recorded_down(),
+                        point: point()?,
+                    },
+                    2 => recording::Event::Key {
+                        code: ui
+                            .get_recorded_key()
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Enter a whole native key code.")?,
+                        extended: ui.get_recorded_extended(),
+                        down: ui.get_recorded_down(),
+                    },
+                    3 => recording::Event::Scroll {
+                        point: point()?,
+                        horizontal: ui.get_step_direction() == 1,
+                        delta: ui
+                            .get_step_count()
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Enter a whole scroll amount.")?,
+                    },
+                    _ => return Err("The recorded event type is invalid."),
+                };
+                let step = ActionStep {
+                    target: None,
+                    action: Action::Recorded { event },
+                    delay_ms,
+                };
+                if let Action::Recorded {
+                    event: event @ recording::Event::Scroll { .. },
+                } = &step.action
+                {
+                    recording::validate_for(
+                        &[recording::Entry {
+                            delay_ms: 0,
+                            event: event.clone(),
+                        }],
+                        settings.recording_origin,
+                    )?;
+                }
+                if let Action::Recorded {
+                    event: recording::Event::Key { code, extended, .. },
+                } = &step.action
+                    && !recording::valid_key_code(settings.recording_origin, *code, *extended)
+                {
+                    return Err("The recorded key code is invalid for this desktop.");
+                }
+                automation::validate_action(&step, self.hotkeys.toggle_binding())?;
+                Ok(Step::Action(Box::new(step)))
+            })()
+        } else if ui.get_step_inherits() {
             match target {
                 Some(Destination::Point(point)) => Ok(Step::Point(point)),
                 Some(Destination::Control(control)) => Ok(Step::Control(control)),
@@ -1281,11 +1976,14 @@ impl Controller {
             }
         } else {
             (|| {
-                let delay_ms = ui
-                    .get_step_delay()
-                    .trim()
-                    .parse()
-                    .map_err(|_| "Enter a whole delay in milliseconds.")?;
+                let delay_ms = if ui.get_step_kind() == 7 {
+                    0
+                } else {
+                    ui.get_step_delay()
+                        .trim()
+                        .parse()
+                        .map_err(|_| "Enter a whole delay in milliseconds.")?
+                };
                 let count = || {
                     ui.get_step_count()
                         .trim()
@@ -1302,9 +2000,118 @@ impl Controller {
                         direction: Direction::from_index(ui.get_step_direction()),
                         ticks: count()?,
                     },
-                    _ => Action::Key {
+                    3 => Action::Key {
                         key: ui.get_step_key().trim().to_owned(),
                     },
+                    4 => Action::Text {
+                        text: ui.get_step_key().to_string(),
+                    },
+                    5 => {
+                        let (point, rgb) = targets::parse_pixel(&ui.get_step_key())
+                            .ok_or("Enter a pixel as x, y, #RRGGBB.")?;
+                        let tolerance = ui
+                            .get_step_pixel_tolerance()
+                            .trim()
+                            .parse::<u8>()
+                            .map_err(|_| "Set pixel tolerance from 0 to 255.")?;
+                        let stable_ms = ui
+                            .get_step_pixel_stable()
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| "Set pixel stability from 0 to 60,000 ms.")?;
+                        let check_once = ui.get_step_pixel_check_once();
+                        let retry_clicks = ui
+                            .get_step_pixel_retries()
+                            .trim()
+                            .parse::<u8>()
+                            .map_err(|_| "Set click retries from 0 to 10.")?;
+                        Action::WaitColor {
+                            point,
+                            rgb,
+                            tolerance,
+                            different: ui.get_step_pixel_different(),
+                            stable_ms,
+                            skip_next_on_timeout: !check_once && ui.get_step_pixel_skip_next(),
+                            check_once,
+                            skip_next_on_mismatch: check_once && ui.get_step_pixel_skip_next(),
+                            retry_clicks,
+                        }
+                    }
+                    6 => {
+                        let search = targets::parse_image_rect(&ui.get_step_image_search())
+                            .ok_or("Enter search region as x, y, width, height.")?;
+                        let template = serde_json::from_str(&ui.get_step_image_template())
+                            .map_err(|_| "Capture a reference image first.")?;
+                        let threshold = ui
+                            .get_step_image_threshold()
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Enter an image threshold from 70 to 100%.")?;
+                        let timeout_ms = ui
+                            .get_step_image_timeout()
+                            .trim()
+                            .parse()
+                            .map_err(|_| "Enter an image timeout in milliseconds.")?;
+                        let output = match ui.get_step_image_output() {
+                            1 => targets::ImageOutput::Move,
+                            2 => targets::ImageOutput::Click,
+                            3 => targets::ImageOutput::If,
+                            _ => targets::ImageOutput::Wait,
+                        };
+                        Action::WaitImage {
+                            search,
+                            template,
+                            threshold,
+                            timeout_ms,
+                            output,
+                            scaled: ui.get_step_image_scaled(),
+                        }
+                    }
+                    _ => {
+                        use workflow::{Operation, PixelTest};
+                        let pixel_test = || -> Result<PixelTest, &'static str> {
+                            let (point, rgb) = targets::parse_pixel(&ui.get_step_key())
+                                .ok_or("Enter a pixel as x, y, #RRGGBB.")?;
+                            let tolerance = ui
+                                .get_step_pixel_tolerance()
+                                .trim()
+                                .parse()
+                                .map_err(|_| "Set pixel tolerance from 0 to 255.")?;
+                            Ok(PixelTest {
+                                point,
+                                rgb,
+                                tolerance,
+                                different: ui.get_step_pixel_different(),
+                            })
+                        };
+                        let operation = match ui.get_step_flow_kind() {
+                            0 => Operation::If {
+                                test: pixel_test()?,
+                            },
+                            1 => Operation::Else,
+                            2 => Operation::EndIf,
+                            3 => Operation::Repeat {
+                                count: ui
+                                    .get_step_flow_count()
+                                    .trim()
+                                    .parse()
+                                    .map_err(|_| "Enter a repeat count from 1 to 1,000.")?,
+                            },
+                            4 => Operation::EndRepeat,
+                            5 => Operation::BreakIf {
+                                test: pixel_test()?,
+                            },
+                            _ => Operation::Recover {
+                                retries: ui
+                                    .get_step_flow_count()
+                                    .trim()
+                                    .parse()
+                                    .map_err(|_| "Set retries from 0 to 10.")?,
+                                skip: ui.get_step_flow_skip(),
+                            },
+                        };
+                        Action::Flow { operation }
+                    }
                 };
                 if action == Action::Wait && target.is_some() {
                     return Err("Use Add step to insert a wait alongside this target.");
@@ -1337,7 +2144,13 @@ impl Controller {
             index
         } else {
             if settings.route.len() >= settings::MAX_POINTS {
-                ui.set_step_error("The route has 64 steps. Remove a step to add another.".into());
+                ui.set_step_error(
+                    format!(
+                        "The route has {} steps. Remove a step to add another.",
+                        settings::MAX_POINTS
+                    )
+                    .into(),
+                );
                 return;
             }
             let selected = usize::try_from(ui.get_route_index())
@@ -1428,12 +2241,158 @@ impl Controller {
         );
     }
 
+    fn display_share_review(
+        ui: &App,
+        kind: i32,
+        name: &str,
+        path: &str,
+        preset: &Settings,
+    ) -> Result<(), String> {
+        let items = share_review_items(preset)?;
+        ui.set_share_review_index(0);
+        ui.set_share_review_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        ui.set_share_review_name(name.into());
+        ui.set_share_review_path(path.into());
+        ui.set_share_review_metadata(if kind == 2 {
+            format!(
+                "Transfer format: afterbeat-preset, version {}",
+                settings::pixel_transfer_version(preset)
+            )
+            .into()
+        } else {
+            "The saved name can be changed below; all displayed settings are imported.".into()
+        });
+        ui.set_share_review_kind(kind);
+        Ok(())
+    }
+
     fn profile_action(&self, ui: &App, operation: i32) {
         if ui.get_active()
             || ui.get_capturing()
             || ui.get_step_editing()
             || ui.get_preset_load_open()
+            || matches!(ui.get_recording_state(), 1 | 2)
         {
+            return;
+        }
+        if operation == 7 {
+            let mut state = self.state.borrow_mut();
+            state.pending_import = None;
+            state.pending_export = None;
+            ui.set_import_ready(false);
+            ui.set_import_error("".into());
+            ui.set_share_review_kind(0);
+            return;
+        }
+        if operation == 8 {
+            let state = self.state.borrow();
+            let Some((path, name, preset)) = state.pending_export.as_ref() else {
+                return;
+            };
+            let result = settings::export_preset(path, name, preset);
+            drop(state);
+            match result {
+                Ok(()) => {
+                    self.state.borrow_mut().pending_export = None;
+                    ui.set_share_review_kind(0);
+                    status(ui, "Reviewed preset exported.");
+                }
+                Err(error) => failure(ui, &format!("Could not export preset: {error}")),
+            }
+            return;
+        }
+        if (0..=3).contains(&operation) {
+            let mut state = self.state.borrow_mut();
+            state.pending_import = None;
+            state.pending_export = None;
+            ui.set_import_ready(false);
+            ui.set_share_review_kind(0);
+        }
+        if operation == 6 {
+            let name = ui.get_import_name().to_string();
+            let mut state = self.state.borrow_mut();
+            let Some(preset) = state.pending_import.as_ref() else {
+                return;
+            };
+            let library = match new_preset(&state.library, name.trim(), preset) {
+                Ok(library) => library,
+                Err(error) => {
+                    ui.set_import_error(error.into());
+                    return;
+                }
+            };
+            state.library = library;
+            state.library_dirty = true;
+            state.pending_import = None;
+            ui.set_import_ready(false);
+            ui.set_share_review_kind(0);
+            ui.set_import_error("".into());
+            ui.set_selected_preset(name.trim().into());
+            Self::display_library(ui, &state.library);
+            drop(state);
+            if self.save() {
+                status(ui, "Preset imported. Review it before loading.");
+            }
+            return;
+        }
+        if operation == 4 || operation == 5 {
+            let path_text = ui.get_preset_transfer_path().to_string();
+            let path = std::path::Path::new(path_text.trim());
+            if path.as_os_str().is_empty() {
+                failure(ui, "Enter a preset file path.");
+                return;
+            }
+            if operation == 4 {
+                let path = match std::path::absolute(path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        failure(ui, &format!("Could not resolve the export path: {error}"));
+                        return;
+                    }
+                };
+                let state = self.state.borrow();
+                let name = ui.get_selected_preset().to_string();
+                let Some(preset) = state.library.profiles.get(&name) else {
+                    failure(ui, "Choose a saved preset to export.");
+                    return;
+                };
+                let preset = preset.clone();
+                drop(state);
+                if let Err(error) =
+                    Self::display_share_review(ui, 2, &name, &path.to_string_lossy(), &preset)
+                {
+                    failure(ui, &error);
+                    return;
+                }
+                let mut state = self.state.borrow_mut();
+                state.pending_import = None;
+                state.pending_export = Some((path, name, preset));
+                ui.set_import_ready(false);
+            } else {
+                self.state.borrow_mut().pending_import = None;
+                self.state.borrow_mut().pending_export = None;
+                ui.set_import_ready(false);
+                ui.set_share_review_kind(0);
+                let (name, preset) = match settings::import_preset(path) {
+                    Ok(preset) => preset,
+                    Err(error) => {
+                        failure(ui, &format!("Could not import preset: {error}"));
+                        return;
+                    }
+                };
+                let summary = import_preview(&preset);
+                if let Err(error) =
+                    Self::display_share_review(ui, 1, &name, path_text.trim(), &preset)
+                {
+                    failure(ui, &error);
+                    return;
+                }
+                ui.set_import_name(name.into());
+                ui.set_import_summary(summary.into());
+                ui.set_import_error("".into());
+                self.state.borrow_mut().pending_import = Some(preset);
+                ui.set_import_ready(true);
+            }
             return;
         }
         if operation == 1 {
@@ -1689,7 +2648,20 @@ impl Controller {
     }
 
     fn capture(&self, ui: &App, kind: i32) {
-        if ui.get_active() || ui.get_step_editing() || ui.get_preset_load_open() {
+        #[cfg(not(windows))]
+        if (matches!(kind, PIXEL_CAPTURE | PIXEL_PREVIEW) || image_capture_kind(kind)) {
+            return;
+        }
+        if ui.get_active()
+            || (ui.get_step_editing()
+                && !(matches!(kind, PIXEL_CAPTURE | PIXEL_PREVIEW) || image_capture_kind(kind)))
+            || (matches!(kind, PIXEL_CAPTURE | PIXEL_PREVIEW)
+                && (!ui.get_step_editing() || !matches!(ui.get_step_kind(), 5 | 7)))
+            || (image_capture_kind(kind) && (!ui.get_step_editing() || ui.get_step_kind() != 6))
+            || ui.get_preset_load_open()
+            || matches!(ui.get_recording_state(), 1 | 2)
+            || (ui.get_route_recorded() && matches!(kind, 1 | CONTROL_CAPTURE))
+        {
             return;
         }
         #[cfg(target_os = "linux")]
@@ -1719,6 +2691,13 @@ impl Controller {
             self.cancel_capture(ui);
             return;
         }
+        if kind == PIXEL_PREVIEW {
+            ui.set_step_pixel_preview("".into());
+        }
+        if image_capture_kind(kind) {
+            ui.set_step_image_preview("".into());
+            ui.set_step_image_has_match(false);
+        }
         if kind != DRY_SAMPLE {
             ui.set_pick_kind(kind);
         }
@@ -1747,7 +2726,14 @@ impl Controller {
     }
 
     fn capture_shortcut(&self, ui: &App, point: Point, requested_at: u64) {
-        if ui.get_step_editing() || ui.get_preset_load_open() || ui.get_capture_shortcut_kind() < 0
+        if (ui.get_step_editing()
+            && !(ui.get_capturing()
+                && (matches!(ui.get_pick_kind(), PIXEL_CAPTURE | PIXEL_PREVIEW)
+                    || image_capture_kind(ui.get_pick_kind()))))
+            || ui.get_preset_load_open()
+            || ui.get_capture_shortcut_kind() < 0
+            || (ui.get_route_recorded()
+                && matches!(ui.get_capture_shortcut_kind(), 1 | CONTROL_CAPTURE))
         {
             return;
         }
@@ -1773,6 +2759,191 @@ impl Controller {
     }
 
     fn complete_capture(&self, ui: &App, point: Option<Point>, kind: i32, _requested_at: u64) {
+        #[cfg(windows)]
+        if image_capture_kind(kind) {
+            self.end_capture(ui);
+            if !ui.get_step_editing() || ui.get_step_kind() != 6 {
+                return;
+            }
+            if matches!(kind, IMAGE_REFERENCE_FIRST | IMAGE_SEARCH_FIRST) {
+                if let Some(point) = point.filter(|p| mouse::on_monitor(*p)) {
+                    ui.set_step_image_corner_x(point.x);
+                    ui.set_step_image_corner_y(point.y);
+                    self.capture(ui, kind + 1);
+                } else {
+                    ui.set_step_error("Could not select the first corner.".into());
+                    clear_capture_status(ui);
+                }
+                return;
+            }
+            if matches!(kind, IMAGE_REFERENCE_SECOND | IMAGE_SEARCH_SECOND) {
+                let first = Point {
+                    x: ui.get_step_image_corner_x(),
+                    y: ui.get_step_image_corner_y(),
+                };
+                let limit = if kind == IMAGE_REFERENCE_SECOND {
+                    64
+                } else {
+                    512
+                };
+                let rect = point
+                    .and_then(|second| {
+                        Some(targets::ImageRect {
+                            x: first.x.min(second.x),
+                            y: first.y.min(second.y),
+                            width: u16::try_from(first.x.abs_diff(second.x).checked_add(1)?)
+                                .ok()?,
+                            height: u16::try_from(first.y.abs_diff(second.y).checked_add(1)?)
+                                .ok()?,
+                        })
+                    })
+                    .filter(|rect| target_pixels::image_region(*rect, limit).is_some());
+                if let Some(rect) = rect {
+                    let value = format!("{}, {}, {}, {}", rect.x, rect.y, rect.width, rect.height);
+                    if kind == IMAGE_REFERENCE_SECOND {
+                        ui.set_step_image_capture_rect(value.into());
+                    } else {
+                        ui.set_step_image_search(value.into());
+                        ui.set_step_edited(true);
+                    }
+                    ui.set_step_error("".into());
+                } else {
+                    ui.set_step_error(
+                        format!(
+                            "Select a rectangle up to {limit} × {limit} pixels on one display."
+                        )
+                        .into(),
+                    );
+                }
+                clear_capture_status(ui);
+                return;
+            }
+            let result = if kind == IMAGE_CAPTURE {
+                (|| -> Result<String, &'static str> {
+                    let rect = targets::parse_image_rect(&ui.get_step_image_capture_rect())
+                        .ok_or("Enter reference region as x, y, width, height.")?;
+                    target_pixels::image_region(rect, 64).ok_or(
+                        "Reference must fit within one display and be 8–64 pixels on each side.",
+                    )?;
+                    let template = target_pixels::Frame::capture_image(rect)
+                        .ok_or("Could not capture the reference image (minimum 8 × 8 pixels).")?;
+                    ui.set_step_image_reference_image(
+                        review_image_template(&template).unwrap_or_default(),
+                    );
+                    ui.set_step_image_template(
+                        serde_json::to_string(&template)
+                            .map_err(|_| "Could not save the reference image.")?
+                            .into(),
+                    );
+                    ui.set_step_edited(true);
+                    Ok(format!(
+                        "Reference captured: {} × {} grayscale pixels.",
+                        template.width, template.height
+                    ))
+                })()
+            } else {
+                (|| -> Result<String, &'static str> {
+                    let rect = targets::parse_image_rect(&ui.get_step_image_search())
+                        .ok_or("Enter search region as x, y, width, height.")?;
+                    let region = target_pixels::image_region(rect, 512).ok_or("Search region must fit within one display and be at most 512 × 512 pixels.")?;
+                    let template: targets::ImageTemplate =
+                        serde_json::from_str(&ui.get_step_image_template())
+                            .map_err(|_| "Capture a reference image first.")?;
+                    let threshold = ui
+                        .get_step_image_threshold()
+                        .trim()
+                        .parse::<u8>()
+                        .map_err(|_| "Enter an image threshold from 70 to 100%.")?;
+                    if !(70..=100).contains(&threshold) {
+                        return Err("Enter an image threshold from 70 to 100%.");
+                    }
+                    let frame = target_pixels::Frame::capture_color(region)
+                        .ok_or("The screen image could not be read.")?;
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    use target_pixels::ImageSearch;
+                    let result = frame.search_image(&template, threshold, ui.get_step_image_scaled(), true, || Instant::now() >= deadline)
+                        .map_err(|error| if error == "Image search interrupted." { "Preview took too long. Reduce the search region or increase the threshold." } else { error })?;
+                    let (found, state) = match result {
+                        ImageSearch::Missing => {
+                            return Ok(format!("No match at {threshold}% threshold."));
+                        }
+                        ImageSearch::Unique(found) => (found, "Match"),
+                        ImageSearch::Ambiguous(found) => {
+                            (found, "Multiple locations match. Best match")
+                        }
+                    };
+                    ui.set_step_image_match_image(
+                        frame.matched_image(found.region).unwrap_or_default(),
+                    );
+                    ui.set_step_image_has_match(true);
+                    let point = found.region.center();
+                    Ok(format!(
+                        "{state} at {}, {} · {}%.",
+                        point.x,
+                        point.y,
+                        found.score()
+                    ))
+                })()
+            };
+            match result {
+                Ok(message) => {
+                    ui.set_step_image_preview(message.into());
+                    ui.set_step_error("".into());
+                }
+                Err(error) => {
+                    ui.set_step_error(error.into());
+                }
+            }
+            clear_capture_status(ui);
+            return;
+        }
+        #[cfg(windows)]
+        if kind == PIXEL_PREVIEW {
+            self.end_capture(ui);
+            if !ui.get_step_editing() || !matches!(ui.get_step_kind(), 5 | 7) {
+                return;
+            }
+            match preview_pixel_condition(
+                &ui.get_step_key(),
+                &ui.get_step_pixel_tolerance(),
+                ui.get_step_pixel_different(),
+                mouse::on_monitor,
+                target_pixels::pixel_rgb,
+            ) {
+                Ok(message) => {
+                    ui.set_step_pixel_preview(message.into());
+                    ui.set_step_error("".into());
+                    clear_capture_status(ui);
+                }
+                Err(error) => {
+                    ui.set_step_error(error.into());
+                    clear_capture_status(ui);
+                }
+            }
+            return;
+        }
+        #[cfg(windows)]
+        if kind == PIXEL_CAPTURE {
+            self.end_capture(ui);
+            if !ui.get_step_editing() || !matches!(ui.get_step_kind(), 5 | 7) {
+                return;
+            }
+            let result = capture_pixel_value(point, mouse::on_monitor, target_pixels::pixel_rgb);
+            if let Some(value) = result {
+                ui.set_step_key(value.into());
+                ui.set_step_pixel_preview("".into());
+                ui.set_step_edited(true);
+                ui.set_step_error("".into());
+                status(
+                    ui,
+                    "Pixel captured. Review the condition and save the step.",
+                );
+            } else {
+                ui.set_step_error("Could not read a pixel on the displays. Try again.".into());
+                clear_capture_status(ui);
+            }
+            return;
+        }
         #[cfg(windows)]
         if kind == CONTROL_CAPTURE {
             ui.set_dry_checking(false);
@@ -1983,7 +3154,13 @@ impl Controller {
             return;
         }
         if state.settings.route.len() >= settings::MAX_POINTS {
-            failure(ui, "The route has 64 steps. Remove a step to add another.");
+            failure(
+                ui,
+                &format!(
+                    "The route has {} steps. Remove a step to add another.",
+                    settings::MAX_POINTS
+                ),
+            );
             return;
         }
         ui.set_route_index(state.settings.route.len() as i32);
@@ -2033,7 +3210,10 @@ impl Controller {
                 if state.settings.route.len() == settings::MAX_POINTS {
                     failure(
                         ui,
-                        "The route has 64 points. Remove a point to add another.",
+                        &format!(
+                            "The route has {} points. Remove a point to add another.",
+                            settings::MAX_POINTS
+                        ),
                     );
                     return;
                 }
@@ -2097,6 +3277,7 @@ impl Controller {
             || ui.get_capturing()
             || ui.get_step_editing()
             || ui.get_preset_load_open()
+            || matches!(ui.get_recording_state(), 1 | 2)
         {
             return;
         }
@@ -2115,8 +3296,14 @@ impl Controller {
             );
         }
         let settings = self.state.borrow().settings.clone();
-        let (schedule, injector, guard) =
-            automation::prepare(&settings, self.hotkeys.toggle_binding(), binding)?;
+        let shortcut = self.hotkeys.toggle_binding();
+        #[cfg(target_os = "macos")]
+        let double_click_interval = if settings.route_enabled && settings.has_recording() {
+            macos::double_click_interval()
+        } else {
+            Duration::ZERO
+        };
+        let (schedule, injector, guard) = automation::prepare(&settings, shortcut, binding)?;
         #[cfg(windows)]
         let smart = if settings.has_smart_route() || settings.has_action_route() {
             Some(smart_targets::Route::new(
@@ -2130,8 +3317,8 @@ impl Controller {
         } else {
             None
         };
-        #[cfg(not(windows))]
-        let smart_run = false;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let smart_run = settings.route_enabled && settings.has_recording();
         #[cfg(windows)]
         let smart_run = smart.is_some();
         let stop = Arc::new(
@@ -2189,7 +3376,6 @@ impl Controller {
                 };
                 #[cfg(windows)]
                 let mut smart = smart;
-                #[cfg(windows)]
                 let mut dispatch_probe = stop_probe.clone();
                 let mut stop_probe = stop_probe.map(|mut probe| move || probe.pending());
                 let run = || {
@@ -2255,8 +3441,51 @@ impl Controller {
                 } else {
                     run()
                 };
-                #[cfg(not(windows))]
-                let result = run();
+                #[cfg(target_os = "linux")]
+                let result = if smart_run {
+                    let mut countdown_gate = || guard.borrow_mut().check();
+                    engine::run_sequence(
+                        schedule,
+                        &worker_stop,
+                        &worker_progress,
+                        guarded.then_some(&mut countdown_gate),
+                        |control| {
+                            recording::x11_player::run(
+                                &settings,
+                                schedule,
+                                shortcut,
+                                &mut guard.borrow_mut(),
+                                control,
+                                || dispatch_probe.as_mut().is_some_and(|probe| probe.pending()),
+                            )
+                        },
+                    )
+                } else {
+                    run()
+                };
+                #[cfg(target_os = "macos")]
+                let result = if smart_run {
+                    let mut countdown_gate = || guard.borrow_mut().check();
+                    engine::run_sequence(
+                        schedule,
+                        &worker_stop,
+                        &worker_progress,
+                        guarded.then_some(&mut countdown_gate),
+                        |control| {
+                            recording::macos_player::run(
+                                &settings,
+                                schedule,
+                                shortcut,
+                                double_click_interval,
+                                &mut guard.borrow_mut(),
+                                control,
+                                || dispatch_probe.as_mut().is_some_and(|probe| probe.pending()),
+                            )
+                        },
+                    )
+                } else {
+                    run()
+                };
                 let ended = Instant::now();
                 // X11 text output may still need to restore the keyboard mapping.
                 drop(injector);
@@ -2343,13 +3572,18 @@ impl Controller {
             ui.set_stopping(false);
             ui.set_run_state("Last run".into());
             self.tick.stop();
+            let skipped = run.progress.skipped_steps();
+            let last_skipped = run.progress.last_skipped_step();
+            let retried = run.progress.retried_clicks();
+            let with_skips =
+                |message: &str| run_feedback_message(message, skipped, last_skipped, retried);
             match result {
-                Ok(Outcome::Completed) => status(ui, "Completed."),
-                Ok(Outcome::Stopped) => status(ui, "Stopped."),
-                Ok(Outcome::Guarded(reason)) => status(ui, reason),
+                Ok(Outcome::Completed) => status(ui, &with_skips("Completed.")),
+                Ok(Outcome::Stopped) => status(ui, &with_skips("Stopped.")),
+                Ok(Outcome::Guarded(reason)) => status(ui, &with_skips(reason)),
                 Err(error) => {
                     diagnostics::record(&format!("Run stopped with an error: {error}"));
-                    failure(ui, &error);
+                    failure(ui, &with_skips(&error));
                 }
             }
             drop(state);
@@ -2389,7 +3623,16 @@ impl Controller {
             status(ui, hint);
         } else if run.progress.started.get().is_some() {
             ui.set_run_state("Running".into());
-            status(ui, "");
+            let skipped = run.progress.skipped_steps();
+            status(
+                ui,
+                &run_feedback_message(
+                    "",
+                    skipped,
+                    run.progress.last_skipped_step(),
+                    run.progress.retried_clicks(),
+                ),
+            );
         } else if now >= run.countdown {
             ui.set_run_state("Starting".into());
             status(ui, "Waiting to send the first action.");
@@ -2427,6 +3670,44 @@ impl Controller {
                 ui.set_dry_message(
                     format!("Sampling in {left} s. Move the pointer to the target.").into(),
                 );
+            } else if capture.kind == PIXEL_CAPTURE {
+                status(
+                    ui,
+                    &format!(
+                        "Picking pixel in {left} s. Move the pointer to the color, or press the capture shortcut."
+                    ),
+                );
+            } else if capture.kind == PIXEL_PREVIEW {
+                status(
+                    ui,
+                    &format!(
+                        "Checking pixel in {left} s. Uncover the target, or press the capture shortcut."
+                    ),
+                );
+            } else if (IMAGE_REFERENCE_FIRST..=IMAGE_SEARCH_SECOND).contains(&capture.kind) {
+                let corner = if matches!(capture.kind, IMAGE_REFERENCE_FIRST | IMAGE_SEARCH_FIRST) {
+                    "first"
+                } else {
+                    "opposite"
+                };
+                status(
+                    ui,
+                    &format!(
+                        "Point at the {corner} corner. Picks in {left} s, or press the capture shortcut."
+                    ),
+                );
+            } else if matches!(capture.kind, IMAGE_CAPTURE | IMAGE_PREVIEW) {
+                status(
+                    ui,
+                    &format!(
+                        "{} in {left} s. Uncover the screen, or press the capture shortcut.",
+                        if capture.kind == IMAGE_CAPTURE {
+                            "Capturing image"
+                        } else {
+                            "Searching for image"
+                        }
+                    ),
+                );
             } else {
                 status(
                     ui,
@@ -2461,6 +3742,11 @@ impl Controller {
     }
 
     fn shutdown(&self) {
+        self.recording_stop.request(hotkeys::tick_count());
+        {
+            self.recording_timer.stop();
+            self.recorder.borrow_mut().take();
+        }
         signal_stop(&self.stop_slot);
         let run = self.state.borrow_mut().run.take();
         if let Some(run) = run
@@ -2513,6 +3799,8 @@ fn pause_hint(reason: PauseReason) -> &'static str {
             "Waiting for matching visual evidence. Check the target in Dry run."
         }
         PauseReason::WheelFocus => "Focus the window at the wheel target to resume.",
+        PauseReason::PixelColor => "Waiting for the screen condition.",
+        PauseReason::PendingStop => "Waiting for the stop shortcut. Use Stop run if needed.",
     }
 }
 
@@ -2554,6 +3842,40 @@ fn record_run(state: &mut State, progress: &Progress, ended: Instant) {
         state.library.active_millis = state.library.active_millis.saturating_add(millis as u64);
         state.library_dirty = true;
     }
+}
+
+fn run_skip_message(message: &str, skipped: u64, last: Option<u64>) -> String {
+    if skipped == 0 {
+        return message.to_owned();
+    }
+    let separator = if message.is_empty() { "" } else { " " };
+    let last = last.map_or_else(String::new, |step| {
+        format!(" Last skipped: step {}.", grouped(step))
+    });
+    format!(
+        "{message}{separator}{} {} skipped.{last}",
+        grouped(skipped),
+        if skipped == 1 { "step" } else { "steps" }
+    )
+}
+
+fn run_feedback_message(message: &str, skipped: u64, last: Option<u64>, retried: u64) -> String {
+    let mut result = run_skip_message(message, skipped, last);
+    if retried > 0 {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        result.push_str(&format!(
+            "{} click {} retried.",
+            grouped(retried),
+            if retried == 1 {
+                "step was"
+            } else {
+                "steps were"
+            }
+        ));
+    }
+    result
 }
 
 fn status(ui: &App, message: &str) {
@@ -2671,11 +3993,14 @@ fn preset_preview(saved: &Settings) -> String {
         String::new()
     };
     let target = if settings.route_enabled {
-        format!(
-            "{}-step route · {}",
-            settings.route.len(),
-            if settings.route_once { "Once" } else { "Loop" }
-        )
+        let mode = if settings.route_once {
+            "Once".to_owned()
+        } else if !settings.has_recording() && settings.route_iterations.trim() != "0" {
+            format!("{} loops", settings.route_iterations.trim())
+        } else {
+            "Loop".to_owned()
+        };
+        format!("{}-step route · {mode}", settings.route.len())
     } else if settings.keyboard {
         "Focused app".into()
     } else if settings.fixed {
@@ -2868,6 +4193,17 @@ mod tests {
     }
 
     #[test]
+    fn preset_preview_includes_finite_route_loops() {
+        let settings = Settings {
+            route_enabled: true,
+            route_iterations: "3".into(),
+            route: vec![Step::Point(Point { x: 1, y: 2 })],
+            ..Settings::default()
+        };
+        assert!(preset_preview(&settings).contains("1-step route · 3 loops"));
+    }
+
+    #[test]
     fn preset_preview_distinguishes_unlimited_runs_and_route_playback() {
         let mut settings = Settings::default();
         let preview = preset_preview(&settings);
@@ -2903,6 +4239,141 @@ mod tests {
         assert!(setup_needs_preserving(&settings, &library, true));
         // Returning a loaded preset to the defaults is still a modified setup.
         assert!(setup_needs_preserving(&Settings::default(), &library, true));
+    }
+
+    #[test]
+    fn skipped_step_count_is_visible_in_run_messages() {
+        assert_eq!(run_skip_message("Completed.", 0, None), "Completed.");
+        assert_eq!(
+            run_skip_message("Completed.", 1, Some(2)),
+            "Completed. 1 step skipped. Last skipped: step 2."
+        );
+        assert_eq!(
+            run_skip_message("", 2, Some(4)),
+            "2 steps skipped. Last skipped: step 4."
+        );
+        assert_eq!(run_feedback_message("Completed.", 0, None, 0), "Completed.");
+        assert_eq!(
+            run_feedback_message("Completed.", 0, None, 1),
+            "Completed. 1 click step was retried."
+        );
+        assert_eq!(
+            run_feedback_message("", 1, Some(3), 2),
+            "1 step skipped. Last skipped: step 3. 2 click steps were retried."
+        );
+    }
+
+    #[test]
+    fn sharing_review_covers_all_settings_steps_and_visual_data() {
+        let patch = "0123456789abcdef".repeat(30);
+        let control = serde_json::json!({
+            "selector": {
+                "window": {"executable": "C:\\private\\app.exe", "class": "Window", "title": "Private document"},
+                "control": {"role": 50000, "identity": {"Name": "Save"}},
+                "label": "Save",
+                "visual": {
+                    "anchor": {"role": 50000, "identity": {"Name": "Label"}},
+                    "target_name": "Save", "anchor_size": {"x": 20, "y": 12},
+                    "target_size": {"x": 20, "y": 12}, "offset": {"x": 1, "y": 2},
+                    "target": patch, "landmark": "ff".repeat(240)
+                }
+            }
+        });
+        let step: Step = serde_json::from_value(control).unwrap();
+        let preset = Settings {
+            process_names: "private-filter.exe".into(),
+            point: Some(Point { x: -123, y: 456 }),
+            route: vec![
+                step,
+                Step::Action(Box::new(targets::ActionStep {
+                    action: targets::Action::Text {
+                        text: "private text".into(),
+                    },
+                    target: None,
+                    delay_ms: 20,
+                })),
+            ],
+            ..Settings::default()
+        };
+        let review = share_review_items(&preset).unwrap();
+        assert_eq!(review.len(), 3);
+        let header: serde_json::Value = serde_json::from_str(review[0].details.as_str()).unwrap();
+        let mut expected = serde_json::to_value(&preset).unwrap();
+        expected.as_object_mut().unwrap().remove("route");
+        assert_eq!(header, expected);
+        for (index, step) in preset.route.iter().enumerate() {
+            let displayed: serde_json::Value =
+                serde_json::from_str(review[index + 1].details.as_str()).unwrap();
+            assert_eq!(displayed, serde_json::to_value(step).unwrap());
+        }
+        assert!(review[1].has_visual);
+        assert_eq!(review[1].target_image.size().width, 20);
+        assert_eq!(review[1].landmark_image.size().height, 12);
+        let target = review[1].target_image.to_rgb8().unwrap();
+        assert_eq!(target.as_slice()[0], slint::Rgb8Pixel { r: 1, g: 1, b: 1 });
+        assert_eq!(
+            target.as_slice()[1],
+            slint::Rgb8Pixel {
+                r: 0x23,
+                g: 0x23,
+                b: 0x23
+            }
+        );
+        assert!(!review[2].has_visual);
+        assert!(review_fingerprint(&targets::Patch("invalid".into())).is_none());
+    }
+
+    #[test]
+    fn sharing_review_displays_saved_image_reference() {
+        let mut preset = Settings::default();
+        preset
+            .route
+            .push(Step::Action(Box::new(targets::ActionStep {
+                action: targets::Action::WaitImage {
+                    search: targets::ImageRect {
+                        x: 0,
+                        y: 0,
+                        width: 8,
+                        height: 8,
+                    },
+                    template: targets::ImageTemplate {
+                        width: 8,
+                        height: 8,
+                        pixels: "ab".repeat(64),
+                    },
+                    threshold: 100,
+                    timeout_ms: 100,
+                    output: Default::default(),
+                    scaled: false,
+                },
+                target: None,
+                delay_ms: 0,
+            })));
+        let review = share_review_items(&preset).unwrap();
+        assert!(review[1].has_image_template);
+        assert_eq!(review[1].image_template.size().width, 8);
+        let image = review[1].image_template.to_rgb8().unwrap();
+        assert_eq!(
+            image.as_slice()[0],
+            slint::Rgb8Pixel {
+                r: 0xab,
+                g: 0xab,
+                b: 0xab
+            }
+        );
+    }
+
+    #[test]
+    fn import_preview_reports_normalization_and_invalid_settings() {
+        let settings = Settings {
+            delay_seconds: 42,
+            interval: "invalid".into(),
+            ..Settings::default()
+        };
+        let preview = import_preview(&settings);
+        assert!(preview.contains("adjusted when loaded"));
+        assert!(preview.contains("Check before starting:"));
+        assert_eq!(settings.delay_seconds, 42);
     }
 
     #[test]
@@ -2964,6 +4435,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn pixel_capture_formats_sample_and_rejects_unavailable_pixels() {
+        let point = Point { x: -15, y: 200 };
+        let value = capture_pixel_value(Some(point), |_| true, |_| Some(0x00ff04)).unwrap();
+        assert_eq!(targets::parse_pixel(&value), Some((point, 0x00ff04)));
+        assert_eq!(
+            capture_pixel_value(None, |_| panic!("no point"), |_| panic!("no point")),
+            None
+        );
+        assert_eq!(
+            capture_pixel_value(Some(point), |_| false, |_| panic!("outside displays")),
+            None
+        );
+        assert_eq!(capture_pixel_value(Some(point), |_| true, |_| None), None);
+    }
+
+    #[test]
     fn countdown_describes_the_effective_destination() {
         let mut settings = Settings::default();
         assert_eq!(
@@ -3017,5 +4505,62 @@ mod tests {
         }
         assert!(state.receive_capture(point, end - 1));
         assert_eq!(state.capture.unwrap().point, Some(point));
+    }
+
+    #[test]
+    fn emergency_stop_cancels_pending_pixel_capture() {
+        let mut state = StopState {
+            capture: Some(Capture {
+                deadline: Instant::now() + CAPTURE_DELAY,
+                kind: PIXEL_CAPTURE,
+                requested_at: 10_000,
+                point: None,
+            }),
+            last_emergency: Some(10_001),
+            ..StopState::default()
+        };
+        assert!(state.cancelled(state.capture.unwrap().requested_at));
+        assert!(state.receive_capture(Point { x: 1, y: 2 }, 10_002));
+        assert!(state.cancelled(state.capture.unwrap().requested_at));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pixel_preview_uses_configured_point_tolerance_and_condition() {
+        let sample = |value: &str, tolerance: &str, different, color| {
+            preview_pixel_condition(
+                value,
+                tolerance,
+                different,
+                |p| p == Point { x: -4, y: 8 },
+                |_| color,
+            )
+        };
+        assert_eq!(
+            sample("-4, 8, #102030", "2", false, Some(0x112232)).unwrap(),
+            "Sampled (-4, 8): #112232. Condition matches at preview time."
+        );
+        assert!(
+            sample("-4, 8, #102030", "1", false, Some(0x112232))
+                .unwrap()
+                .contains("does not match")
+        );
+        assert!(
+            sample("-4, 8, #102030", "1", true, Some(0x112232))
+                .unwrap()
+                .contains("Condition matches")
+        );
+        assert!(sample("-4, 8, #102030", "255", true, Some(0)).is_err());
+        assert!(sample("bad", "0", false, Some(0)).is_err());
+        assert!(
+            sample("1, 2, #102030", "0", false, Some(0))
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(
+            sample("-4, 8, #102030", "0", false, None)
+                .unwrap_err()
+                .contains("could not be read")
+        );
     }
 }

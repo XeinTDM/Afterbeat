@@ -273,6 +273,107 @@ impl Focus {
     }
 }
 
+fn text_focus_matches(saved: Option<Focus>, current: Option<Focus>) -> bool {
+    saved.is_none_or(|saved| Some(saved) == current)
+}
+
+fn stable_pixel_match(
+    since: &mut Option<Instant>,
+    matches: bool,
+    now: Instant,
+    duration: Duration,
+) -> bool {
+    if !matches {
+        *since = None;
+        return false;
+    }
+    let started = *since.get_or_insert(now);
+    now.saturating_duration_since(started) >= duration
+}
+
+fn may_skip_pixel_timeout(enabled: bool, gate: Gate, stop_pending: bool) -> bool {
+    enabled && matches!(gate, Gate::Open) && !stop_pending
+}
+
+fn immediate_pixel_failure(check_once: bool, matches: bool, skip_next: bool) -> Option<bool> {
+    (check_once && !matches).then_some(skip_next)
+}
+
+#[derive(Default)]
+struct PixelRetries {
+    condition: Option<usize>,
+    used: u8,
+    pending_click: Option<usize>,
+}
+
+impl PixelRetries {
+    fn enter(&mut self, index: usize) {
+        if self.condition != Some(index) {
+            self.condition = Some(index);
+            self.used = 0;
+        }
+    }
+
+    fn available(&self, limit: u8) -> bool {
+        self.used < limit
+    }
+
+    fn schedule(&mut self, limit: u8) -> Option<usize> {
+        if !self.available(limit) {
+            return None;
+        }
+        let previous = self.condition?.checked_sub(1)?;
+        self.used += 1;
+        self.pending_click = Some(previous);
+        Some(previous)
+    }
+
+    fn sent(&mut self, index: usize) -> bool {
+        if self.pending_click == Some(index) {
+            self.pending_click = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(&mut self) {
+        self.condition = None;
+        self.used = 0;
+        self.pending_click = None;
+    }
+}
+
+fn wait_for_pending_stop(control: &mut RunControl<'_>) -> Result<Option<Outcome>, String> {
+    match control.retry_dispatch(Gate::Paused(PauseReason::PendingStop))? {
+        Some(Outcome::Completed) => {
+            // Do not end before a queued toggle shortcut is handled, even if the run time expires.
+            thread::sleep(RESPONSE_POLL);
+            Ok(None)
+        }
+        outcome => Ok(outcome),
+    }
+}
+
+fn advance_route(
+    index: &mut usize,
+    len: usize,
+    completed: &mut u64,
+    once: bool,
+    limit: Option<u64>,
+) -> bool {
+    *index += 1;
+    if *index < len {
+        return false;
+    }
+    *completed += 1;
+    if once || limit.is_some_and(|limit| *completed >= limit) {
+        return true;
+    }
+    *index = 0;
+    false
+}
+
 fn foreground_focus() -> Option<Focus> {
     unsafe {
         let window = wm::GetForegroundWindow();
@@ -916,7 +1017,7 @@ impl Route {
     pub fn new(service: Option<Service>, steps: Vec<Step>, timeout: Duration) -> Self {
         let layouts = steps
             .iter()
-            .any(|step| step.point().is_some())
+            .any(|step| step.point().is_some() || matches!(step, Step::Action(action) if matches!(action.action, Action::WaitColor { .. } | Action::WaitImage { .. } | Action::Flow { .. })))
             .then(crate::mouse::display_areas);
         Self {
             service,
@@ -936,9 +1037,31 @@ impl Route {
         control: &mut RunControl<'_>,
         mut stop_pending: impl FnMut() -> bool,
     ) -> Result<Outcome, String> {
+        if settings.has_recording() {
+            return self.recorded_sequence(settings, schedule, guard, control, &mut stop_pending);
+        }
         let mut random = Random::new();
         let mut last_action = None;
-        loop {
+        let mut completed = 0;
+        let mut retries = PixelRetries::default();
+        let loop_limit = if settings.route_once {
+            None
+        } else {
+            settings.route_loop_limit().map_err(|issue| issue.message)?
+        };
+        use crate::workflow::Operation;
+        let workflow = crate::workflow::compile(&self.steps)?;
+        let mut loops = vec![0u16; self.steps.len()];
+        let mut recovery_attempts = vec![0u8; self.steps.len()];
+        let mut actions_at_traversal_start = control.route_actions();
+        'route: loop {
+            if stop_pending() {
+                loop {
+                    if let Some(outcome) = wait_for_pending_stop(control)? {
+                        return Ok(outcome);
+                    }
+                }
+            }
             if schedule
                 .limit
                 .is_some_and(|limit| control.route_actions() >= limit)
@@ -946,6 +1069,27 @@ impl Route {
                 return Ok(control
                     .wait_route(Instant::now())?
                     .unwrap_or(Outcome::Completed));
+            }
+            if self.index == self.steps.len() {
+                self.index -= 1;
+                if advance_route(
+                    &mut self.index,
+                    self.steps.len(),
+                    &mut completed,
+                    settings.route_once,
+                    loop_limit,
+                ) {
+                    return Ok(control
+                        .wait_route(Instant::now())?
+                        .unwrap_or(Outcome::Completed));
+                }
+                let actions = control.route_actions();
+                if actions == actions_at_traversal_start
+                    && let Some(outcome) = wait_delay(control, guard, Instant::now() + RETRY)?
+                {
+                    return Ok(outcome);
+                }
+                actions_at_traversal_start = actions;
             }
             let step = &self.steps[self.index];
             let interval = schedule.rates.map_or(schedule.interval, |(low, high)| {
@@ -962,7 +1106,585 @@ impl Route {
                 last_action.unwrap_or_else(Instant::now)
             };
             if let Some(outcome) = wait_delay(control, guard, from + delay)? {
+                if retries.pending_click.is_some() && stop_pending() {
+                    loop {
+                        if let Some(outcome) = wait_for_pending_stop(control)? {
+                            return Ok(outcome);
+                        }
+                    }
+                }
                 return Ok(outcome);
+            }
+            macro_rules! timeout {
+                ($error:expr, $recoverable:expr) => {{
+                    let index = self.index;
+                    if $recoverable && let Some(policy) = workflow.recovery[index] {
+                        control.clear_target_wait();
+                        if recovery_attempts[index] < policy.retries {
+                            recovery_attempts[index] += 1;
+                            continue 'route;
+                        }
+                        if policy.skip {
+                            control.record_skipped_step(index);
+                            recovery_attempts[index] = 0;
+                            self.index += 1;
+                            continue 'route;
+                        }
+                    }
+                    return Err($error);
+                }};
+            }
+            if let Step::Action(action) = step
+                && let Action::Flow { operation } = &action.action
+            {
+                let index = self.index;
+                self.index = match operation {
+                    Operation::If { test } | Operation::BreakIf { test } => {
+                        let passed = match self.test_workflow_pixel(
+                            test,
+                            guard,
+                            control,
+                            &mut stop_pending,
+                        )? {
+                            Ok(passed) => passed,
+                            Err(outcome) => return Ok(outcome),
+                        };
+                        match operation {
+                            Operation::If { .. } if !passed => workflow.jumps[index],
+                            Operation::BreakIf { .. } if passed => {
+                                let end = workflow.jumps[index];
+                                loops[workflow.jumps[end]] = 0;
+                                end + 1
+                            }
+                            _ => index + 1,
+                        }
+                    }
+                    Operation::Else => workflow.jumps[index],
+                    Operation::Repeat { count } => {
+                        loops[index] = *count;
+                        index + 1
+                    }
+                    Operation::EndRepeat => {
+                        let start = workflow.jumps[index];
+                        loops[start] -= 1;
+                        if loops[start] > 0 {
+                            start + 1
+                        } else {
+                            index + 1
+                        }
+                    }
+                    Operation::EndIf | Operation::Recover { .. } => index + 1,
+                };
+                continue;
+            }
+            if let Step::Action(action) = step
+                && let Action::WaitImage {
+                    search,
+                    template,
+                    threshold,
+                    timeout_ms,
+                    output,
+                    scaled,
+                } = &action.action
+            {
+                let deadline = Instant::now() + Duration::from_millis(u64::from(*timeout_ms));
+                use crate::{target_pixels::ImageSearch, targets::ImageOutput};
+                let mut stop_observed = false;
+                let input = match output {
+                    ImageOutput::Wait | ImageOutput::If => None,
+                    ImageOutput::Move => Some(RouteInput::Move),
+                    ImageOutput::Click => Some(RouteInput::Click(crate::mouse::Button::Left, 1)),
+                };
+                let mut last_hint = "Waiting for the image to match.";
+                let mut recoverable = true;
+                let mut observed_missing = false;
+                'image_wait: loop {
+                    if stop_pending() {
+                        stop_observed = true;
+                    }
+                    if stop_observed {
+                        if let Some(outcome) = wait_for_pending_stop(control)? {
+                            return Ok(outcome);
+                        }
+                        continue 'image_wait;
+                    }
+                    if let Some(outcome) = control.wait_route(Instant::now())? {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue 'image_wait;
+                        }
+                        return Ok(outcome);
+                    }
+                    if let Err(error) = self.validate_layout(Point {
+                        x: search.x,
+                        y: search.y,
+                    }) {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue 'image_wait;
+                        }
+                        return Err(error);
+                    }
+                    let Some(region) = crate::target_pixels::image_region(*search, 512) else {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue 'image_wait;
+                        }
+                        return Err("Image search region must fit within one display.".into());
+                    };
+                    let gate = guard.check();
+                    if stop_pending() {
+                        stop_observed = true;
+                        continue 'image_wait;
+                    }
+                    if let Gate::Stop(reason) = gate {
+                        return Ok(Outcome::Guarded(reason));
+                    }
+                    if Instant::now() >= deadline {
+                        let hint = match gate {
+                            Gate::Paused(reason) => crate::pause_hint(reason),
+                            _ => last_hint,
+                        };
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue 'image_wait;
+                        }
+                        if *output == ImageOutput::If
+                            && observed_missing
+                            && matches!(gate, Gate::Open)
+                        {
+                            control.clear_target_wait();
+                            self.index = workflow.jumps[self.index];
+                            continue 'route;
+                        }
+                        timeout!(
+                            self.timed_out(&step.label(), hint),
+                            recoverable && matches!(gate, Gate::Open)
+                        );
+                    }
+                    let reason = match gate {
+                        Gate::Paused(reason) => {
+                            observed_missing = false;
+                            reason
+                        }
+                        Gate::Open => 'search: {
+                            let Some(frame) = crate::target_pixels::Frame::capture_color(region)
+                            else {
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue 'image_wait;
+                                }
+                                return Err("The screen image could not be read.".into());
+                            };
+                            let mut interrupted = None;
+                            let mut stop_seen_during_search = false;
+                            let matched = frame.search_image(
+                                template,
+                                *threshold,
+                                *scaled,
+                                input.is_some(),
+                                || {
+                                    if stop_pending() {
+                                        stop_seen_during_search = true;
+                                        return true;
+                                    }
+                                    if Instant::now() >= deadline {
+                                        return true;
+                                    }
+                                    match control.wait_route(Instant::now()) {
+                                        Ok(None) => false,
+                                        Ok(Some(outcome)) => {
+                                            interrupted = Some(Ok(outcome));
+                                            true
+                                        }
+                                        Err(error) => {
+                                            interrupted = Some(Err(error));
+                                            true
+                                        }
+                                    }
+                                },
+                            );
+                            if stop_seen_during_search || stop_pending() {
+                                stop_observed = true;
+                                continue 'image_wait;
+                            }
+                            if let Some(outcome) = interrupted {
+                                return outcome;
+                            }
+                            if Instant::now() >= deadline {
+                                continue 'image_wait;
+                            }
+                            let matched = matched?;
+                            if let Some(outcome) = control.wait_route(Instant::now())? {
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue 'image_wait;
+                                }
+                                return Ok(outcome);
+                            }
+                            if stop_pending() {
+                                stop_observed = true;
+                                continue 'image_wait;
+                            }
+                            let found = match matched {
+                                ImageSearch::Missing => {
+                                    observed_missing = true;
+                                    last_hint = "Waiting for the image to match.";
+                                    recoverable = true;
+                                    break 'search PauseReason::PixelColor;
+                                }
+                                ImageSearch::Ambiguous(_) => {
+                                    last_hint = "Multiple image locations match. Narrow the region or raise the threshold.";
+                                    recoverable = true;
+                                    break 'search PauseReason::TargetAmbiguous;
+                                }
+                                ImageSearch::Unique(found) => found,
+                            };
+                            if let Some(input) = input {
+                                let point = found.region.center();
+                                self.validate_layout(point)?;
+                                match guard.check_destination(Some(point)) {
+                                    Gate::Stop(reason) => return Ok(Outcome::Guarded(reason)),
+                                    Gate::Paused(reason) => {
+                                        last_hint = crate::pause_hint(reason);
+                                        recoverable = false;
+                                        break 'search reason;
+                                    }
+                                    Gate::Open => {}
+                                }
+                                let Some(hit) = NativeHit::at(point) else {
+                                    last_hint = "The matched location has no available window.";
+                                    recoverable = false;
+                                    break 'search PauseReason::TargetUnavailable;
+                                };
+                                let mut stop_during_dispatch = false;
+                                let mut guard_stop = None;
+                                let delivery = input.send(Some(point), control, || {
+                                    if stop_pending() {
+                                        stop_during_dispatch = true;
+                                        return false;
+                                    }
+                                    if RouteInput::Move.is_held() || !frame.unchanged(found.region)
+                                    {
+                                        return false;
+                                    }
+                                    if stop_pending() {
+                                        stop_during_dispatch = true;
+                                        return false;
+                                    }
+                                    if Instant::now() >= deadline
+                                        || self.validate_layout(point).is_err()
+                                        || NativeHit::at(point) != Some(hit)
+                                    {
+                                        return false;
+                                    }
+                                    match guard.check_destination(Some(point)) {
+                                        Gate::Open => {
+                                            stop_during_dispatch = stop_pending();
+                                            !stop_during_dispatch
+                                        }
+                                        Gate::Paused(_) => false,
+                                        Gate::Stop(reason) => {
+                                            guard_stop = Some(reason);
+                                            false
+                                        }
+                                    }
+                                })?;
+                                match delivery {
+                                    RouteDelivery::Sent => last_action = Some(Instant::now()),
+                                    RouteDelivery::End(outcome) => return Ok(outcome),
+                                    RouteDelivery::Retry => {
+                                        stop_observed |= stop_during_dispatch;
+                                        last_hint = "The image or destination changed before input could be sent.";
+                                        recoverable = false;
+                                        if stop_observed {
+                                            continue 'image_wait;
+                                        }
+                                        if let Some(reason) = guard_stop {
+                                            return Ok(Outcome::Guarded(reason));
+                                        }
+                                        break 'search PauseReason::TargetUnavailable;
+                                    }
+                                }
+                            }
+                            control.clear_target_wait();
+                            break 'image_wait;
+                        }
+                        Gate::Stop(_) => unreachable!(),
+                    };
+                    let now = Instant::now();
+                    if let Some(outcome) = control.wait_for_target(
+                        reason,
+                        RETRY.min(deadline.saturating_duration_since(now)),
+                        self.index,
+                        deadline,
+                    )? {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue 'image_wait;
+                        }
+                        return Ok(outcome);
+                    }
+                }
+            }
+            if let Step::Action(action) = step
+                && let Action::WaitColor {
+                    point,
+                    rgb,
+                    tolerance,
+                    different,
+                    stable_ms,
+                    skip_next_on_timeout,
+                    check_once,
+                    skip_next_on_mismatch,
+                    retry_clicks,
+                } = &action.action
+            {
+                retries.enter(self.index);
+                let deadline = Instant::now() + self.timeout;
+                let mut matched_since = None;
+                let mut skip_next = false;
+                let mut stop_observed = false;
+                macro_rules! retry_click {
+                    ($allowed:expr) => {
+                        if $allowed && retries.available(*retry_clicks) {
+                            if !crate::targets::has_retryable_previous_click(&self.steps, self.index) {
+                                return Err("Click retries require an immediately preceding custom click step.".into());
+                            }
+                            if let Some(outcome) = control.wait_route(Instant::now())? {
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                return Ok(outcome);
+                            }
+                            if stop_pending() {
+                                stop_observed = true;
+                                continue;
+                            }
+                            control.clear_target_wait();
+                            self.index = retries.schedule(*retry_clicks).ok_or("Click retries require a previous step.")?;
+                            continue 'route;
+                        }
+                    };
+                }
+                loop {
+                    if stop_pending() {
+                        stop_observed = true;
+                    }
+                    if stop_observed {
+                        if let Some(outcome) = wait_for_pending_stop(control)? {
+                            return Ok(outcome);
+                        }
+                        continue;
+                    }
+                    if let Some(outcome) = control.wait_route(Instant::now())? {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue;
+                        }
+                        return Ok(outcome);
+                    }
+                    if let Err(error) = self.validate_layout(*point) {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    let gate = guard.check();
+                    if let Gate::Stop(reason) = gate {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue;
+                        }
+                        return Ok(Outcome::Guarded(reason));
+                    }
+                    let stop_requested = stop_pending();
+                    if stop_requested {
+                        stop_observed = true;
+                        matched_since = None;
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        retry_click!(!*check_once && matches!(gate, Gate::Open));
+                        if !*check_once
+                            && may_skip_pixel_timeout(*skip_next_on_timeout, gate, stop_observed)
+                        {
+                            if self.index + 1 >= self.steps.len() {
+                                return Err(
+                                    "Add a step after the pixel condition to use Skip next.".into(),
+                                );
+                            }
+                            if let Some(outcome) = control.wait_route(Instant::now())? {
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                return Ok(outcome);
+                            }
+                            if stop_pending() {
+                                stop_observed = true;
+                                continue;
+                            }
+                            control.clear_target_wait();
+                            control.record_skipped_step(self.index + 1);
+                            skip_next = true;
+                            break;
+                        }
+                        let reason = match gate {
+                            Gate::Paused(reason) => reason,
+                            _ => PauseReason::PixelColor,
+                        };
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue;
+                        }
+                        timeout!(
+                            self.timed_out(&step.label(), crate::pause_hint(reason)),
+                            matches!(gate, Gate::Open)
+                        );
+                    }
+                    let reason = match gate {
+                        Gate::Stop(reason) => return Ok(Outcome::Guarded(reason)),
+                        Gate::Paused(reason) => {
+                            matched_since = None;
+                            reason
+                        }
+                        Gate::Open => {
+                            let Some(color) = crate::target_pixels::pixel_rgb(*point) else {
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                return Err("The screen pixel could not be read.".into());
+                            };
+                            let matches = crate::target_pixels::pixel_condition_matches(
+                                color, *rgb, *tolerance, *different,
+                            );
+                            if let Some(skip_on_mismatch) = immediate_pixel_failure(
+                                *check_once,
+                                matches,
+                                *skip_next_on_mismatch,
+                            ) {
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                if let Some(outcome) = control.wait_route(Instant::now())? {
+                                    if stop_pending() {
+                                        stop_observed = true;
+                                        continue;
+                                    }
+                                    return Ok(outcome);
+                                }
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                if Instant::now() >= deadline {
+                                    continue;
+                                }
+                                retry_click!(true);
+                                if !skip_on_mismatch {
+                                    timeout!(
+                                        format!(
+                                            "Step {} pixel condition did not match.",
+                                            self.index + 1
+                                        ),
+                                        true
+                                    );
+                                }
+                                if self.index + 1 >= self.steps.len() {
+                                    return Err(
+                                        "Add a step after the pixel condition to use Skip next."
+                                            .into(),
+                                    );
+                                }
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                control.clear_target_wait();
+                                control.record_skipped_step(self.index + 1);
+                                skip_next = true;
+                                break;
+                            }
+                            if stable_pixel_match(
+                                &mut matched_since,
+                                matches,
+                                Instant::now(),
+                                Duration::from_millis((*stable_ms).into()),
+                            ) {
+                                if let Some(outcome) = control.wait_route(Instant::now())? {
+                                    if stop_pending() {
+                                        stop_observed = true;
+                                        continue;
+                                    }
+                                    return Ok(outcome);
+                                }
+                                if stop_pending() {
+                                    stop_observed = true;
+                                    continue;
+                                }
+                                if Instant::now() >= deadline {
+                                    continue;
+                                }
+                                control.clear_target_wait();
+                                break;
+                            }
+                            PauseReason::PixelColor
+                        }
+                    };
+                    let now = Instant::now();
+                    let outcome = control.wait_for_target(
+                        reason,
+                        RETRY.min(deadline.saturating_duration_since(now)),
+                        self.index,
+                        deadline,
+                    )?;
+                    if stop_pending() {
+                        stop_observed = true;
+                        continue;
+                    }
+                    if let Some(outcome) = outcome {
+                        return Ok(outcome);
+                    }
+                }
+                if skip_next {
+                    // A skip never crosses a loop boundary.
+                    self.index += 1;
+                }
+                retries.finish();
+            }
+            if let Step::Action(action) = step
+                && let Action::Text { text } = &action.action
+            {
+                let mut text_focus = None;
+                for character in text.chars() {
+                    if schedule
+                        .limit
+                        .is_some_and(|limit| control.route_actions() >= limit)
+                    {
+                        return Ok(control
+                            .wait_route(Instant::now())?
+                            .unwrap_or(Outcome::Completed));
+                    }
+                    match self.send_step(
+                        step,
+                        RouteInput::Text(character),
+                        guard,
+                        control,
+                        &mut stop_pending,
+                        Some(&mut text_focus),
+                    )? {
+                        StepResult::End(outcome) => return Ok(outcome),
+                        StepResult::Sent(at) => last_action = Some(at),
+                        StepResult::Timeout(error, _) => return Err(error),
+                    }
+                }
+                self.index += 1;
+                continue;
             }
             let input = match step {
                 Step::Action(action) => match &action.action {
@@ -975,6 +1697,15 @@ impl Route {
                         crate::keys::parse(key)
                             .ok_or("The route key is unavailable on this keyboard layout.")?,
                     )),
+                    Action::Text { .. } => unreachable!("text is sent character by character"),
+                    Action::WaitColor { .. } | Action::WaitImage { .. } | Action::Flow { .. } => {
+                        None
+                    }
+                    Action::Recorded { .. } => {
+                        return Err(
+                            "Recorded events cannot be mixed with other route steps.".into()
+                        );
+                    }
                 },
                 _ if settings.keyboard => return Err(INHERITED_ROUTE_OUTPUT.into()),
                 _ if settings.scroll => Some(RouteInput::Scroll(
@@ -984,19 +1715,277 @@ impl Route {
                 _ => Some(RouteInput::Click(settings.button, settings.click_count())),
             };
             if let Some(input) = input {
-                match self.send_step(step, input, guard, control, &mut stop_pending)? {
+                let before = control.route_actions();
+                let result = self.send_step(step, input, guard, control, &mut stop_pending, None);
+                if control.route_actions() > before && retries.sent(self.index) {
+                    control.record_click_retry();
+                }
+                match result? {
                     StepResult::End(outcome) => return Ok(outcome),
                     StepResult::Sent(at) => last_action = Some(at),
+                    StepResult::Timeout(error, recoverable) => timeout!(error, recoverable),
                 }
+            }
+            recovery_attempts[self.index] = 0;
+            self.index += 1;
+        }
+    }
+
+    fn recorded_sequence(
+        &mut self,
+        settings: &crate::settings::Settings,
+        schedule: Schedule,
+        guard: &mut Guard,
+        control: &mut RunControl<'_>,
+        stop_pending: &mut impl FnMut() -> bool,
+    ) -> Result<Outcome, String> {
+        use crate::recording::Event;
+        let mut player = crate::mouse::MacroPlayer::new()?;
+        let mut key_focus: Option<Focus> = None;
+        loop {
+            if !player.has_held()
+                && schedule
+                    .limit
+                    .is_some_and(|limit| control.route_actions() >= limit)
+            {
+                return Ok(Outcome::Completed);
+            }
+            let Step::Action(step) = &self.steps[self.index] else {
+                return Err("The recording contains another type of route step.".into());
+            };
+            let Action::Recorded { event } = &step.action else {
+                return Err("The recording contains another type of route step.".into());
+            };
+            let deadline = Instant::now() + Duration::from_millis(step.delay_ms.into());
+            loop {
+                if stop_pending() {
+                    return Ok(Outcome::Stopped);
+                }
+                match guard.check() {
+                    Gate::Stop(reason) => return Ok(Outcome::Guarded(reason)),
+                    Gate::Paused(_) if player.has_held() => {
+                        return Ok(Outcome::Guarded(
+                            "A safety condition changed while an input was held.",
+                        ));
+                    }
+                    _ => {}
+                }
+                if player.has_held_keys()
+                    && key_focus.is_none_or(|focus| !focus.current(foreground_focus))
+                {
+                    return Ok(Outcome::Guarded(
+                        "Keyboard focus changed while a recorded key was held.",
+                    ));
+                }
+                if player.has_held_keys()
+                    && key_focus.is_some_and(|focus| {
+                        !matches!(guard.check_route_key(focus.recipient_pid), Gate::Open)
+                    })
+                {
+                    return Ok(Outcome::Guarded("Keyboard input is no longer permitted."));
+                }
+                if player.has_held_buttons() {
+                    let cursor = crate::mouse::cursor().map_err(|_| "Cursor access was lost.")?;
+                    if !matches!(guard.check_destination(Some(cursor)), Gate::Open) {
+                        return Ok(Outcome::Guarded("Mouse input is no longer permitted."));
+                    }
+                }
+                let now = Instant::now();
+                if let Some(outcome) = control.wait_route(deadline.min(now + RESPONSE_POLL))? {
+                    return Ok(outcome);
+                }
+                if now >= deadline {
+                    break;
+                }
+            }
+            let dispatch_deadline = Instant::now() + self.timeout;
+            loop {
+                if stop_pending() {
+                    return Ok(Outcome::Stopped);
+                }
+                let mut authorized_focus = None;
+                let mut authorized_mouse = None;
+                let gate = match event {
+                    Event::Key { .. } => {
+                        match Focus::authorize_key(foreground_focus, |pid| {
+                            guard.check_route_key(pid)
+                        }) {
+                            Ok(focus) if key_focus.is_none_or(|saved| saved == focus) => {
+                                authorized_focus = Some(focus);
+                                Gate::Open
+                            }
+                            Ok(_) => Gate::Paused(PauseReason::KeyboardFocus),
+                            Err(gate) => gate,
+                        }
+                    }
+                    Event::Move(point)
+                    | Event::Button { point, .. }
+                    | Event::Scroll { point, .. } => {
+                        let hit = unsafe {
+                            wm::WindowFromPoint(POINT {
+                                x: point.x,
+                                y: point.y,
+                            })
+                        };
+                        let pid = window_pid(hit.0);
+                        if hit.is_invalid() || pid == 0 || pid == std::process::id() {
+                            Gate::Paused(PauseReason::TargetUnavailable)
+                        } else {
+                            authorized_mouse = Some((hit.0 as usize, pid));
+                            guard.check_destination(Some(*point))
+                        }
+                    }
+                };
+                match gate {
+                    Gate::Stop(reason) => return Ok(Outcome::Guarded(reason)),
+                    Gate::Paused(_) if player.has_held() => {
+                        return Ok(Outcome::Guarded(
+                            "A safety condition changed while an input was held.",
+                        ));
+                    }
+                    Gate::Paused(_) => {
+                        if Instant::now() >= dispatch_deadline {
+                            return Err(self.timed_out(
+                                &self.steps[self.index].label(),
+                                "The recorded input target was unavailable.",
+                            ));
+                        }
+                        if let Some(outcome) = control.retry_dispatch(gate)? {
+                            return Ok(outcome);
+                        }
+                        continue;
+                    }
+                    Gate::Open => {}
+                }
+                if let Some(outcome) = control.begin_dispatch() {
+                    return Ok(outcome);
+                }
+                if stop_pending() {
+                    return Ok(Outcome::Stopped);
+                }
+                if matches!(event, Event::Key { down: true, .. }) && !player.has_held_keys() {
+                    key_focus = authorized_focus;
+                }
+                if key_focus.is_some_and(|focus| !focus.current(foreground_focus))
+                    || authorized_focus.is_some_and(|focus| !focus.current(foreground_focus))
+                {
+                    return Ok(Outcome::Guarded(
+                        "Keyboard focus changed before recorded input was sent.",
+                    ));
+                }
+                if let (
+                    Some((window, pid)),
+                    Event::Move(point) | Event::Button { point, .. } | Event::Scroll { point, .. },
+                ) = (authorized_mouse, event)
+                {
+                    let hit = unsafe {
+                        wm::WindowFromPoint(POINT {
+                            x: point.x,
+                            y: point.y,
+                        })
+                    };
+                    if hit.0 as usize != window
+                        || window_pid(hit.0) != pid
+                        || !matches!(guard.check_destination(Some(*point)), Gate::Open)
+                    {
+                        return Ok(Outcome::Guarded(
+                            "The recorded mouse target changed before input was sent.",
+                        ));
+                    }
+                }
+                player.send(event)?;
+                if matches!(
+                    event,
+                    Event::Key { down: true, .. }
+                        | Event::Button { down: true, .. }
+                        | Event::Scroll { .. }
+                ) {
+                    control.record_tap();
+                }
+                if !player.has_held_keys() {
+                    key_focus = None;
+                }
+                break;
             }
             self.index += 1;
             if self.index == self.steps.len() {
                 if settings.route_once {
-                    return Ok(control
-                        .wait_route(Instant::now())?
-                        .unwrap_or(Outcome::Completed));
+                    return Ok(Outcome::Completed);
                 }
                 self.index = 0;
+            }
+        }
+    }
+
+    fn test_workflow_pixel(
+        &self,
+        test: &crate::workflow::PixelTest,
+        guard: &mut Guard,
+        control: &mut RunControl<'_>,
+        stop_pending: &mut impl FnMut() -> bool,
+    ) -> Result<Result<bool, Outcome>, String> {
+        let deadline = Instant::now() + self.timeout;
+        let mut stop_observed = false;
+        loop {
+            stop_observed |= stop_pending();
+            if stop_observed {
+                if let Some(outcome) = wait_for_pending_stop(control)? {
+                    return Ok(Err(outcome));
+                }
+                continue;
+            }
+            if let Some(outcome) = control.wait_route(Instant::now())? {
+                if stop_pending() {
+                    stop_observed = true;
+                    continue;
+                }
+                return Ok(Err(outcome));
+            }
+            match guard.check() {
+                Gate::Stop(reason) => return Ok(Err(Outcome::Guarded(reason))),
+                gate if Instant::now() >= deadline => {
+                    if stop_pending() {
+                        stop_observed = true;
+                        continue;
+                    }
+                    let hint = match gate {
+                        Gate::Paused(reason) => crate::pause_hint(reason),
+                        _ => "The condition could not be evaluated in time.",
+                    };
+                    return Err(self.timed_out("the workflow condition", hint));
+                }
+                Gate::Open => {
+                    let value = self.validate_layout(test.point).and_then(|()| {
+                        crate::target_pixels::pixel_rgb(test.point)
+                            .ok_or_else(|| "The condition's screen pixel could not be read.".into())
+                    });
+                    if stop_pending() {
+                        stop_observed = true;
+                        continue;
+                    }
+                    if let Some(outcome) = control.wait_route(Instant::now())? {
+                        return Ok(Err(outcome));
+                    }
+                    control.clear_target_wait();
+                    return Ok(Ok(crate::target_pixels::pixel_condition_matches(
+                        value?,
+                        test.rgb,
+                        test.tolerance,
+                        test.different,
+                    )));
+                }
+                Gate::Paused(reason) => {
+                    let interval = RETRY.min(deadline.saturating_duration_since(Instant::now()));
+                    if let Some(outcome) =
+                        control.wait_for_target(reason, interval, self.index, deadline)?
+                    {
+                        if stop_pending() {
+                            stop_observed = true;
+                            continue;
+                        }
+                        return Ok(Err(outcome));
+                    }
+                }
             }
         }
     }
@@ -1008,11 +1997,12 @@ impl Route {
         guard: &mut Guard,
         control: &mut RunControl<'_>,
         stop_pending: &mut impl FnMut() -> bool,
+        mut text_focus: Option<&mut Option<Focus>>,
     ) -> Result<StepResult, String> {
         let deadline = Instant::now() + self.timeout;
         let mut last_reason = PauseReason::TargetMissing;
         let mut request = None;
-        let key = matches!(input, RouteInput::Key(_));
+        let key = matches!(input, RouteInput::Key(_) | RouteInput::Text(_));
         let scroll = matches!(input, RouteInput::Scroll(..));
         let clicked = 'send: loop {
             if let Some(outcome) = control.wait_route(Instant::now())? {
@@ -1069,6 +2059,10 @@ impl Route {
                         Err(Gate::Paused(reason)) => break 'ready (reason, RESPONSE_POLL),
                         Err(Gate::Open) => unreachable!(),
                     };
+                    if !text_focus_matches(text_focus.as_ref().and_then(|saved| **saved), key_focus)
+                    {
+                        break 'ready (PauseReason::KeyboardFocus, RESPONSE_POLL);
+                    }
                     if input.is_held() {
                         break 'ready (PauseReason::InputGrabbed, RESPONSE_POLL);
                     }
@@ -1126,7 +2120,12 @@ impl Route {
                             break 'ready (PauseReason::TargetUnavailable, RESPONSE_POLL);
                         }
                         RouteDelivery::End(end) => return Ok(StepResult::End(end)),
-                        RouteDelivery::Sent => break 'send (target, Instant::now()),
+                        RouteDelivery::Sent => {
+                            if let Some(saved) = text_focus.as_deref_mut() {
+                                *saved = key_focus;
+                            }
+                            break 'send (target, Instant::now());
+                        }
                     }
                 }
             };
@@ -1139,7 +2138,13 @@ impl Route {
                 return Ok(StepResult::End(outcome));
             }
             if Instant::now() >= deadline {
-                return Err(self.timed_out(&step.label(), crate::pause_hint(reason)));
+                return Ok(StepResult::Timeout(
+                    self.timed_out(&step.label(), crate::pause_hint(reason)),
+                    matches!(
+                        reason,
+                        PauseReason::TargetMissing | PauseReason::TargetAmbiguous
+                    ),
+                ));
             }
         };
         if let Some(saved) = step.control().filter(|saved| saved.wait_for_disappearance)
@@ -1319,6 +2324,7 @@ impl Route {
 }
 
 enum StepResult {
+    Timeout(String, bool),
     Sent(Instant),
     End(Outcome),
 }
@@ -1367,6 +2373,156 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pixel_retry_budget_is_bounded_and_resets_after_a_condition() {
+        let mut retries = PixelRetries::default();
+        retries.enter(2);
+        assert!(retries.available(2));
+        assert_eq!(retries.schedule(2), Some(1));
+        assert!(!retries.sent(0));
+        assert!(retries.sent(1));
+        retries.enter(2);
+        assert_eq!(retries.schedule(2), Some(1));
+        assert!(!retries.available(2));
+        assert_eq!(retries.schedule(2), None);
+        assert!(retries.sent(1));
+        retries.finish();
+        retries.enter(2);
+        assert!(retries.available(2));
+        assert_eq!(retries.schedule(2), Some(1));
+        retries.finish();
+        retries.enter(0);
+        assert_eq!(retries.schedule(2), None);
+    }
+
+    #[test]
+    fn one_time_pixel_check_branches_only_on_a_mismatch() {
+        assert_eq!(immediate_pixel_failure(false, false, true), None);
+        assert_eq!(immediate_pixel_failure(true, true, true), None);
+        assert_eq!(immediate_pixel_failure(true, false, false), Some(false));
+        assert_eq!(immediate_pixel_failure(true, false, true), Some(true));
+    }
+
+    #[test]
+    fn pending_shortcut_waits_for_stop_even_when_run_time_expires() {
+        let stop = Arc::new(crate::engine::StopSignal::new().unwrap());
+        let delayed = stop.clone();
+        let (ready, started) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            delayed.request();
+        });
+        let progress = crate::engine::Progress::default();
+        let result = crate::engine::run_sequence(
+            Schedule {
+                duration: Some(Duration::from_millis(5)),
+                ..Schedule::default()
+            },
+            &stop,
+            &progress,
+            None,
+            |control| {
+                ready.send(()).unwrap();
+                loop {
+                    if let Some(outcome) = wait_for_pending_stop(control)? {
+                        return Ok(outcome);
+                    }
+                }
+            },
+        );
+        thread.join().unwrap();
+        assert_eq!(result, Ok(Outcome::Stopped));
+        assert_eq!(progress.actions(), 0);
+    }
+
+    #[test]
+    fn pixel_timeout_skip_never_overrides_stop_or_guard() {
+        assert!(may_skip_pixel_timeout(true, Gate::Open, false));
+        assert!(!may_skip_pixel_timeout(false, Gate::Open, false));
+        assert!(!may_skip_pixel_timeout(true, Gate::Open, true));
+        assert!(!may_skip_pixel_timeout(
+            true,
+            Gate::Paused(PauseReason::KeyboardFilter),
+            false
+        ));
+        assert!(!may_skip_pixel_timeout(true, Gate::Stop("stop"), false));
+    }
+
+    #[test]
+    fn pixel_stability_resets_after_a_mismatch() {
+        let start = Instant::now();
+        let required = Duration::from_millis(200);
+        let mut since = None;
+        assert!(!stable_pixel_match(&mut since, true, start, required));
+        assert!(!stable_pixel_match(
+            &mut since,
+            true,
+            start + Duration::from_millis(100),
+            required
+        ));
+        assert!(!stable_pixel_match(
+            &mut since,
+            false,
+            start + Duration::from_millis(150),
+            required
+        ));
+        assert!(!stable_pixel_match(
+            &mut since,
+            true,
+            start + Duration::from_millis(200),
+            required
+        ));
+        assert!(!stable_pixel_match(
+            &mut since,
+            true,
+            start + Duration::from_millis(399),
+            required
+        ));
+        assert!(stable_pixel_match(
+            &mut since,
+            true,
+            start + Duration::from_millis(400),
+            required
+        ));
+        assert!(stable_pixel_match(&mut None, true, start, Duration::ZERO));
+    }
+
+    #[test]
+    fn finite_mixed_route_finishes_only_after_the_last_step() {
+        let mut index = 0;
+        let mut completed = 0;
+        for _ in 0..2 {
+            assert!(!advance_route(
+                &mut index,
+                3,
+                &mut completed,
+                false,
+                Some(2)
+            ));
+            assert!(!advance_route(
+                &mut index,
+                3,
+                &mut completed,
+                false,
+                Some(2)
+            ));
+            if completed == 0 {
+                assert!(!advance_route(
+                    &mut index,
+                    3,
+                    &mut completed,
+                    false,
+                    Some(2)
+                ));
+                assert_eq!((index, completed), (0, 1));
+            } else {
+                assert!(advance_route(&mut index, 3, &mut completed, false, Some(2)));
+                assert_eq!((index, completed), (3, 2));
+            }
+        }
+    }
+
+    #[test]
     fn route_key_rechecks_the_focus_used_for_authorization() {
         use std::cell::Cell;
 
@@ -1409,6 +2565,10 @@ mod tests {
             ..allowed
         })));
         assert!(!allowed.current(|| None));
+        assert!(text_focus_matches(None, Some(allowed)));
+        assert!(text_focus_matches(Some(allowed), Some(allowed)));
+        assert!(!text_focus_matches(Some(allowed), Some(blocked)));
+        assert!(!text_focus_matches(Some(allowed), None));
     }
 
     #[test]

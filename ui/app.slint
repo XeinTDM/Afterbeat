@@ -1,4 +1,4 @@
-import { AboutSlint, ComboBox, Palette, ScrollView } from "std-widgets.slint";
+import { AboutSlint, ComboBox, ListView, Palette, ScrollView, SpinBox, TextEdit } from "std-widgets.slint";
 
 export component StartupError inherits Window {
     title: "Afterbeat";
@@ -483,16 +483,14 @@ component SelectionList inherits Rectangle {
         text: root.empty-text;
         wrap: word-wrap;
     }
-    list := ScrollView {
+    list := ListView {
         visible: root.row-count > 0;
         x: 3px; y: 3px;
         width: root.width - 6px; height: root.height - 6px;
         content-width: self.visible-width;
-        content-height: root.row-count * root.row-height;
         for i in root.row-count: ActionButton {
-            y: i * root.row-height;
             width: parent.width - 13px;
-            height: root.row-height - 1px;
+            height: root.row-height;
             label: root.row-label(i);
             detail: root.row-detail(i);
             hint: self.detail == "" ? self.label : self.label + " · " + self.detail;
@@ -538,6 +536,17 @@ component RunButton inherits ActionButton {
     height: 34px * Theme.text-scale;
 }
 
+export struct ShareReviewItem {
+    title: string,
+    details: string,
+    has-visual: bool,
+    visual-status: string,
+    target-image: image,
+    landmark-image: image,
+    has-image-template: bool,
+    image-template: image,
+}
+
 export struct DryArea {
     x: float,
     y: float,
@@ -554,6 +563,7 @@ export struct DryPoint {
     blocked: bool,
     terminal: bool,
     counts-as-action: bool,
+    action-count: int,
     hidden: bool,
     repair: bool,
     location: string,
@@ -714,6 +724,7 @@ export component App inherits Window {
     in-out property <string> max-rate: "12";
     in-out property <bool> route-enabled;
     in-out property <bool> route-once;
+    in-out property <string> route-iterations: "0";
     in-out property <string> route-radius: "0";
     in-out property <string> target-timeout: "10";
     in-out property <bool> capture-visual;
@@ -725,10 +736,26 @@ export component App inherits Window {
         root.route-move-error = "";
     }
     in property <bool> smart-targets-available;
+    in property <bool> recording-available;
+    in property <bool> recording-windows;
+    in property <bool> recording-macos;
     in property <bool> route-smart;
     in property <bool> route-actions;
+    in property <bool> route-recorded;
+    in-out property <int> recording-state: 0;
+    in-out property <bool> record-movement: true;
+    in-out property <bool> record-buttons: true;
+    in-out property <bool> record-keys: false;
+    in property <int> recorded-count;
     in property <[int]> route-control-rows;
     in-out property <bool> step-editing;
+    in property <bool> step-recorded;
+    in property <int> recorded-kind;
+    in-out property <string> recorded-x;
+    in-out property <string> recorded-y;
+    in-out property <string> recorded-key;
+    in-out property <bool> recorded-extended;
+    in-out property <bool> recorded-down;
     in property <int> step-edit-index: -1;
     in property <bool> step-has-target;
     in property <bool> step-control-target;
@@ -740,6 +767,30 @@ export component App inherits Window {
     in-out property <string> step-delay;
     in-out property <string> step-count;
     in-out property <string> step-key;
+    in-out property <string> step-pixel-tolerance: "0";
+    in-out property <bool> step-pixel-different;
+    in-out property <string> step-pixel-stable: "0";
+    in-out property <bool> step-pixel-skip-next;
+    in-out property <bool> step-pixel-check-once;
+    in-out property <string> step-pixel-retries: "0";
+    in-out property <string> step-pixel-preview;
+    in-out property <string> step-image-capture-rect: "0, 0, 32, 32";
+    in-out property <string> step-image-search: "0, 0, 320, 240";
+    in-out property <string> step-image-template;
+    in-out property <string> step-image-threshold: "90";
+    in-out property <string> step-image-timeout: "10000";
+    in-out property <string> step-image-preview;
+    in-out property <image> step-image-reference-image;
+    in-out property <image> step-image-match-image;
+    in-out property <bool> step-image-has-match;
+    in-out property <int> step-image-output;
+    in-out property <bool> step-image-scaled;
+    in-out property <int> step-image-corner-x;
+    in-out property <int> step-image-corner-y;
+    in-out property <int> step-flow-kind;
+    in-out property <string> step-flow-count: "2";
+    in-out property <bool> step-flow-skip;
+    private property <bool> step-flow-predicate: root.step-kind == 7 && (root.step-flow-kind == 0 || root.step-flow-kind == 5);
     in-out property <string> step-error;
     private property <int> selected-control:
         root.route-index >= 0 && root.route-index < root.route-control-rows.length ?
@@ -749,6 +800,17 @@ export component App inherits Window {
     in-out property <string> process-names;
     in-out property <int> pick-kind: 1;
     in-out property <string> profile-name;
+    in-out property <string> preset-transfer-path;
+    in-out property <string> import-name;
+    in-out property <string> import-summary;
+    in-out property <string> import-error;
+    in-out property <bool> import-ready;
+    in property <[ShareReviewItem]> share-review-items;
+    in-out property <int> share-review-index: 0;
+    in-out property <int> share-review-kind: 0;
+    in-out property <string> share-review-name;
+    in-out property <string> share-review-path;
+    in-out property <string> share-review-metadata;
 
     in property <bool> input-ready;
     in property <bool> native-wayland;
@@ -842,6 +904,7 @@ export component App inherits Window {
     callback apply-shortcut();
     callback discard-and-close();
     callback edit-route(int);
+    callback recording-action(int);
     callback move-route-to();
     callback undo-route-removal();
     callback toggle-target-verification();
@@ -913,8 +976,9 @@ export component App inherits Window {
         root.capture-shortcut-kind == 1 ? "Add point" :
         root.capture-shortcut-kind == 2 ? "Inside corner" :
         root.capture-shortcut-kind == 3 ? "Stop corner" :
+        root.capture-shortcut-kind == 6 ? "Pick pixel" :
         root.capture-shortcut-kind == 5 ? "Pick control" : "Pick point";
-    private property <bool> locked: root.active || root.capturing || root.step-editing || root.preset-load-open;
+    private property <bool> locked: root.active || root.capturing || root.step-editing || root.preset-load-open || root.recording-state == 1 || root.recording-state == 2;
     private property <bool> valid: root.configuration-error == "";
     private property <bool> available: root.can-start && root.input-ready;
     private property <bool> inline-configuration-error:
@@ -975,10 +1039,11 @@ export component App inherits Window {
     private property <bool> show-run-button: root.page != 4 && (root.active || !root.hold-activation);
     private property <string> run-button-label: root.stopping ? "Stopping…" : root.active ? "Stop run" : "Start run";
     out property <bool> run-button-enabled: root.page != 4 && !root.stopping && !root.capturing && !root.step-editing &&
+        root.recording-state != 1 && root.recording-state != 2 &&
         (!root.shortcut-editing || root.active) &&
         !root.preset-load-open && (root.active || (root.available && root.valid && root.armed && !root.hold-activation));
     private property <string> hold-instructions: root.page != 4 && root.hold-activation &&
-        !root.active && !root.capturing && root.available && root.valid && root.armed && root.has-toggle ?
+        !root.active && !root.capturing && root.recording-state != 1 && root.recording-state != 2 && root.available && root.valid && root.armed && root.has-toggle ?
         "Hold " + root.toggle-key + " to start. Release to stop." : "";
     private property <string> run-metrics: root.session-count + " actions  ·  " +
         (root.session-rate == "—" ? "—" : root.session-rate + "/s") + "  ·  " + root.session-elapsed;
@@ -991,7 +1056,7 @@ export component App inherits Window {
     out property <string> setup-summary:
         root.output-summary + "  ·  " + root.pace-value + "  ·  " +
         (root.route-enabled ? (root.route-smart || root.route-actions ? "\{root.route-count}-step route" : "\{root.route-count}-point route") +
-            (root.route-once ? " · Once" : " · Loop") : root.keyboard ? "Foreground app" :
+            (root.route-once ? " · Once" : !root.route-recorded && root.route-iterations != "0" ? " · " + root.route-iterations + " loops" : " · Loop") : root.keyboard ? "Foreground app" :
             root.fixed-target ? "Fixed point · " + root.point-label : "Follow cursor") +
         root.limit-summary +
         (!root.hold-activation && root.delay > 0 ? "  ·  \{root.delay} s delay" : "") +
@@ -1076,7 +1141,7 @@ export component App inherits Window {
             root.dry-playback-step += 1;
             root.dry-step = root.dry-playback-step;
             let step = root.dry-points[root.dry-playback-step];
-            if (!step.blocked && step.counts-as-action) { root.dry-playback-actions += 1; }
+            if (!step.blocked && step.counts-as-action) { root.dry-playback-actions += step.action-count; }
         }
         if (root.dry-at-end) {
             root.dry-playing = false;
@@ -1819,7 +1884,7 @@ export component App inherits Window {
                                 if (pick-point.enabled && pick-point.visible) { pick-point.focus(); }
                                 else if (target-mode.enabled) { target-mode.focus(); }
                             }
-                            if (root.route-enabled): Secondary { text: root.route-smart || root.route-actions ? "\{root.route-count} steps" : "\{root.route-count} points"; }
+                            if (root.route-enabled): Secondary { text: root.route-smart || root.route-actions || root.route-recorded ? "\{root.route-count} steps" : "\{root.route-count} points"; }
                             if (root.route-enabled): ActionButton { label: "Edit route"; activated => { root.show-page(2); } }
                             target-mode := Choices {
                                 label: "Target";
@@ -1911,13 +1976,17 @@ export component App inherits Window {
                         if (root.show-clicker-options): FieldRow {
                             compact: root.stack-fields;
                             label: "Start delay";
-                            Choices {
-                                label: "Start delay";
+                            ComboBox {
+                                accessible-label: "Start delay";
                                 width: 225px * min(1.65, Theme.text-scale);
-                                labels: ["None", "1 s", "3 s"];
-                                current: root.delay == 3 ? 2 : root.delay;
+                                height: 36px * Theme.text-scale;
+                                model: ["None", "1 second", "3 seconds", "10 seconds", "30 seconds", "1 minute", "5 minutes", "15 minutes", "1 hour"];
+                                current-index: root.delay == 1 ? 1 : root.delay == 3 ? 2 : root.delay == 10 ? 3 : root.delay == 30 ? 4 : root.delay == 60 ? 5 : root.delay == 300 ? 6 : root.delay == 900 ? 7 : root.delay == 3600 ? 8 : 0;
                                 enabled: !root.locked && !root.hold-activation;
-                                selected(index) => { root.delay = index == 2 ? 3 : index; root.settings-edited(); }
+                                selected => {
+                                    root.delay = self.current-index == 1 ? 1 : self.current-index == 2 ? 3 : self.current-index == 3 ? 10 : self.current-index == 4 ? 30 : self.current-index == 5 ? 60 : self.current-index == 6 ? 300 : self.current-index == 7 ? 900 : self.current-index == 8 ? 3600 : 0;
+                                    root.settings-edited();
+                                }
                             }
                             if (root.hold-activation): Secondary { text: "Hold starts immediately"; }
                         }
@@ -2202,17 +2271,30 @@ export component App inherits Window {
                                 Secondary { text: "Radius"; }
                                 if (!root.route-enabled && root.route-count > 0): Secondary { text: "Route off"; }
                             }
+                            if (root.route-enabled && !root.route-once && !root.route-recorded): FieldRow {
+                                compact: root.stack-fields;
+                                label: "Route loops";
+                                error: root.field-error("route");
+                                NumberField {
+                                    width: 105px;
+                                    label: "Route loop count";
+                                    enabled: !root.locked;
+                                    value <=> root.route-iterations;
+                                    edited => { root.settings-edited(); }
+                                }
+                                Secondary { text: "0 repeats until stopped. A limit can stop a route partway through."; wrap: word-wrap; }
+                            }
                             FieldRow {
                                 compact: root.stack-fields;
                                 label: "Add target";
                                 ActionButton {
                                     label: root.native-wayland ? "Add coordinates" : root.capturing && root.pick-kind == 1 ? "Cancel" : "Add in 3s";
-                                    enabled: !root.step-editing && !root.active && (!root.capturing || root.pick-kind == 1) && (!root.native-wayland || root.wayland-displays != "");
+                                    enabled: !root.route-recorded && !root.step-editing && !root.active && root.recording-state != 1 && root.recording-state != 2 && (!root.capturing || root.pick-kind == 1) && (!root.native-wayland || root.wayland-displays != "");
                                     activated => { root.capture-point(1); }
                                 }
                                 if (root.smart-targets-available): ActionButton {
                                     label: root.capturing && root.pick-kind == 5 ? "Cancel" : "Pick control";
-                                    enabled: !root.step-editing && !root.active && (!root.capturing || root.pick-kind == 5);
+                                    enabled: !root.route-recorded && !root.step-editing && !root.active && root.recording-state != 1 && root.recording-state != 2 && (!root.capturing || root.pick-kind == 5);
                                     activated => { root.capture-point(5); }
                                 }
                             }
@@ -2236,8 +2318,8 @@ export component App inherits Window {
                                 alignment: start;
                                 flex-wrap: wrap;
                                 spacing: 8px;
-                                if (root.smart-targets-available): ActionButton { label: "Add step"; enabled: !root.locked; activated => { root.edit-step(-1); } }
-                                if (root.smart-targets-available): ActionButton { label: "Edit step"; enabled: !root.locked && root.route-index >= 0; activated => { root.edit-step(root.route-index); } }
+                                if (root.smart-targets-available): ActionButton { label: "Add step"; enabled: !root.locked && !root.route-recorded; activated => { root.edit-step(-1); } }
+                                if (root.smart-targets-available || (root.recording-available && root.route-recorded)): ActionButton { label: "Edit step"; enabled: !root.locked && root.route-index >= 0; activated => { root.edit-step(root.route-index); } }
                                 ActionButton { label: "Move up"; enabled: !root.locked && root.route-index > 0; activated => { root.edit-route(-1); } }
                                 ActionButton { label: "Move down"; enabled: !root.locked && root.route-index >= 0 && root.route-index + 1 < root.route-count; activated => { root.edit-route(1); } }
                                 ActionButton { label: "Remove"; enabled: !root.locked && root.route-index >= 0; activated => { root.edit-route(0); } }
@@ -2299,27 +2381,49 @@ export component App inherits Window {
                                     text: root.step-inherited-summary;
                                     wrap: word-wrap;
                                 }
-                                if (!root.step-inherits): FieldRow {
+                                if (!root.step-inherits && !root.step-recorded && !root.step-has-target): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Action";
+                                    Choices {
+                                        width: 400px * min(1.4, Theme.text-scale);
+                                        label: "Step action";
+                                        enabled: !root.capturing;
+                                        labels: ["Wait", "Key press", "Text", "Pixel", "Image"];
+                                        current: root.step-kind == 1 ? 0 : root.step-kind < 7 ? root.step-kind - 2 : -1;
+                                        selected(index) => {
+                                            root.step-kind = index == 0 ? 1 : index + 2;
+                                            root.step-edited = true;
+                                            root.step-error = "";
+                                        }
+                                    }
+                                    ActionButton {
+                                        label: "Workflow";
+                                        enabled: !root.capturing;
+                                        selected: root.step-kind == 7;
+                                        activated => { root.step-kind = 7; root.step-edited = true; root.step-error = ""; }
+                                    }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-has-target): FieldRow {
                                     compact: root.stack-fields;
                                     label: "Action";
                                     Choices {
                                         label: "Step action";
+                                        enabled: !root.capturing;
                                         width: 275px * min(1.4, Theme.text-scale);
                                         labels: root.step-control-target ? ["Click", "Scroll", "Key press"] :
-                                            root.step-has-target ? ["Click", "Scroll"] : ["Wait", "Key press"];
+                                            ["Click", "Scroll"];
                                         current: root.step-control-target ? (root.step-kind == 0 ? 0 : root.step-kind - 1) :
-                                            root.step-has-target ? root.step-kind / 2 : (root.step-kind == 1 ? 0 : 1);
+                                            root.step-kind / 2;
                                         selected(index) => {
                                             root.step-edited = true;
                                             if (root.step-has-target && ((root.step-kind == 2) != (index == 1))) {
                                                 root.step-count = "1";
                                             }
-                                            root.step-kind = root.step-has-target ? (index == 0 ? 0 : index + 1) :
-                                                (index == 0 ? 1 : 3);
+                                            root.step-kind = index == 0 ? 0 : index + 1;
                                         }
                                     }
                                 }
-                                if (!root.step-inherits && (root.step-kind == 0 || root.step-kind == 2)): FieldRow {
+                                if (!root.step-inherits && !root.step-recorded && (root.step-kind == 0 || root.step-kind == 2)): FieldRow {
                                     compact: root.stack-fields;
                                     label: root.step-kind == 0 ? "Mouse button" : "Direction";
                                     Choices {
@@ -2341,16 +2445,241 @@ export component App inherits Window {
                                         edited => { root.step-edited = true; }
                                     }
                                 }
-                                if (!root.step-inherits && root.step-kind == 3): FieldRow {
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 3): FieldRow {
                                     compact: root.stack-fields;
                                     label: "Key press";
                                     NumberField { width: 125px; label: "Route key"; value <=> root.step-key; edited => { root.step-edited = true; } }
                                     Secondary { text: root.step-control-target ? "Requires the captured control to have focus." : "Sends to the focused app."; wrap: word-wrap; }
                                 }
-                                if (!root.step-inherits): FieldRow {
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 4): FieldRow {
                                     compact: root.stack-fields;
-                                    label: root.step-kind == 1 ? "Wait duration" : "Delay before input";
-                                    NumberField { width: 108px; label: "Step delay"; unit: "ms"; value <=> root.step-delay; edited => { root.step-edited = true; } }
+                                    label: "Text";
+                                    NumberField { width: 240px; label: "Text to type"; value <=> root.step-key; edited => { root.step-edited = true; } }
+                                    Secondary { text: "Types into the focused app. Each character counts as one action."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Reference region";
+                                    NumberField { width: 190px; label: "Reference region x, y, width, height"; enabled: !root.capturing; value <=> root.step-image-capture-rect; }
+                                    ActionButton {
+                                        label: root.capturing && (root.pick-kind == 10 || root.pick-kind == 11) ? "Cancel selection" : "Pick corners";
+                                        enabled: !root.capturing || root.pick-kind == 10 || root.pick-kind == 11;
+                                        activated => { root.capture-point(10); }
+                                    }
+                                    ActionButton {
+                                        label: root.capturing && root.pick-kind == 8 ? "Cancel capture" : "Capture in 3s";
+                                        enabled: !root.capturing || root.pick-kind == 8;
+                                        activated => { root.capture-point(8); }
+                                    }
+                                    Secondary { text: root.step-image-template == "" ? "Enter x, y, width, height; each side must be 8–64 pixels." : "Reference image captured. Enter a region to replace it."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Search region";
+                                    NumberField { width: 190px; label: "Search region x, y, width, height"; enabled: !root.capturing; value <=> root.step-image-search; edited => { root.step-edited = true; root.step-image-preview = ""; root.step-image-has-match = false; } }
+                                    ActionButton {
+                                        label: root.capturing && (root.pick-kind == 12 || root.pick-kind == 13) ? "Cancel selection" : "Pick corners";
+                                        enabled: !root.capturing || root.pick-kind == 12 || root.pick-kind == 13;
+                                        activated => { root.capture-point(12); }
+                                    }
+                                    ActionButton {
+                                        label: root.capturing && root.pick-kind == 9 ? "Cancel preview" : "Preview in 3s";
+                                        enabled: (!root.capturing || root.pick-kind == 9) && root.step-image-template != "";
+                                        activated => { root.capture-point(9); }
+                                    }
+                                    Secondary { text: "Search up to 512 × 512 pixels on one display."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "On match";
+                                    Choices {
+                                        label: "Image action";
+                                        width: 325px;
+                                        labels: ["Wait only", "Move", "Left click", "If found"];
+                                        current: root.step-image-output;
+                                        enabled: !root.capturing;
+                                        selected(index) => { root.step-image-output = index; root.step-edited = true; }
+                                    }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Image scales";
+                                    Choices {
+                                        label: "Image scales";
+                                        width: 235px;
+                                        labels: ["Original", "75–150%"];
+                                        current: root.step-image-scaled ? 1 : 0;
+                                        enabled: !root.capturing;
+                                        selected(index) => {
+                                            root.step-image-scaled = index == 1;
+                                            root.step-edited = true;
+                                            root.step-image-preview = "";
+                                            root.step-image-has-match = false;
+                                        }
+                                    }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6): FieldRow {
+                                    compact: root.stack-fields; label: "Match threshold";
+                                    NumberField { width: 95px; label: "Image match threshold percent"; unit: "%"; enabled: !root.capturing; value <=> root.step-image-threshold; edited => { root.step-edited = true; root.step-image-preview = ""; root.step-image-has-match = false; } }
+                                    Secondary { text: "70–100%. Higher requires a closer match."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6): FieldRow {
+                                    compact: root.stack-fields; label: "Image timeout";
+                                    NumberField { width: 120px; label: "Image timeout in milliseconds"; unit: "ms"; enabled: !root.capturing; value <=> root.step-image-timeout; edited => { root.step-edited = true; } }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6 && root.step-image-preview != ""): Secondary {
+                                    text: root.step-image-preview; wrap: word-wrap; accessible-live-region: polite;
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 6 && root.step-image-template != ""): HorizontalLayout {
+                                    alignment: start; spacing: 12px;
+                                    VerticalLayout { Label { text: "Reference"; } Image { width: 96px; height: 96px; source: root.step-image-reference-image; image-fit: contain; accessible-role: image; accessible-label: "Reference image"; } }
+                                    if (root.step-image-has-match): VerticalLayout { Label { text: "Match"; } Image { width: 96px; height: 96px; source: root.step-image-match-image; image-fit: contain; accessible-role: image; accessible-label: "Matched image"; } }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 7): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Workflow step";
+                                    ComboBox {
+                                        width: 215px * min(1.5, Theme.text-scale);
+                                        height: 36px * Theme.text-scale;
+                                        accessible-label: "Workflow step";
+                                        enabled: !root.capturing;
+                                        model: ["If pixel", "Else", "End if", "Repeat", "End repeat", "Exit repeat if pixel", "Recover next step"];
+                                        current-index: root.step-flow-kind;
+                                        selected => { root.step-flow-kind = self.current-index; root.step-edited = true; root.step-pixel-preview = ""; }
+                                    }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 7 && (root.step-flow-kind == 3 || root.step-flow-kind == 6)): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: root.step-flow-kind == 3 ? "Iterations" : "Retries";
+                                    NumberField { width: 105px; label: root.step-flow-kind == 3 ? "Repeat iterations" : "Retry attempts"; value <=> root.step-flow-count; edited => { root.step-edited = true; } }
+                                    if (root.step-flow-kind == 6): Choices {
+                                        label: "When retries run out";
+                                        width: 165px;
+                                        labels: ["Stop", "Skip"];
+                                        current: root.step-flow-skip ? 1 : 0;
+                                        selected(index) => { root.step-flow-skip = index == 1; root.step-edited = true; }
+                                    }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && (root.step-kind == 5 || root.step-flow-predicate)): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: root.step-pixel-check-once || root.step-flow-predicate ? "Check pixel" : "Wait for pixel";
+                                    NumberField { width: 190px; label: "Pixel x, y, and RGB color"; enabled: !root.capturing; value <=> root.step-key; edited => { root.step-edited = true; root.step-pixel-preview = ""; } }
+                                    ActionButton {
+                                        label: root.capturing && root.pick-kind == 6 ? "Cancel capture" : "Pick pixel in 3s";
+                                        enabled: !root.capturing || root.pick-kind == 6;
+                                        activated => { root.capture-point(6); }
+                                    }
+                                    ActionButton {
+                                        label: root.capturing && root.pick-kind == 7 ? "Cancel preview" : "Preview in 3s";
+                                        enabled: !root.capturing || root.pick-kind == 7;
+                                        activated => { root.capture-point(7); }
+                                    }
+                                    Secondary { text: "Move to the color and wait, or press the capture shortcut. You can also enter x, y, #RRGGBB."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && (root.step-kind == 5 || root.step-flow-predicate) && root.step-pixel-preview != ""): Secondary {
+                                    text: root.step-pixel-preview;
+                                    wrap: word-wrap;
+                                    accessible-live-region: polite;
+                                }
+                                if (!root.step-inherits && !root.step-recorded && (root.step-kind == 5 || root.step-flow-predicate)): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Pixel condition";
+                                    Choices {
+                                        label: "Pixel condition";
+                                        width: 205px;
+                                        labels: ["Matches", "Different"];
+                                        current: root.step-pixel-different ? 1 : 0;
+                                        enabled: !root.capturing;
+                                        selected(index) => { root.step-pixel-different = index == 1; root.step-edited = true; root.step-pixel-preview = ""; }
+                                    }
+                                    NumberField {
+                                        width: 95px;
+                                        label: "Per-channel tolerance from 0 to 255";
+                                        unit: "±";
+                                        enabled: !root.capturing;
+                                        value <=> root.step-pixel-tolerance;
+                                        edited => { root.step-edited = true; root.step-pixel-preview = ""; }
+                                    }
+                                    Secondary { text: "Tolerance applies to each RGB channel."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 5): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Check mode";
+                                    Choices {
+                                        label: "Pixel check mode";
+                                        width: 205px * min(1.6, Theme.text-scale);
+                                        labels: ["Wait", "Check once"];
+                                        current: root.step-pixel-check-once ? 1 : 0;
+                                        selected(index) => {
+                                            root.step-pixel-check-once = index == 1;
+                                            if (root.step-pixel-check-once) { root.step-pixel-stable = "0"; }
+                                            root.step-edited = true;
+                                        }
+                                    }
+                                    Secondary { text: "After the step delay, Check once samples as soon as the guards allow it."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 5 && !root.step-pixel-check-once): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Stable for";
+                                    NumberField {
+                                        width: 115px;
+                                        label: "Pixel stability in milliseconds";
+                                        unit: "ms";
+                                        value <=> root.step-pixel-stable;
+                                        edited => { root.step-edited = true; }
+                                    }
+                                    Secondary { text: "The condition must hold across samples for this long; 0 accepts the first match."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 5): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: "Click retries";
+                                    NumberField {
+                                        width: 95px;
+                                        label: "Maximum retries of previous click from 0 to 10";
+                                        value <=> root.step-pixel-retries;
+                                        edited => { root.step-edited = true; }
+                                    }
+                                    Secondary { text: "On failure, repeat the immediately preceding custom click step, up to this many times. 0 disables retries."; wrap: word-wrap; }
+                                }
+                                if (!root.step-inherits && !root.step-recorded && root.step-kind == 5): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: root.step-pixel-check-once ? "On mismatch" : "On timeout";
+                                    Choices {
+                                        label: root.step-pixel-check-once ? "Pixel mismatch action" : "Pixel timeout action";
+                                        width: 205px * min(1.6, Theme.text-scale);
+                                        labels: ["Stop", "Skip next"];
+                                        current: root.step-pixel-skip-next ? 1 : 0;
+                                        selected(index) => { root.step-pixel-skip-next = index == 1; root.step-edited = true; }
+                                    }
+                                    Secondary { text: root.step-pixel-check-once ? "If the condition is false, Skip next skips the following step." : "Skip next continues after the following step when the pixel condition times out."; wrap: word-wrap; }
+                                }
+                                if (root.step-recorded && root.recorded-kind != 2): FieldRow {
+                                    compact: root.stack-fields; label: "Position";
+                                    NumberField { width: 100px * min(1.6, Theme.text-scale); label: "Recorded X"; unit: "x"; value <=> root.recorded-x; edited => { root.step-edited = true; } }
+                                    NumberField { width: 100px * min(1.6, Theme.text-scale); label: "Recorded Y"; unit: "y"; value <=> root.recorded-y; edited => { root.step-edited = true; } }
+                                }
+                                if (root.step-recorded && root.recorded-kind == 1): FieldRow {
+                                    compact: root.stack-fields; label: "Mouse button";
+                                    ComboBox { accessible-label: "Recorded button"; width: 185px * min(1.8, Theme.text-scale); height: 36px * Theme.text-scale; model: ["Left", "Right", "Middle", "Mouse4", "Mouse5"]; current-index: root.step-button; selected => { root.step-button = self.current-index; root.step-edited = true; } }
+                                }
+                                if (root.step-recorded && root.recorded-kind == 2): FieldRow {
+                                    compact: root.stack-fields; label: root.recording-windows ? "Windows key code" : root.recording-macos ? "macOS key code" : "X11 key code";
+                                    NumberField { width: 100px * min(1.6, Theme.text-scale); label: "Recorded key code"; value <=> root.recorded-key; edited => { root.step-edited = true; } }
+                                    if (root.recording-windows): Choices { label: "Extended key"; width: 160px * min(1.8, Theme.text-scale); labels: ["Standard", "Extended"]; current: root.recorded-extended ? 1 : 0; selected(index) => { root.recorded-extended = index == 1; root.step-edited = true; } }
+                                }
+                                if (root.step-recorded && root.recorded-kind == 3): FieldRow {
+                                    compact: root.stack-fields; label: "Scroll";
+                                    ComboBox { accessible-label: "Scroll axis"; width: 140px; height: 36px * Theme.text-scale; model: ["Vertical", "Horizontal"]; current-index: root.step-direction; selected => { root.step-direction = self.current-index; root.step-edited = true; } }
+                                    NumberField { width: 100px * min(1.6, Theme.text-scale); label: "Scroll amount"; value <=> root.step-count; edited => { root.step-edited = true; } }
+                                }
+                                if (root.step-recorded && (root.recorded-kind == 1 || root.recorded-kind == 2)): FieldRow {
+                                    compact: root.stack-fields; label: "Edge";
+                                    Choices { label: "Press or release"; width: 160px * min(1.8, Theme.text-scale); labels: ["Release", "Press"]; current: root.recorded-down ? 1 : 0; selected(index) => { root.recorded-down = index == 1; root.step-edited = true; } }
+                                }
+                                if (!root.step-inherits && root.step-kind != 7): FieldRow {
+                                    compact: root.stack-fields;
+                                    label: root.step-recorded ? "Delay before event" : root.step-kind == 1 ? "Wait duration" : root.step-kind == 5 || root.step-kind == 6 ? "Delay before check" : "Delay before input";
+                                    NumberField { width: 108px * min(1.6, Theme.text-scale); label: "Step delay"; unit: "ms"; value <=> root.step-delay; edited => { root.step-edited = true; } }
                                 }
                                 if (root.step-error != ""): Label {
                                     text: root.step-error;
@@ -2361,8 +2690,57 @@ export component App inherits Window {
                                 HorizontalLayout {
                                     alignment: start;
                                     spacing: 8px;
-                                    ActionButton { label: "Save step"; primary: true; activated => { root.save-step(); } }
-                                    ActionButton { label: "Cancel edit"; activated => { root.step-editing = false; } }
+                                    ActionButton { label: "Save step"; primary: true; enabled: !root.capturing; activated => { root.save-step(); } }
+                                    ActionButton { label: "Cancel edit"; enabled: !root.capturing; activated => { root.step-editing = false; } }
+                                }
+                            }
+                            if (root.recording-available): VerticalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                SectionTitle { text: "Record a route"; }
+                                FieldRow {
+                                    compact: root.stack-fields;
+                                    height: root.stack-fields ? 57px * Theme.text-scale + 5px : 36px * Theme.text-scale;
+                                    label: "Mouse movement";
+                                    Choices { label: "Record mouse movement"; width: 150px * min(1.8, Theme.text-scale); labels: ["Exclude", "Record"]; current: root.record-movement ? 1 : 0; enabled: !root.locked; selected(index) => { root.record-movement = index == 1; } }
+                                }
+                                FieldRow {
+                                    compact: root.stack-fields;
+                                    height: root.stack-fields ? 57px * Theme.text-scale + 5px : 36px * Theme.text-scale;
+                                    label: "Buttons & wheel";
+                                    Choices { label: "Record mouse buttons and wheel"; width: 150px * min(1.8, Theme.text-scale); labels: ["Exclude", "Record"]; current: root.record-buttons ? 1 : 0; enabled: !root.locked; selected(index) => { root.record-buttons = index == 1; } }
+                                }
+                                FieldRow {
+                                    compact: root.stack-fields;
+                                    height: root.stack-fields ? 57px * Theme.text-scale + 5px : 36px * Theme.text-scale;
+                                    label: "Keyboard";
+                                    Choices { label: "Record keyboard"; width: 150px * min(1.8, Theme.text-scale); labels: ["Exclude", "Record"]; current: root.record-keys ? 1 : 0; enabled: !root.locked; selected(index) => { root.record-keys = index == 1; } }
+                                }
+                                Secondary {
+                                    text: root.record-keys ? "Keys you type will be included in the saved route. Pause recording before entering sensitive information." : "Keys are excluded. Pause recording to omit other sensitive input.";
+                                    height: self.preferred-height;
+                                    wrap: word-wrap;
+                                }
+                                FlexboxLayout {
+                                    alignment: start; flex-wrap: wrap; spacing: 8px;
+                                    height: root.stack-fields ? (root.recording-state == 3 ? 108px * Theme.text-scale + 16px : root.recording-state == 0 ? 36px * Theme.text-scale : 72px * Theme.text-scale + 8px) : 36px * Theme.text-scale;
+                                    if (root.recording-state == 0 || root.recording-state == 3): ActionButton {
+                                        label: root.recording-state == 3 ? "Discard & record" : "Start recording";
+                                        enabled: !root.locked;
+                                        activated => { root.recording-action(0); }
+                                    }
+                                    if (root.recording-state == 1 || root.recording-state == 2): ActionButton {
+                                        label: root.recording-state == 1 ? "Pause recording" : "Resume recording";
+                                        activated => { root.recording-action(root.recording-state == 1 ? 1 : 2); }
+                                    }
+                                    if (root.recording-state == 1 || root.recording-state == 2): ActionButton { label: "Stop recording"; activated => { root.recording-action(3); } }
+                                    if (root.recording-state == 3): ActionButton { label: "Replace route"; enabled: !root.locked && root.recorded-count > 0; activated => { root.recording-action(4); } }
+                                    if (root.recording-state == 3): ActionButton { label: "Discard recording"; enabled: !root.locked; activated => { root.recording-action(5); } }
+                                }
+                                if (root.recording-state != 0): Secondary {
+                                    text: (root.recording-state == 1 ? "Recording" : root.recording-state == 2 ? "Recording paused" : "Recording ready") + " · \{root.recorded-count} events";
+                                    height: self.preferred-height;
+                                    wrap: word-wrap;
                                 }
                             }
                             if (root.smart-targets-available): FieldRow {
@@ -2407,6 +2785,13 @@ export component App inherits Window {
                                     enabled: !root.locked;
                                     activated => { root.toggle-target-verification(); }
                                 }
+                            }
+                            // Reserve scroll extent for wrapped controls at large text sizes.
+                            if (root.step-editing && !root.step-inherits && (root.step-kind == 5 || root.step-kind == 6)): Rectangle {
+                                height: (root.step-kind == 6 ? 150px : 90px) * Theme.text-scale;
+                            }
+                            if (root.recording-available && root.stack-fields && Theme.text-scale > 1): Rectangle {
+                                height: 240px * (Theme.text-scale - 1);
                             }
                         }
                         if (root.targets-panel == 1): VerticalLayout {
@@ -2704,6 +3089,7 @@ export component App inherits Window {
                             enabled: !root.locked;
                             empty-text: "No presets yet. Name the current setup to save it.";
                             chosen(index, name) => {
+                                root.profile-action(7);
                                 root.profile-index = index;
                                 root.selected-preset = name;
                                 root.confirm-preset = 0;
@@ -2770,11 +3156,107 @@ export component App inherits Window {
                                 activated => { root.confirm-preset = 0; root.profile-action(0); } }
                         }
                         Rule {}
+                        SectionTitle { text: "Share a preset"; }
+                        Secondary {
+                            text: "Enter a JSON file path. Export creates a new file; import adds a saved preset without loading it. Presets can contain app paths, coordinates and visual data.";
+                            wrap: word-wrap;
+                        }
+                        FieldRow {
+                            compact: root.stack-fields;
+                            label: "Preset file";
+                            NumberField {
+                                width: 300px;
+                                label: "Preset file path";
+                                enabled: !root.locked;
+                                value <=> root.preset-transfer-path;
+                                edited => { root.profile-action(7); }
+                            }
+                            ActionButton { label: "Review import"; enabled: !root.locked && root.preset-transfer-path != "";
+                                activated => { root.profile-action(5); } }
+                            ActionButton { label: "Review export"; enabled: !root.locked && root.profile-index >= 0 && root.preset-transfer-path != "";
+                                activated => { root.profile-action(4); } }
+                        }
+                        if (root.share-review-kind != 0 && root.share-review-items.length > 0): VerticalLayout {
+                            spacing: 6px;
+                            Label {
+                                text: (root.share-review-kind == 1 ? "Import review · " : "Export review · ") + root.share-review-name;
+                                font-weight: 600;
+                                wrap: word-wrap;
+                            }
+                            Secondary { text: "File: " + root.share-review-path; wrap: word-wrap; }
+                            Secondary { text: root.share-review-metadata; wrap: word-wrap; }
+                            Secondary {
+                                text: "Review all settings and each route step. JSON includes full paths, text, coordinates, and fingerprint data. Previews are saved grayscale fingerprints, not original screenshots.";
+                                wrap: word-wrap;
+                            }
+                            FlexboxLayout {
+                                alignment: start; cross-axis-alignment: center; flex-wrap: wrap;
+                                spacing-horizontal: 8px; spacing-vertical: 6px;
+                                ActionButton { label: "Previous"; enabled: root.share-review-index > 0; activated => { root.share-review-index -= 1; } }
+                                SpinBox {
+                                    accessible-label: "Review item number";
+                                    minimum: 1; maximum: root.share-review-items.length;
+                                    value: root.share-review-index + 1;
+                                    edited => { root.share-review-index = self.value - 1; }
+                                }
+                                Label { text: "\{root.share-review-index + 1} / \{root.share-review-items.length} · " + root.share-review-items[root.share-review-index].title; vertical-alignment: center; }
+                                ActionButton { label: "Next"; enabled: root.share-review-index + 1 < root.share-review-items.length; activated => { root.share-review-index += 1; } }
+                            }
+                            TextEdit {
+                                height: 180px;
+                                read-only: true;
+                                wrap: char-wrap;
+                                accessible-label: "Complete preset data for selected item";
+                                text: root.share-review-items[root.share-review-index].details;
+                            }
+                            if (root.share-review-items[root.share-review-index].has-visual): VerticalLayout {
+                                spacing: 4px;
+                                Secondary { text: root.share-review-items[root.share-review-index].visual-status; wrap: word-wrap; }
+                                FlexboxLayout {
+                                    alignment: start; flex-wrap: wrap; spacing-horizontal: 8px; spacing-vertical: 6px;
+                                    VerticalLayout { Label { text: "Target fingerprint"; } Image { width: 160px; height: 96px; source: root.share-review-items[root.share-review-index].target-image; image-fit: contain; accessible-role: image; accessible-label: "Target fingerprint preview"; } }
+                                    VerticalLayout { Label { text: "Anchor fingerprint"; } Image { width: 160px; height: 96px; source: root.share-review-items[root.share-review-index].landmark-image; image-fit: contain; accessible-role: image; accessible-label: "Anchor fingerprint preview"; } }
+                                }
+                            }
+                            if (root.share-review-items[root.share-review-index].has-image-template): VerticalLayout {
+                                Label { text: "Saved reference image"; }
+                                Image { width: 160px; height: 120px; source: root.share-review-items[root.share-review-index].image-template; image-fit: contain; accessible-role: image; accessible-label: "Saved image reference"; }
+                            }
+                            if (root.share-review-kind == 2): HorizontalLayout {
+                                alignment: start; spacing: 8px;
+                                ActionButton { label: "Export reviewed preset"; enabled: !root.locked; activated => { root.profile-action(8); } }
+                                ActionButton { label: "Cancel review"; enabled: !root.locked; activated => { root.profile-action(7); } }
+                            }
+                        }
+                        if (root.import-ready): VerticalLayout {
+                            spacing: 6px;
+                            Label { text: "Review imported preset"; font-weight: 600; }
+                            Secondary { text: root.import-summary; wrap: word-wrap; accessible-live-region: polite; }
+                            FieldRow {
+                                compact: root.stack-fields;
+                                label: "Save as";
+                                error: root.import-error;
+                                NumberField {
+                                    width: 175px * min(1.6, Theme.text-scale);
+                                    label: "Imported preset name";
+                                    enabled: !root.locked;
+                                    value <=> root.import-name;
+                                    error: root.import-error;
+                                    edited => { root.import-error = ""; }
+                                }
+                                ActionButton { label: "Save imported preset"; enabled: !root.locked;
+                                    activated => { root.profile-action(6); } }
+                                ActionButton { label: "Cancel"; enabled: !root.locked;
+                                    activated => { root.profile-action(7); } }
+                            }
+                        }
+                        Rule {}
                         FieldRow {
                             compact: root.stack-fields;
                             label: "Lifetime";
                             Secondary { text: root.library-stats; }
                         }
+                        if (root.share-review-kind != 0): Rectangle { height: 48px; }
                     }
                 }
             }

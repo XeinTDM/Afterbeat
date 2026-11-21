@@ -27,6 +27,9 @@ const MAX_RECOVERABLE_DELAY: Duration = Duration::from_millis(8);
 #[derive(Default)]
 pub struct Progress {
     actions: AtomicU64,
+    skipped_steps: AtomicU64,
+    last_skipped_step: AtomicU64,
+    retried_clicks: AtomicU64,
     pause: AtomicU8,
     pub started: OnceLock<Instant>,
     #[cfg(windows)]
@@ -36,6 +39,21 @@ pub struct Progress {
 impl Progress {
     pub fn actions(&self) -> u64 {
         self.actions.load(Ordering::Relaxed)
+    }
+
+    pub fn skipped_steps(&self) -> u64 {
+        self.skipped_steps.load(Ordering::Acquire)
+    }
+
+    pub fn retried_clicks(&self) -> u64 {
+        self.retried_clicks.load(Ordering::Relaxed)
+    }
+
+    pub fn last_skipped_step(&self) -> Option<u64> {
+        match self.last_skipped_step.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
     }
 
     pub fn pause_reason(&self) -> Option<PauseReason> {
@@ -54,6 +72,8 @@ impl Progress {
             12 => Some(PauseReason::VerifyingTarget),
             13 => Some(PauseReason::TargetEvidence),
             14 => Some(PauseReason::WheelFocus),
+            15 => Some(PauseReason::PixelColor),
+            16 => Some(PauseReason::PendingStop),
             _ => None,
         }
     }
@@ -151,6 +171,8 @@ pub enum PauseReason {
     VerifyingTarget = 12,
     TargetEvidence = 13,
     WheelFocus = 14,
+    PixelColor = 15,
+    PendingStop = 16,
 }
 
 #[derive(Default)]
@@ -295,12 +317,23 @@ impl RunControl<'_> {
         self.progress.clear_pause();
     }
 
-    #[cfg(windows)]
     pub fn record_tap(&self) {
         self.progress.actions.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(windows)]
+    pub fn record_skipped_step(&self, index: usize) {
+        self.progress
+            .last_skipped_step
+            .store(index as u64 + 1, Ordering::Relaxed);
+        self.progress.skipped_steps.fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(windows)]
+    pub fn record_click_retry(&self) {
+        self.progress.retried_clicks.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn wait_route(&mut self, deadline: Instant) -> Result<Option<Outcome>, String> {
         match self.wait(deadline, Duration::ZERO, false, None)? {
             Wait::End(outcome) => Ok(Some(outcome)),
@@ -308,7 +341,6 @@ impl RunControl<'_> {
         }
     }
 
-    #[cfg(windows)]
     pub fn route_actions(&self) -> u64 {
         self.progress.actions()
     }
@@ -395,7 +427,6 @@ impl Random {
     }
 }
 
-#[cfg(windows)]
 pub fn run_sequence<'a>(
     schedule: Schedule,
     stop: &'a StopSignal,
@@ -628,6 +659,25 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn skipped_route_steps_are_reported_without_counting_actions() {
+        let stop = StopSignal::new().unwrap();
+        let progress = Progress::default();
+        let outcome = run_sequence(Schedule::default(), &stop, &progress, None, |control| {
+            control.record_skipped_step(1);
+            control.record_skipped_step(3);
+            control.record_click_retry();
+            Ok(Outcome::Completed)
+        })
+        .unwrap();
+        assert_eq!(outcome, Outcome::Completed);
+        assert_eq!(progress.actions(), 0);
+        assert_eq!(progress.skipped_steps(), 2);
+        assert_eq!(progress.last_skipped_step(), Some(4));
+        assert_eq!(progress.retried_clicks(), 1);
+    }
     use std::{sync::Arc, thread};
 
     #[test]

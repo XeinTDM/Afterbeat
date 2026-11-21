@@ -34,6 +34,17 @@ pub fn prepare(
     if !settings.armed {
         return Err("Enable the master switch in Timing to start a run.".into());
     }
+    if settings.route_enabled
+        && settings.has_recording()
+        && crate::recording::current_origin() == Some(settings.recording_origin)
+        && settings
+            .route
+            .iter()
+            .filter_map(crate::targets::Step::point)
+            .any(|point| !mouse::on_monitor(point))
+    {
+        return Err("A recorded point is outside your displays. Edit it before playback.".into());
+    }
     #[cfg(target_os = "linux")]
     if crate::wayland::active() && settings.keyboard && invoked.is_some_and(Binding::has_modifiers)
     {
@@ -172,13 +183,27 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
         ));
     }
     if settings.has_smart_route() || settings.has_action_route() {
-        if !cfg!(windows) {
+        if settings.has_recording()
+            && crate::recording::current_origin() != Some(settings.recording_origin)
+        {
+            return Err(Issue::new(
+                "route",
+                "This recording was made on a different desktop backend.",
+            ));
+        }
+        if !cfg!(windows)
+            && !(settings.has_recording()
+                && matches!(
+                    crate::recording::current_origin(),
+                    Some(crate::recording::Origin::X11 | crate::recording::Origin::Macos)
+                ))
+        {
             return Err(Issue::new(
                 "route",
                 "Control targets and per-step actions require Windows.",
             ));
         }
-        settings
+        let target_timeout = settings
             .target_timeout()
             .map_err(|message| Issue::new("target-timeout", message))?;
         if settings
@@ -192,13 +217,77 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
                 "A control has no saved identity. Capture it again.",
             ));
         }
-        if settings.has_action_route() && settings.route.iter().all(|step| matches!(step, crate::targets::Step::Action(action) if action.action == crate::targets::Action::Wait)) {
+        if settings.has_action_route() && settings.route.iter().all(|step| matches!(step, crate::targets::Step::Action(action) if !crate::workflow::sends_input(&action.action))) {
             return Err(Issue::new("route", "Add an input action to the route."));
         }
-        for step in &settings.route {
+        crate::workflow::compile(&settings.route)
+            .map_err(|message| Issue::new("route", message))?;
+        for (index, step) in settings.route.iter().enumerate() {
             if let crate::targets::Step::Action(action) = step {
                 validate_action(action, bound).map_err(|error| Issue::new("route", error))?;
+                if matches!(
+                    action.action,
+                    crate::targets::Action::WaitColor {
+                        retry_clicks: 1..,
+                        ..
+                    }
+                ) && !crate::targets::has_retryable_previous_click(&settings.route, index)
+                {
+                    return Err(Issue::new(
+                        "route",
+                        "Click retries require an immediately preceding custom click step.",
+                    ));
+                }
+                if matches!(
+                    action.action,
+                    crate::targets::Action::WaitColor {
+                        skip_next_on_timeout: true,
+                        ..
+                    } | crate::targets::Action::WaitColor {
+                        skip_next_on_mismatch: true,
+                        ..
+                    }
+                ) && index + 1 == settings.route.len()
+                {
+                    return Err(Issue::new(
+                        "route",
+                        "Add a step after the pixel condition to use Skip next.",
+                    ));
+                }
+                if let crate::targets::Action::WaitColor { stable_ms, .. } = action.action
+                    && stable_ms > 0
+                    && Duration::from_millis(stable_ms.into()) >= target_timeout
+                {
+                    return Err(Issue::new(
+                        "target-timeout",
+                        "Set target timeout longer than pixel stability.",
+                    ));
+                }
             }
+        }
+        if settings.has_recording() {
+            let events = settings
+                .route
+                .iter()
+                .map(|step| match step {
+                    crate::targets::Step::Action(action) => match &action.action {
+                        crate::targets::Action::Recorded { event } => Ok(crate::recording::Entry {
+                            delay_ms: action.delay_ms.into(),
+                            event: event.clone(),
+                        }),
+                        _ => Err(Issue::new(
+                            "route",
+                            "Recorded events cannot be mixed with other route steps.",
+                        )),
+                    },
+                    _ => Err(Issue::new(
+                        "route",
+                        "Recorded events cannot be mixed with other route steps.",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::recording::validate_for(&events, settings.recording_origin)
+                .map_err(|message| Issue::new("route", message))?;
         }
         #[cfg(windows)]
         if settings.has_action_route()
@@ -208,8 +297,11 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
             use crate::targets::{Action, Step};
             if settings.route.iter().any(|step| match step {
                 Step::Action(step) => match step.action {
-                    Action::Key { .. } => binding.has_modifiers(),
+                    Action::Key { .. } | Action::Text { .. } => binding.has_modifiers(),
                     Action::Scroll { .. } => binding.has_modifiers() || binding.mouse(),
+                    Action::Recorded {
+                        event: crate::recording::Event::Key { .. },
+                    } => binding.has_modifiers(),
                     _ => false,
                 },
                 _ => false,
@@ -243,6 +335,12 @@ fn plan(settings: &Settings, bound: Option<Binding>) -> Result<Plan, Issue> {
         }
     }
     let mut schedule = settings.schedule()?;
+    if settings.route_enabled && settings.has_recording() && !settings.route_once && schedule.limit.is_some()
+        && !settings.route.iter().any(|step| matches!(step, crate::targets::Step::Action(action)
+            if matches!(action.action, crate::targets::Action::Recorded { event: crate::recording::Event::Button { down: true, .. } | crate::recording::Event::Key { down: true, .. } | crate::recording::Event::Scroll { .. } })))
+    {
+        return Err(Issue::new("route", "A counted looping recording needs at least one button, key, or scroll event."));
+    }
     #[cfg(windows)]
     if settings.scroll
         && !settings.keyboard
@@ -388,6 +486,16 @@ pub fn validate_action(
     bound: Option<Binding>,
 ) -> Result<(), &'static str> {
     action.validate()?;
+    if matches!(
+        action.action,
+        crate::targets::Action::WaitImage {
+            output: crate::targets::ImageOutput::Click,
+            ..
+        }
+    ) && bound.is_some_and(|binding| binding.matches_button(crate::mouse::Button::Left))
+    {
+        return Err("Use a different activation shortcut for image clicks.");
+    }
     if let crate::targets::Action::Click { button, .. } = action.action
         && bound.is_some_and(|binding| binding.matches_button(button))
     {
@@ -400,6 +508,57 @@ pub fn validate_action(
         }
         if action.target.as_ref().is_some_and(|target| matches!(target, crate::targets::Destination::Control(control) if control.selector.control.is_none())) {
             return Err("A targeted key step needs a control that exposes a keyboard focus identity.");
+        }
+    }
+    #[cfg(windows)]
+    if let crate::targets::Action::Recorded { event } = &action.action {
+        match event {
+            crate::recording::Event::Key { code: 0, .. } => {
+                return Err("Enter a Windows key code from 1 to 255.");
+            }
+            crate::recording::Event::Key { code, .. }
+                if *code == u32::from(keys::F7)
+                    || *code == u32::from(keys::F8)
+                    || bound.is_some_and(|binding| u32::from(binding.vk) == *code) =>
+            {
+                return Err(
+                    "A recorded key conflicts with an activation, stop, or capture shortcut.",
+                );
+            }
+            crate::recording::Event::Button { button, .. }
+                if bound.is_some_and(|binding| binding.matches_button(*button)) =>
+            {
+                return Err("A recorded mouse button conflicts with the activation shortcut.");
+            }
+            _ => {}
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let crate::targets::Action::Recorded {
+        event: crate::recording::Event::Button { button, .. },
+    } = &action.action
+        && bound.is_some_and(|binding| binding.matches_button(*button))
+    {
+        return Err("A recorded mouse button conflicts with the activation shortcut.");
+    }
+    #[cfg(target_os = "macos")]
+    if let crate::targets::Action::Recorded { event } = &action.action {
+        match event {
+            crate::recording::Event::Key { code, .. }
+                if *code == u32::from(keys::F7)
+                    || *code == u32::from(keys::F8)
+                    || bound.is_some_and(|binding| binding.uses_code(*code as u16)) =>
+            {
+                return Err(
+                    "A recorded key conflicts with an activation, stop, or capture shortcut.",
+                );
+            }
+            crate::recording::Event::Button { button, .. }
+                if bound.is_some_and(|binding| binding.matches_button(*button)) =>
+            {
+                return Err("A recorded mouse button conflicts with the activation shortcut.");
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -420,13 +579,13 @@ pub struct Guard {
 }
 
 impl Guard {
-    #[cfg(windows)]
     pub fn check_route_key(&mut self, recipient_pid: u32) -> Gate {
         self.observe_safety(mouse::cursor, Binding::modifiers_pressed)
             .and_then(|()| self.check_keyboard_recipient(recipient_pid))
             .err()
             .unwrap_or(Gate::Open)
     }
+
     pub fn enabled(&self) -> bool {
         self.hold.is_some()
             || self.release_modifiers.is_some()
@@ -863,6 +1022,227 @@ mod tests {
                 .unwrap()
                 .contains("modifiers")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recording_requires_balanced_edges_and_rejects_shortcuts_and_mixed_steps() {
+        use crate::{
+            recording::Event,
+            targets::{Action, ActionStep, Step},
+        };
+        let recorded = |event| {
+            Step::Action(Box::new(ActionStep {
+                action: Action::Recorded { event },
+                target: None,
+                delay_ms: 15,
+            }))
+        };
+        let point = Point { x: 10, y: 10 };
+        let mut settings = Settings {
+            route_enabled: true,
+            route_once: true,
+            route: vec![
+                recorded(Event::Button {
+                    button: crate::mouse::Button::Left,
+                    down: true,
+                    point,
+                }),
+                recorded(Event::Move(Point { x: 20, y: 20 })),
+                recorded(Event::Button {
+                    button: crate::mouse::Button::Left,
+                    down: false,
+                    point: Point { x: 20, y: 20 },
+                }),
+            ],
+            ..Settings::default()
+        };
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_ok());
+        settings.recording_origin = crate::recording::Origin::Macos;
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_err());
+        settings.recording_origin = crate::recording::Origin::Windows;
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let decoded: Settings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.route, settings.route);
+        settings.route.pop();
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_err());
+        settings.route.push(recorded(Event::Button {
+            button: crate::mouse::Button::Left,
+            down: false,
+            point,
+        }));
+        settings.route.push(Step::Point(point));
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_err());
+        settings.route = vec![
+            recorded(Event::Key {
+                code: u32::from(crate::keys::F7),
+                extended: false,
+                down: true,
+            }),
+            recorded(Event::Key {
+                code: u32::from(crate::keys::F7),
+                extended: false,
+                down: false,
+            }),
+        ];
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_err());
+
+        settings.route = vec![recorded(Event::Move(point))];
+        settings.limited = true;
+        settings.count = "1".into();
+        settings.route_once = false;
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_err());
+        settings.route_once = true;
+        assert!(validated_schedule(&settings, Binding::parse("F6")).is_ok());
+        settings.limited = false;
+        settings.hold_activation = true;
+        settings.route = vec![
+            recorded(Event::Key {
+                code: 65,
+                extended: false,
+                down: true,
+            }),
+            recorded(Event::Key {
+                code: 65,
+                extended: false,
+                down: false,
+            }),
+        ];
+        assert!(validated_schedule(&settings, Binding::parse("Ctrl+F6")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pixel_retries_require_a_valid_immediately_preceding_custom_click() {
+        use crate::targets::{Action, ActionStep, Destination, Step};
+        let point = Point { x: 10, y: 10 };
+        let click = Step::Action(Box::new(ActionStep {
+            action: Action::Click {
+                button: crate::mouse::Button::Left,
+                count: 1,
+            },
+            target: Some(Destination::Point(point)),
+            delay_ms: 0,
+        }));
+        let condition = Step::Action(Box::new(ActionStep {
+            action: Action::WaitColor {
+                point,
+                rgb: 0,
+                tolerance: 0,
+                different: false,
+                stable_ms: 0,
+                skip_next_on_timeout: false,
+                check_once: true,
+                skip_next_on_mismatch: false,
+                retry_clicks: 2,
+            },
+            target: None,
+            delay_ms: 0,
+        }));
+        let mut settings = Settings {
+            route_enabled: true,
+            route: vec![click.clone(), condition.clone()],
+            ..Settings::default()
+        };
+        assert!(validated_schedule(&settings, None).is_ok());
+        settings.route = vec![condition.clone(), click.clone()];
+        assert!(
+            validated_schedule(&settings, None)
+                .err()
+                .unwrap()
+                .message
+                .contains("immediately preceding custom click")
+        );
+        settings.route = vec![Step::Point(point), condition];
+        assert!(
+            validated_schedule(&settings, None)
+                .err()
+                .unwrap()
+                .message
+                .contains("immediately preceding custom click")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pixel_condition_does_not_count_as_an_input_action() {
+        use crate::targets::{Action, ActionStep, Step};
+        let mut settings = Settings {
+            route_enabled: true,
+            route: vec![Step::Action(Box::new(ActionStep {
+                action: Action::WaitColor {
+                    point: Point { x: 0, y: 0 },
+                    rgb: 0x123456,
+                    tolerance: 0,
+                    different: false,
+                    stable_ms: 0,
+                    skip_next_on_timeout: false,
+                    check_once: false,
+                    skip_next_on_mismatch: false,
+                    retry_clicks: 0,
+                },
+                target: None,
+                delay_ms: 0,
+            }))],
+            ..Settings::default()
+        };
+        assert_eq!(
+            validated_schedule(&settings, None).err().unwrap().message,
+            "Add an input action to the route."
+        );
+        settings.route.push(Step::Action(Box::new(ActionStep {
+            action: Action::Key {
+                key: "Enter".into(),
+            },
+            target: None,
+            delay_ms: 0,
+        })));
+        assert!(validated_schedule(&settings, None).is_ok());
+        if let Step::Action(step) = &mut settings.route[0]
+            && let Action::WaitColor { stable_ms, .. } = &mut step.action
+        {
+            *stable_ms = 10_000;
+        }
+        assert_eq!(
+            validated_schedule(&settings, None).err().unwrap().field,
+            "target-timeout"
+        );
+        settings.target_timeout = "11".into();
+        assert!(validated_schedule(&settings, None).is_ok());
+        if let Step::Action(step) = &mut settings.route[0]
+            && let Action::WaitColor {
+                skip_next_on_timeout,
+                ..
+            } = &mut step.action
+        {
+            *skip_next_on_timeout = true;
+        }
+        assert!(validated_schedule(&settings, None).is_ok());
+        settings.route.swap(0, 1);
+        assert_eq!(
+            validated_schedule(&settings, None).err().unwrap().message,
+            "Add a step after the pixel condition to use Skip next."
+        );
+        if let Step::Action(step) = &mut settings.route[1]
+            && let Action::WaitColor {
+                stable_ms,
+                check_once,
+                skip_next_on_timeout,
+                skip_next_on_mismatch,
+                ..
+            } = &mut step.action
+        {
+            *stable_ms = 0;
+            *check_once = true;
+            *skip_next_on_timeout = false;
+            *skip_next_on_mismatch = true;
+        }
+        assert_eq!(
+            validated_schedule(&settings, None).err().unwrap().message,
+            "Add a step after the pixel condition to use Skip next."
+        );
+        settings.route.swap(0, 1);
+        assert!(validated_schedule(&settings, None).is_ok());
     }
 
     #[cfg(windows)]

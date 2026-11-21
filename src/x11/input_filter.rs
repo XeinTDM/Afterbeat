@@ -16,6 +16,10 @@ use std::{
 use x11rb::protocol::xproto::{ConnectionExt as _, Window};
 
 static WINDOW: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+pub(crate) fn test_window(window: Window) -> u32 {
+    WINDOW.swap(window, Ordering::AcqRel)
+}
 type PadHits = HashMap<(i16, i16), u32>;
 static HITS: Mutex<Option<PadHits>> = Mutex::new(None);
 

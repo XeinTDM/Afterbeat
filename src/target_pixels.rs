@@ -5,7 +5,7 @@ use windows_sys::Win32::{
     Foundation::{HWND, RECT},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, ReleaseDC, SRCCOPY,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetPixel, HBITMAP, HDC, ReleaseDC, SRCCOPY,
         SelectObject,
     },
     UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, WindowFromPoint},
@@ -15,6 +15,56 @@ const COLS: usize = 20;
 const ROWS: usize = 12;
 const PIXELS: usize = COLS * ROWS;
 const MAX_SIDE: i32 = 1024;
+
+pub fn pixel_rgb(point: Point) -> Option<u32> {
+    unsafe {
+        let screen = Screen(GetDC(null_mut()));
+        if screen.0.is_null() {
+            return None;
+        }
+        let color = GetPixel(screen.0, point.x, point.y);
+        if color == u32::MAX {
+            return None;
+        }
+        Some(colorref_to_rgb(color))
+    }
+}
+
+fn colorref_to_rgb(color: u32) -> u32 {
+    ((color & 0xff) << 16) | (color & 0xff00) | ((color >> 16) & 0xff)
+}
+
+pub fn pixel_condition_matches(actual: u32, expected: u32, tolerance: u8, different: bool) -> bool {
+    let matches = [0, 8, 16].into_iter().all(|shift| {
+        let a = ((actual >> shift) & 0xff) as u8;
+        let b = ((expected >> shift) & 0xff) as u8;
+        a.abs_diff(b) <= tolerance
+    });
+    matches != different
+}
+
+pub fn image_region(rect: crate::targets::ImageRect, limit: u16) -> Option<Region> {
+    if !rect.valid(limit) {
+        return None;
+    }
+    let end = Point {
+        x: rect.x + (i32::from(rect.width) - 1),
+        y: rect.y + (i32::from(rect.height) - 1),
+    };
+    let contained = crate::mouse::display_areas().iter().any(|area| {
+        rect.x >= area.from.x && rect.y >= area.from.y && end.x <= area.to.x && end.y <= area.to.y
+    });
+    contained.then_some(Region {
+        origin: Point {
+            x: rect.x,
+            y: rect.y,
+        },
+        size: Point {
+            x: rect.width.into(),
+            y: rect.height.into(),
+        },
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region {
@@ -79,10 +129,213 @@ impl Region {
 pub struct Frame {
     region: Region,
     gray: Vec<u8>,
+    rgb: Option<Vec<[u8; 3]>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSearch {
+    Missing,
+    Unique(ImageMatch),
+    Ambiguous(ImageMatch),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageMatch {
+    pub region: Region,
+    quality: u16,
+}
+
+impl ImageMatch {
+    pub fn score(self) -> u16 {
+        self.quality / 100
+    }
 }
 
 impl Frame {
+    pub fn matched_image(&self, rect: Region) -> Option<slint::Image> {
+        let (x, y, w, h) = self.crop(rect)?;
+        let stride = self.region.size.x as usize;
+        let mut buffer = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(w as u32, h as u32);
+        for (index, pixel) in buffer.make_mut_slice().iter_mut().enumerate() {
+            let offset = (y + index / w) * stride + x + index % w;
+            let [r, g, b] = self
+                .rgb
+                .as_ref()
+                .map_or([self.gray[offset]; 3], |rgb| rgb[offset]);
+            *pixel = slint::Rgb8Pixel { r, g, b };
+        }
+        Some(slint::Image::from_rgb8(buffer))
+    }
+
+    fn crop(&self, rect: Region) -> Option<(usize, usize, usize, usize)> {
+        let x = usize::try_from(rect.origin.x.checked_sub(self.region.origin.x)?).ok()?;
+        let y = usize::try_from(rect.origin.y.checked_sub(self.region.origin.y)?).ok()?;
+        let w = rect.size.x as usize;
+        let h = rect.size.y as usize;
+        (x.checked_add(w)? <= self.region.size.x as usize
+            && y.checked_add(h)? <= self.region.size.y as usize)
+            .then_some((x, y, w, h))
+    }
+
+    pub fn unchanged(&self, rect: Region) -> bool {
+        let Some((x, y, w, h)) = self.crop(rect) else {
+            return false;
+        };
+        let Some(current) = Self::capture_color(rect) else {
+            return false;
+        };
+        let (Some(original), Some(now)) = (&self.rgb, current.rgb) else {
+            return false;
+        };
+        let stride = self.region.size.x as usize;
+        (0..h).all(|row| {
+            let start = (y + row) * stride + x;
+            original[start..start + w] == now[row * w..(row + 1) * w]
+        })
+    }
+
+    pub fn capture_image(rect: crate::targets::ImageRect) -> Option<crate::targets::ImageTemplate> {
+        if rect.width < 8 || rect.height < 8 {
+            return None;
+        }
+        let frame = Self::capture_color(image_region(rect, 64)?)?;
+        let mut pixels =
+            String::with_capacity(usize::from(rect.width) * usize::from(rect.height) * 6);
+        use std::fmt::Write;
+        for [r, g, b] in frame.rgb? {
+            write!(pixels, "{r:02x}{g:02x}{b:02x}").ok()?;
+        }
+        Some(crate::targets::ImageTemplate {
+            width: rect.width,
+            height: rect.height,
+            pixels,
+        })
+    }
+
+    pub fn search_image(
+        &self,
+        template: &crate::targets::ImageTemplate,
+        threshold: u8,
+        scaled: bool,
+        collect_matches: bool,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<ImageSearch, &'static str> {
+        if !template.valid() {
+            return Err("The saved image is invalid.");
+        }
+        if !(70..=100).contains(&threshold) {
+            return Err("Image threshold must be from 70 to 100%.");
+        }
+        let original_w = usize::from(template.width);
+        let original_h = usize::from(template.height);
+        let width = self.region.size.x as usize;
+        let height = self.region.size.y as usize;
+        let channels = template.pixels.len() / (original_w * original_h * 2);
+        if channels == 3 && self.rgb.is_none() {
+            return Err("The color screen image could not be read.");
+        }
+        let pixels: Vec<u8> = template
+            .pixels
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                (char::from(pair[0]).to_digit(16).unwrap() * 16
+                    + char::from(pair[1]).to_digit(16).unwrap()) as u8
+            })
+            .collect();
+        let scales: &[usize] = if scaled { &[100, 75, 125, 150] } else { &[100] };
+        let mut candidates = Vec::new();
+        for &scale in scales {
+            let w = (original_w * scale + 50) / 100;
+            let h = (original_h * scale + 50) / 100;
+            if w > width || h > height {
+                continue;
+            }
+            let mut reference = Vec::with_capacity(w * h * channels);
+            for y in 0..h {
+                for x in 0..w {
+                    let source =
+                        ((y * original_h / h) * original_w + x * original_w / w) * channels;
+                    reference.extend_from_slice(&pixels[source..source + channels]);
+                }
+            }
+            let maximum = (w * h * channels * 255) as u32;
+            let max_error = maximum * u32::from(100 - threshold) / 100;
+            for y in 0..=height - h {
+                for x in 0..=width - w {
+                    if x % 16 == 0 && cancelled() {
+                        return Err("Image search interrupted.");
+                    }
+                    let mut error = 0u32;
+                    for row in 0..h {
+                        let offset = (y + row) * width + x;
+                        let expected = &reference[row * w * channels..(row + 1) * w * channels];
+                        let actual = if channels == 3 {
+                            self.rgb.as_ref().unwrap()[offset..offset + w].as_flattened()
+                        } else {
+                            &self.gray[offset..offset + w]
+                        };
+                        error += actual
+                            .iter()
+                            .zip(expected)
+                            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+                            .sum::<u32>();
+                        if error > max_error {
+                            break;
+                        }
+                    }
+                    if error <= max_error {
+                        let found = ImageMatch {
+                            region: Region {
+                                origin: Point {
+                                    x: self.region.origin.x + x as i32,
+                                    y: self.region.origin.y + y as i32,
+                                },
+                                size: Point {
+                                    x: w as i32,
+                                    y: h as i32,
+                                },
+                            },
+                            quality: (u64::from(maximum - error) * 10_000 / u64::from(maximum))
+                                as u16,
+                        };
+                        if !collect_matches {
+                            return Ok(ImageSearch::Unique(found));
+                        }
+                        candidates.push(found);
+                    }
+                }
+            }
+        }
+        let Some(best) = candidates.iter().copied().max_by_key(|found| found.quality) else {
+            return Ok(ImageSearch::Missing);
+        };
+        let center = best.region.center();
+        let ambiguous = candidates.iter().any(|other| {
+            let alternative = other.region.center();
+            center.x.abs_diff(alternative.x) * 2
+                >= best.region.size.x.min(other.region.size.x) as u32
+                || center.y.abs_diff(alternative.y) * 2
+                    >= best.region.size.y.min(other.region.size.y) as u32
+        });
+        Ok(if ambiguous {
+            ImageSearch::Ambiguous(best)
+        } else {
+            ImageSearch::Unique(best)
+        })
+    }
+
     pub fn capture(region: Region) -> Option<Self> {
+        Self::read(region, false)
+    }
+
+    pub fn capture_color(region: Region) -> Option<Self> {
+        Self::read(region, true)
+    }
+
+    fn read(region: Region, color: bool) -> Option<Self> {
         let Point {
             x: width,
             y: height,
@@ -150,7 +403,15 @@ impl Frame {
                         as u8
                 })
                 .collect();
-            Some(Self { region, gray })
+            let rgb = color.then(|| {
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| [b[2], b[1], b[0]])
+                    .collect()
+            });
+            Some(Self { region, gray, rgb })
         }
     }
 
@@ -301,6 +562,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn colorref_is_converted_from_bgr_to_rgb() {
+        assert_eq!(colorref_to_rgb(0x00563412), 0x123456);
+        assert_eq!(colorref_to_rgb(0), 0);
+        assert_eq!(colorref_to_rgb(0x00ffffff), 0xffffff);
+    }
+
+    #[test]
+    fn pixel_conditions_use_per_channel_tolerance_and_invert() {
+        assert!(pixel_condition_matches(0x123456, 0x123456, 0, false));
+        assert!(!pixel_condition_matches(0x123457, 0x123456, 0, false));
+        assert!(pixel_condition_matches(0x133357, 0x123456, 1, false));
+        assert!(!pixel_condition_matches(0x143456, 0x123456, 1, false));
+        assert!(!pixel_condition_matches(0x133357, 0x123456, 1, true));
+        assert!(pixel_condition_matches(0x143456, 0x123456, 1, true));
+        assert!(pixel_condition_matches(0xffffff, 0, 255, false));
+    }
+
+    #[test]
     fn gray_fingerprint_is_checked_and_rejects_flat_or_reversed_patterns() {
         let good = Signature(std::array::from_fn(|i| (30 + i % 120) as u8));
         let bright = Signature(good.0.map(|n| n + 50));
@@ -333,12 +612,101 @@ mod tests {
                     })
                 })
                 .collect();
-            Frame { region, gray }
+            Frame {
+                region,
+                gray,
+                rgb: None,
+            }
         };
         let initial = make(2, Point { x: -1200, y: -45 });
         let scaled = make(3, Point { x: 2000, y: 300 });
         let first = initial.signature(initial.region).unwrap();
         let second = scaled.signature(scaled.region).unwrap();
         assert_eq!(first.0, second.0);
+    }
+
+    #[test]
+    fn image_search_ranks_matches_and_rejects_distinct_duplicates() {
+        let region = Region {
+            origin: Point { x: -100, y: 20 },
+            size: Point { x: 24, y: 8 },
+        };
+        let mut rgb = vec![[0, 0, 0]; 24 * 8];
+        for row in rgb.as_chunks_mut::<24>().0 {
+            row[..8].fill([240, 0, 0]);
+        }
+        let mut frame = Frame {
+            region,
+            gray: vec![0; 24 * 8],
+            rgb: Some(rgb),
+        };
+        let template = crate::targets::ImageTemplate {
+            width: 8,
+            height: 8,
+            pixels: "f00000".repeat(64),
+        };
+        let search = |frame: &Frame| {
+            frame
+                .search_image(&template, 100, false, true, || false)
+                .unwrap()
+        };
+        let ImageSearch::Unique(found) = search(&frame) else {
+            panic!("expected one match");
+        };
+        assert_eq!(found.region.origin, region.origin);
+        assert_eq!(found.score(), 100);
+        assert!(
+            frame
+                .search_image(&template, 100, false, true, || true)
+                .is_err()
+        );
+        for row in frame.rgb.as_mut().unwrap().as_chunks_mut::<24>().0 {
+            row[16..].fill([240, 0, 0]);
+        }
+        assert!(matches!(search(&frame), ImageSearch::Ambiguous(_)));
+        for row in frame.rgb.as_mut().unwrap().as_chunks_mut::<24>().0 {
+            row[..8].fill([0, 240, 0]);
+            row[16..].fill([0, 240, 0]);
+        }
+        assert_eq!(search(&frame), ImageSearch::Missing);
+    }
+
+    #[test]
+    fn image_search_finds_optional_scaled_reference() {
+        let reference: Vec<u8> = (0..64).map(|index| (index * 3 + 17) as u8).collect();
+        let template = crate::targets::ImageTemplate {
+            width: 8,
+            height: 8,
+            pixels: reference
+                .iter()
+                .map(|value| format!("{value:02x}"))
+                .collect(),
+        };
+        let gray = (0..12)
+            .flat_map(|y| (0..12).map(move |x| (y * 8 / 12) * 8 + x * 8 / 12))
+            .map(|index| reference[index])
+            .collect();
+        let region = Region {
+            origin: Point { x: -10, y: 10 },
+            size: Point { x: 12, y: 12 },
+        };
+        let frame = Frame {
+            region,
+            gray,
+            rgb: None,
+        };
+        assert_eq!(
+            frame
+                .search_image(&template, 100, false, true, || false)
+                .unwrap(),
+            ImageSearch::Missing
+        );
+        let ImageSearch::Unique(found) = frame
+            .search_image(&template, 100, true, true, || false)
+            .unwrap()
+        else {
+            panic!("expected one scaled match");
+        };
+        assert_eq!(found.region, region);
     }
 }

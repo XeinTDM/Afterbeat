@@ -26,7 +26,8 @@ impl Issue {
 
 const MAX_INTERVAL: f64 = 86_400.0;
 const MIN_INTERVAL: f64 = 0.0001;
-pub const MAX_POINTS: usize = 64;
+pub const MAX_POINTS: usize = 256;
+pub const MAX_RECORDING_EVENTS: usize = 10_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
@@ -43,7 +44,7 @@ pub struct Settings {
     pub fixed: bool,
     pub point: Option<Point>,
     pub point_wayland: bool,
-    pub delay_seconds: u8,
+    pub delay_seconds: u32,
     pub unit: u8,
     pub keyboard: bool,
     pub key: String,
@@ -61,8 +62,10 @@ pub struct Settings {
     pub max_rate: String,
     pub route_enabled: bool,
     pub route_once: bool,
+    pub route_iterations: String,
     pub route_radius: String,
     pub route: Vec<Step>,
+    pub recording_origin: crate::recording::Origin,
     pub target_timeout: String,
     pub capture_visual: bool,
     pub route_wayland: bool,
@@ -106,8 +109,10 @@ impl Default for Settings {
             max_rate: "12".into(),
             route_enabled: false,
             route_once: false,
+            route_iterations: "0".into(),
             route_radius: "0".into(),
             route: Vec::new(),
+            recording_origin: crate::recording::Origin::Windows,
             target_timeout: "10".into(),
             capture_visual: false,
             route_wayland: false,
@@ -242,6 +247,20 @@ impl Settings {
             ))
     }
 
+    pub fn route_loop_limit(&self) -> Result<Option<u64>, Issue> {
+        let value = self
+            .route_iterations
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value <= 100_000_000)
+            .ok_or(Issue::new(
+                "route",
+                "Set route loops from 0 to 100,000,000.",
+            ))?;
+        Ok((value > 0).then_some(value))
+    }
+
     pub fn schedule(&self) -> Result<Schedule, Issue> {
         let inherits_cadence = self.inherits_route_cadence();
         let rates = if !inherits_cadence || (self.hold_down && !self.has_action_route()) {
@@ -266,15 +285,22 @@ impl Settings {
             ))?;
         let mut limit = self.action_limit()?;
         if self.route_enabled {
-            if self.route.is_empty() || self.route.len() > MAX_POINTS {
+            if self.route.is_empty() || self.route.len() > self.route_limit() {
                 return Err(Issue::new(
                     "route",
-                    "Add between 1 and 64 points before running a route.",
+                    "The route is empty or exceeds its step limit.",
                 ));
             }
             if self.route_once && !self.has_action_route() {
                 let points = self.route.len() as u64;
                 limit = Some(limit.map_or(points, |count| count.min(points)));
+            }
+            if !self.route_once && !self.has_recording() {
+                let iterations = self.route_loop_limit()?;
+                if let Some(iterations) = iterations.filter(|_| !self.has_action_route()) {
+                    let actions = iterations * self.route.len() as u64;
+                    limit = Some(limit.map_or(actions, |count| count.min(actions)));
+                }
             }
             if self.inside_zone.is_some() {
                 return Err(Issue::new(
@@ -320,13 +346,26 @@ impl Settings {
     }
 
     pub fn normalize(&mut self) {
-        if ![0, 1, 3].contains(&self.delay_seconds) {
+        if ![0, 1, 3, 10, 30, 60, 300, 900, 3600].contains(&self.delay_seconds) {
             self.delay_seconds = 3;
         }
         self.unit = self.unit.min(8);
         self.edge_mode = self.edge_mode.min(2);
         self.process_mode = self.process_mode.min(2);
-        self.route.truncate(MAX_POINTS);
+        let limit = self.route_limit();
+        self.route.truncate(limit);
+    }
+
+    pub fn has_recording(&self) -> bool {
+        self.route.iter().any(|step| matches!(step, Step::Action(action) if matches!(action.action, crate::targets::Action::Recorded { .. })))
+    }
+
+    pub fn route_limit(&self) -> usize {
+        if self.has_recording() {
+            MAX_RECORDING_EVENTS
+        } else {
+            MAX_POINTS
+        }
     }
 
     pub fn has_smart_route(&self) -> bool {
@@ -420,6 +459,120 @@ pub fn path() -> Option<PathBuf> {
 }
 
 const MAX_STORE: u64 = 2 * 1024 * 1024;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PresetTransfer {
+    format: String,
+    version: u32,
+    name: String,
+    settings: Settings,
+}
+
+pub(crate) fn pixel_transfer_version(settings: &Settings) -> u32 {
+    use crate::targets::{Action, ImageOutput};
+    if settings.route.iter().any(|step| match step {
+        Step::Action(step) => match &step.action {
+            Action::Flow { .. } => true,
+            Action::WaitImage {
+                output,
+                scaled,
+                template,
+                ..
+            } => *output != ImageOutput::Wait || *scaled || template.is_color(),
+            _ => false,
+        },
+        _ => false,
+    }) {
+        return 8;
+    }
+    if settings.route.iter().any(|step| matches!(step, Step::Action(action) if matches!(action.action, crate::targets::Action::WaitImage { .. }))) { return 7; }
+    if settings.route.iter().any(|step| {
+        matches!(step,
+        Step::Action(action) if matches!(action.action,
+            crate::targets::Action::WaitColor { retry_clicks: 1.., .. }
+        ))
+    }) {
+        return 6;
+    }
+    if settings.route.iter().any(|step| {
+        matches!(step,
+        Step::Action(action) if matches!(action.action,
+            crate::targets::Action::WaitColor { check_once: true, .. }
+                | crate::targets::Action::WaitColor { skip_next_on_mismatch: true, .. }
+        ))
+    }) {
+        return 5;
+    }
+    if settings.route.iter().any(|step| {
+        matches!(step,
+        Step::Action(action) if matches!(action.action,
+            crate::targets::Action::WaitColor { skip_next_on_timeout: true, .. }
+        ))
+    }) {
+        return 4;
+    }
+    if settings.route.iter().any(|step| {
+        matches!(step,
+        Step::Action(action) if matches!(action.action,
+            crate::targets::Action::WaitColor { stable_ms: 1.., .. }
+        ))
+    }) {
+        return 3;
+    }
+    if settings.route.iter().any(|step| {
+        matches!(step,
+        Step::Action(action) if matches!(action.action,
+            crate::targets::Action::WaitColor { tolerance: 1..=255, .. }
+                | crate::targets::Action::WaitColor { different: true, .. }
+        ))
+    }) {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn export_preset(path: &Path, name: &str, settings: &Settings) -> io::Result<()> {
+    let transfer = PresetTransfer {
+        format: "afterbeat-preset".into(),
+        version: pixel_transfer_version(settings),
+        name: name.into(),
+        settings: settings.clone(),
+    };
+    let bytes = encode_store(&transfer, MAX_STORE)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn import_preset(path: &Path) -> io::Result<(String, Settings)> {
+    let transfer: PresetTransfer = serde_json::from_slice(&read_bounded(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if transfer.format != "afterbeat-preset"
+        || !(1..=8).contains(&transfer.version)
+        || transfer.version < pixel_transfer_version(&transfer.settings)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unsupported preset format or version.",
+        ));
+    }
+    if transfer.settings.route.len() > transfer.settings.route_limit() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "The preset exceeds the route step limit.",
+        ));
+    }
+    Ok((transfer.name, transfer.settings))
+}
 
 pub struct Loaded<T> {
     pub value: T,
@@ -574,6 +727,211 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preset_transfer_round_trips_and_never_overwrites() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "afterbeat-transfer-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preset.json");
+        let settings = Settings {
+            interval: "250".into(),
+            ..Settings::default()
+        };
+        export_preset(&path, "Example", &settings).unwrap();
+        assert_eq!(
+            export_preset(&path, "Other", &settings).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            import_preset(&path).unwrap(),
+            ("Example".to_owned(), settings)
+        );
+        let advanced_path = dir.join("advanced.json");
+        let advanced = Settings {
+            route: vec![Step::Action(Box::new(crate::targets::ActionStep {
+                action: crate::targets::Action::WaitColor {
+                    point: Point { x: 1, y: 2 },
+                    rgb: 0x123456,
+                    tolerance: 2,
+                    different: true,
+                    stable_ms: 0,
+                    skip_next_on_timeout: false,
+                    check_once: false,
+                    skip_next_on_mismatch: false,
+                    retry_clicks: 0,
+                },
+                target: None,
+                delay_ms: 0,
+            }))],
+            ..Settings::default()
+        };
+        export_preset(&advanced_path, "Advanced", &advanced).unwrap();
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&advanced_path).unwrap()).unwrap();
+        assert_eq!(encoded["version"], 2);
+        assert_eq!(
+            import_preset(&advanced_path).unwrap(),
+            ("Advanced".to_owned(), advanced.clone())
+        );
+        encoded["version"] = 1.into();
+        fs::write(&advanced_path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+        assert_eq!(
+            import_preset(&advanced_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut stable = advanced.clone();
+        if let Step::Action(action) = &mut stable.route[0]
+            && let crate::targets::Action::WaitColor { stable_ms, .. } = &mut action.action
+        {
+            *stable_ms = 250;
+        }
+        let stable_path = dir.join("stable.json");
+        export_preset(&stable_path, "Stable", &stable).unwrap();
+        let mut stable_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&stable_path).unwrap()).unwrap();
+        assert_eq!(stable_json["version"], 3);
+        assert_eq!(
+            import_preset(&stable_path).unwrap(),
+            ("Stable".to_owned(), stable.clone())
+        );
+        stable_json["version"] = 2.into();
+        fs::write(&stable_path, serde_json::to_vec(&stable_json).unwrap()).unwrap();
+        assert_eq!(
+            import_preset(&stable_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut branched = stable.clone();
+        if let Step::Action(action) = &mut branched.route[0]
+            && let crate::targets::Action::WaitColor {
+                skip_next_on_timeout,
+                ..
+            } = &mut action.action
+        {
+            *skip_next_on_timeout = true;
+        }
+        let branch_path = dir.join("branch.json");
+        export_preset(&branch_path, "Branch", &branched).unwrap();
+        let mut branch_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&branch_path).unwrap()).unwrap();
+        assert_eq!(branch_json["version"], 4);
+        assert_eq!(
+            import_preset(&branch_path).unwrap(),
+            ("Branch".to_owned(), branched.clone())
+        );
+        branch_json["version"] = 3.into();
+        fs::write(&branch_path, serde_json::to_vec(&branch_json).unwrap()).unwrap();
+        assert_eq!(
+            import_preset(&branch_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut once = branched;
+        if let Step::Action(action) = &mut once.route[0]
+            && let crate::targets::Action::WaitColor {
+                check_once,
+                stable_ms,
+                skip_next_on_timeout,
+                skip_next_on_mismatch,
+                ..
+            } = &mut action.action
+        {
+            *check_once = true;
+            *stable_ms = 0;
+            *skip_next_on_timeout = false;
+            *skip_next_on_mismatch = true;
+        }
+        let once_path = dir.join("once.json");
+        export_preset(&once_path, "Once", &once).unwrap();
+        let mut once_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&once_path).unwrap()).unwrap();
+        assert_eq!(once_json["version"], 5);
+        assert_eq!(
+            import_preset(&once_path).unwrap(),
+            ("Once".to_owned(), once.clone())
+        );
+        once_json["version"] = 4.into();
+        fs::write(&once_path, serde_json::to_vec(&once_json).unwrap()).unwrap();
+        assert_eq!(
+            import_preset(&once_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut retried = once;
+        if let Step::Action(action) = &mut retried.route[0]
+            && let crate::targets::Action::WaitColor { retry_clicks, .. } = &mut action.action
+        {
+            *retry_clicks = 2;
+        }
+        let retry_path = dir.join("retry.json");
+        export_preset(&retry_path, "Retry", &retried).unwrap();
+        let mut retry_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&retry_path).unwrap()).unwrap();
+        assert_eq!(retry_json["version"], 6);
+        assert_eq!(
+            import_preset(&retry_path).unwrap(),
+            ("Retry".to_owned(), retried)
+        );
+        retry_json["version"] = 5.into();
+        fs::write(&retry_path, serde_json::to_vec(&retry_json).unwrap()).unwrap();
+        assert_eq!(
+            import_preset(&retry_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let image = Settings {
+            route: vec![Step::Action(Box::new(crate::targets::ActionStep {
+                action: crate::targets::Action::WaitImage {
+                    search: crate::targets::ImageRect {
+                        x: 0,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                    template: crate::targets::ImageTemplate {
+                        width: 8,
+                        height: 8,
+                        pixels: "00".repeat(64),
+                    },
+                    threshold: 95,
+                    timeout_ms: 1000,
+                    output: Default::default(),
+                    scaled: false,
+                },
+                target: None,
+                delay_ms: 0,
+            }))],
+            ..Settings::default()
+        };
+        let image_path = dir.join("image.json");
+        export_preset(&image_path, "Image", &image).unwrap();
+        let mut image_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&image_path).unwrap()).unwrap();
+        assert_eq!(image_json["version"], 7);
+        assert_eq!(
+            import_preset(&image_path).unwrap(),
+            ("Image".to_owned(), image)
+        );
+        image_json["version"] = 6.into();
+        fs::write(&image_path, serde_json::to_vec(&image_json).unwrap()).unwrap();
+        assert_eq!(
+            import_preset(&image_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(
+            &path,
+            br#"{"format":"afterbeat-preset","version":9,"name":"Example","settings":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            import_preset(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn oversized_presets_leave_the_library_unchanged_and_room_for_stats() {
         let mut library = Library::default();
         let original = Settings::default();
@@ -722,6 +1080,7 @@ mod tests {
         assert!(!settings.keyboard);
         assert!(settings.armed);
         assert!(settings.route.is_empty());
+        assert_eq!(settings.recording_origin, crate::recording::Origin::Windows);
     }
 
     #[test]
@@ -739,6 +1098,76 @@ mod tests {
             settings.interval = invalid.into();
             assert!(settings.interval().is_err());
         }
+    }
+
+    #[test]
+    fn ordinary_routes_accept_256_steps_and_reject_more() {
+        let mut settings = Settings {
+            route_enabled: true,
+            route: vec![Step::Point(Point { x: 0, y: 0 }); 256],
+            ..Settings::default()
+        };
+        assert!(settings.schedule().is_ok());
+        settings.route.push(Step::Point(Point { x: 1, y: 1 }));
+        assert!(settings.schedule().is_err());
+        settings.normalize();
+        assert_eq!(settings.route.len(), 256);
+    }
+
+    #[test]
+    fn start_delay_choices_survive_save_and_schedule() {
+        for seconds in [0, 1, 3, 10, 30, 60, 300, 900, 3600] {
+            let original = Settings {
+                delay_seconds: seconds,
+                ..Settings::default()
+            };
+            let json = serde_json::to_vec(&original).unwrap();
+            let mut restored: Settings = serde_json::from_slice(&json).unwrap();
+            restored.normalize();
+            assert_eq!(restored.delay_seconds, seconds);
+            assert_eq!(
+                restored.schedule().unwrap().delay,
+                Duration::from_secs(seconds.into())
+            );
+        }
+    }
+
+    #[test]
+    fn route_loop_count_honors_action_limit_and_once_mode() {
+        let mut settings = Settings {
+            route_enabled: true,
+            route: vec![
+                Step::Point(Point { x: 0, y: 0 }),
+                Step::Point(Point { x: 1, y: 1 }),
+            ],
+            route_iterations: "3".into(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.schedule().unwrap().limit, Some(6));
+        settings.limited = true;
+        settings.count = "5".into();
+        assert_eq!(settings.schedule().unwrap().limit, Some(5));
+        settings.limited = false;
+        settings.route_once = true;
+        assert_eq!(settings.schedule().unwrap().limit, Some(2));
+        settings.route_once = false;
+        settings.route_iterations = "0".into();
+        assert_eq!(settings.schedule().unwrap().limit, None);
+        settings.route_iterations = "100000001".into();
+        assert_eq!(settings.schedule().err().unwrap().field, "route");
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.route_iterations, "100000001");
+        settings
+            .route
+            .push(Step::Action(Box::new(crate::targets::ActionStep {
+                action: crate::targets::Action::Wait,
+                target: None,
+                delay_ms: 1,
+            })));
+        assert!(settings.schedule().is_err());
+        settings.route_iterations = "3".into();
+        assert_eq!(settings.schedule().unwrap().limit, None);
     }
 
     #[test]

@@ -17,6 +17,10 @@ const FUNCTION_KEYS: [u16; 20] = [
 ];
 static LAYOUT_ID: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn current_layout() -> u64 {
+    LAYOUT_ID.load(Ordering::Acquire)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
     pub code: u16,

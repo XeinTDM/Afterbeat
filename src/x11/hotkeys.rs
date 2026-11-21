@@ -235,6 +235,7 @@ pub enum Action {
     PortalStatus,
 }
 
+#[derive(Clone)]
 pub struct StopProbe {
     stop: Option<Binding>,
     toggle: Option<Binding>,

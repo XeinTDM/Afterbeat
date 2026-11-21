@@ -141,15 +141,30 @@ fn show_targets(
         .iter()
         .enumerate()
         .map(|(index, step)| {
-            let counts_as_action =
-                !matches!(step, Step::Action(action) if action.action == Action::Wait);
+            let counts_as_action = match step {
+                Step::Action(action) => match &action.action {
+                    Action::Wait | Action::WaitColor { .. } | Action::Flow { .. }
+                    | Action::WaitImage { output: crate::targets::ImageOutput::Wait | crate::targets::ImageOutput::If, .. }
+                    | Action::Recorded { event: crate::recording::Event::Move(_) } => false,
+                    Action::Recorded { event: crate::recording::Event::Scroll { .. } } => true,
+                    Action::Recorded { event: crate::recording::Event::Button { down, .. } | crate::recording::Event::Key { down, .. } } => *down,
+                    _ => true,
+                },
+                _ => true,
+            };
+            let action_count = match step {
+                Step::Action(action) => match &action.action {
+                    Action::Text { text } => text.chars().count().min(i32::MAX as usize) as i32,
+                    _ => i32::from(counts_as_action),
+                },
+                _ => 1,
+            };
             let inherited_output = if settings.route_enabled && !matches!(step, Step::Action(_)) {
                 shared_output.clone()
             } else {
                 Default::default()
             };
-            let key =
-                matches!(step, Step::Action(step) if matches!(step.action, Action::Key { .. }));
+            let key = matches!(step, Step::Action(step) if matches!(step.action, Action::Key { .. } | Action::Text { .. } | Action::Recorded { event: crate::recording::Event::Key { .. } }));
             let preview = if let Some(point) = step.point() {
                 Preview {
                     point: Some(point),
@@ -167,9 +182,23 @@ fn show_targets(
                     bounds: None,
                     landmark: None,
                     repair: false,
-                    blocked: false,
-                    message: if !counts_as_action {
+                    blocked: matches!(step, Step::Action(action) if matches!(action.action, Action::Flow { .. } | Action::WaitImage { output: crate::targets::ImageOutput::If, .. })),
+                    message: if matches!(step, Step::Action(action) if action.action == Action::Wait) {
                         "Waits without sending input."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::Flow { .. })) {
+                        "Dry run stops here because workflow branches and loops are evaluated during playback."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::WaitImage { .. })) {
+                        "The image is not searched here; use the image preview in the step editor."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::WaitColor { retry_clicks: 1.., .. })) {
+                        "The pixel is not checked here. Failure can retry the preceding click before the selected failure action."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::WaitColor { check_once: true, skip_next_on_mismatch: true, .. })) {
+                        "The pixel is not checked here. If it does not match, the next step will be skipped."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::WaitColor { check_once: true, .. })) {
+                        "Checks a pixel once during the run; the color is not checked here."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::WaitColor { skip_next_on_timeout: true, .. })) {
+                        "The pixel is not checked here. On timeout the next step will be skipped."
+                    } else if matches!(step, Step::Action(action) if matches!(action.action, Action::WaitColor { .. })) {
+                        "Waits for a pixel color during the run; the color is not checked here."
                     } else {
                         "Uses the focused app when the step runs."
                     },
@@ -179,6 +208,7 @@ fn show_targets(
                 return DryPoint {
                     blocked: preview.blocked,
                     counts_as_action,
+                    action_count,
                     hidden: true,
                     location: step.label().into(),
                     inherited_output,
@@ -217,6 +247,7 @@ fn show_targets(
                 blocked,
                 terminal,
                 counts_as_action,
+                action_count,
                 hidden: false,
                 repair: preview.repair,
                 location: if !matches!(step, Step::Point(_)) {

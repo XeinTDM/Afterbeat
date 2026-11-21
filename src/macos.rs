@@ -4,8 +4,8 @@ use objc2::{
     runtime::ProtocolObject,
 };
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSApplicationWillTerminateNotification, NSRunningApplication,
-    NSWorkspace,
+    NSApplicationActivationOptions, NSApplicationWillTerminateNotification, NSEvent,
+    NSRunningApplication, NSWorkspace,
 };
 use objc2_core_foundation::{
     CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect,
@@ -40,6 +40,15 @@ pub fn request_permissions() {
 
 pub fn secure_input_enabled() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
+pub fn double_click_interval() -> std::time::Duration {
+    let seconds = NSEvent::doubleClickInterval();
+    if seconds.is_finite() && (0.0..=10.0).contains(&seconds) {
+        std::time::Duration::from_secs_f64(seconds)
+    } else {
+        std::time::Duration::from_millis(500)
+    }
 }
 
 pub struct QuitObserver(Retained<ProtocolObject<dyn NSObjectProtocol>>);

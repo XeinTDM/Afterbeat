@@ -79,6 +79,7 @@ impl Hotkeys {
     }
 }
 
+#[derive(Clone)]
 pub struct StopProbe(Option<x11::StopProbe>);
 
 impl StopProbe {

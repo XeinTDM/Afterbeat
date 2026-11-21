@@ -116,6 +116,10 @@ impl Binding {
         self.trigger == Trigger::Key(key.code)
     }
 
+    pub fn uses_code(self, code: u16) -> bool {
+        self.trigger == Trigger::Key(code)
+    }
+
     pub fn matches_button(self, button: crate::mouse::Button) -> bool {
         use crate::mouse::Button::*;
         match button {
@@ -156,6 +160,7 @@ pub enum Action {
     Unavailable,
 }
 
+#[derive(Clone)]
 pub struct StopProbe {
     listening: Arc<AtomicBool>,
     toggle: Option<Binding>,

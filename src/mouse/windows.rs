@@ -34,6 +34,10 @@ use windows_sys::Win32::{
 const LAYOUT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const LAYOUT_CHANGED: &str = "The display layout changed. Capture your points again.";
 
+#[cfg(test)]
+#[path = "windows_recovery_tests.rs"]
+mod recovery_tests;
+
 pub fn cursor() -> io::Result<Point> {
     let mut position = POINT::default();
     if unsafe { GetCursorPos(&mut position) } == 0 {
@@ -654,14 +658,19 @@ impl Injector {
 
 #[derive(Clone, Copy)]
 pub enum RouteInput {
+    Move,
     Click(Button, u8),
     Scroll(crate::targets::Direction, u8),
     Key(crate::keys::Key),
+    Text(char),
 }
 
 impl RouteInput {
     pub fn is_held(self) -> bool {
         match self {
+            Self::Move => Button::ALL
+                .into_iter()
+                .any(|button| keys::down(button.virtual_key())),
             Self::Click(button, _) => keys::down(button.virtual_key()),
             Self::Key(key) => {
                 keys::down(key.vk)
@@ -669,6 +678,9 @@ impl RouteInput {
                         .into_iter()
                         .any(keys::down)
             }
+            Self::Text(_) => [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                .into_iter()
+                .any(keys::down),
             Self::Scroll(..) => scroll_input_held(),
         }
     }
@@ -688,6 +700,7 @@ impl RouteInput {
         }
         let mut stroke = None;
         match self {
+            Self::Move => {}
             Self::Click(button, count) => {
                 let tap = Stroke::new(Input::Mouse(button));
                 for event in packet[used..used + usize::from(count) * 2].chunks_mut(2) {
@@ -700,6 +713,15 @@ impl RouteInput {
                 let tap = Stroke::new(Input::Key(key));
                 packet[..tap.len].copy_from_slice(tap.down());
                 packet[tap.len..2 * tap.len].copy_from_slice(tap.up());
+                used = 2 * tap.len;
+                stroke = Some(tap);
+            }
+            Self::Text(character) => {
+                let tap = Stroke::new(Input::Text(character));
+                for index in 0..tap.len {
+                    packet[index * 2] = tap.down()[index];
+                    packet[index * 2 + 1] = tap.up()[index];
+                }
                 used = 2 * tap.len;
                 stroke = Some(tap);
             }
@@ -724,6 +746,189 @@ pub enum RouteDelivery {
     Retry,
     Sent,
     End(Outcome),
+}
+
+/// Sends individual recorded edges, and releases every injected hold on exit.
+/// The route runner must perform its normal guard and stop checks before each send.
+pub struct MacroPlayer {
+    desktop: Desktop,
+    held: Vec<crate::recording::Event>,
+}
+
+impl MacroPlayer {
+    pub fn new() -> Result<Self, String> {
+        let desktop = Desktop::current();
+        if desktop.displays.is_empty() {
+            return Err("The desktop did not report any displays.".into());
+        }
+        Ok(Self {
+            desktop,
+            held: Vec::new(),
+        })
+    }
+
+    pub fn send(&mut self, event: &crate::recording::Event) -> Result<(), String> {
+        use crate::recording::Event;
+        let down = matches!(
+            event,
+            Event::Button { down: true, .. } | Event::Key { down: true, .. }
+        );
+        let up = matches!(
+            event,
+            Event::Button { down: false, .. } | Event::Key { down: false, .. }
+        );
+        let already_held = self.held.iter().any(|held| matching_edge(held, event));
+        if (down && already_held && matches!(event, Event::Button { .. })) || (up && !already_held)
+        {
+            return Err("The recording has an unmatched input press or release.".into());
+        }
+        if down && !already_held {
+            let vk = match event {
+                Event::Button { button, .. } => Some(button.virtual_key()),
+                Event::Key { code, .. } => u16::try_from(*code)
+                    .ok()
+                    .filter(|vk| (1..=255).contains(vk)),
+                _ => None,
+            }
+            .ok_or("A recorded key is invalid.")?;
+            if keys::down(vk) {
+                return Err("Release the held input before playing the recording.".into());
+            }
+        }
+        let point = match event {
+            Event::Move(point) | Event::Button { point, .. } | Event::Scroll { point, .. } => {
+                Some(*point)
+            }
+            Event::Key { .. } => None,
+        };
+        let mut packet = Vec::with_capacity(2);
+        if let Some(point) = point {
+            if self.desktop != Desktop::current() {
+                return Err(LAYOUT_CHANGED.into());
+            }
+            if !self
+                .desktop
+                .displays
+                .iter()
+                .any(|display| display.contains(point))
+            {
+                return Err("A recorded point is outside your displays.".into());
+            }
+            packet.push(
+                Targets::move_to(&self.desktop, point)
+                    .ok_or("The recorded point is outside the desktop.")?,
+            );
+        }
+        let edge = match event {
+            Event::Move(_) => None,
+            Event::Scroll {
+                horizontal, delta, ..
+            } => {
+                let mut wheel = mouse_input(
+                    if *horizontal {
+                        MOUSEEVENTF_HWHEEL
+                    } else {
+                        MOUSEEVENTF_WHEEL
+                    },
+                    Point { x: 0, y: 0 },
+                );
+                wheel.Anonymous.mi.mouseData = *delta as u32;
+                Some(wheel)
+            }
+            Event::Button { button, down, .. } => {
+                let stroke = Stroke::new(Input::Mouse(*button));
+                Some(if *down {
+                    stroke.down()[0]
+                } else {
+                    stroke.up()[0]
+                })
+            }
+            Event::Key {
+                code,
+                extended,
+                down,
+            } => {
+                let vk = u16::try_from(*code)
+                    .ok()
+                    .filter(|vk| (1..=255).contains(vk))
+                    .ok_or("A recorded key is invalid.")?;
+                let flags = if *extended { KEYEVENTF_EXTENDEDKEY } else { 0 }
+                    | if *down { 0 } else { KEYEVENTF_KEYUP };
+                Some(keyboard_input(vk, flags))
+            }
+        };
+        if let Some(edge) = edge {
+            packet.push(edge);
+        }
+        if down && !already_held {
+            self.held.push(event.clone());
+        }
+        send(&packet, &[])?;
+        if !down {
+            self.held.retain(|held| !matching_edge(held, event));
+        }
+        Ok(())
+    }
+
+    pub fn has_held(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    pub fn has_held_keys(&self) -> bool {
+        self.held
+            .iter()
+            .any(|event| matches!(event, crate::recording::Event::Key { .. }))
+    }
+
+    pub fn has_held_buttons(&self) -> bool {
+        self.held
+            .iter()
+            .any(|event| matches!(event, crate::recording::Event::Button { .. }))
+    }
+
+    fn take_releases(&mut self) -> Vec<INPUT> {
+        use crate::recording::Event;
+        self.held
+            .drain(..)
+            .rev()
+            .filter_map(|event| match event {
+                Event::Button { button, .. } => Some(Stroke::new(Input::Mouse(button)).up()[0]),
+                Event::Key { code, extended, .. } => Some(keyboard_input(
+                    code as u16,
+                    KEYEVENTF_KEYUP | if extended { KEYEVENTF_EXTENDEDKEY } else { 0 },
+                )),
+                Event::Move(_) | Event::Scroll { .. } => None,
+            })
+            .collect()
+    }
+}
+
+fn matching_edge(held: &crate::recording::Event, event: &crate::recording::Event) -> bool {
+    use crate::recording::Event;
+    match (held, event) {
+        (Event::Button { button: a, .. }, Event::Button { button: b, .. }) => a == b,
+        (
+            Event::Key {
+                code: a,
+                extended: ae,
+                ..
+            },
+            Event::Key {
+                code: b,
+                extended: be,
+                ..
+            },
+        ) => a == b && ae == be,
+        _ => false,
+    }
+}
+
+impl Drop for MacroPlayer {
+    fn drop(&mut self) {
+        for release in self.take_releases() {
+            let _ = send(&[release], &[]);
+        }
+    }
 }
 
 fn wait_for_output(
@@ -831,6 +1036,41 @@ fn scroll_input_held() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_cleanup_releases_inputs_in_reverse_order() {
+        use crate::recording::Event;
+        let mut player = MacroPlayer {
+            desktop: Desktop {
+                origin: Point { x: 0, y: 0 },
+                width: 100,
+                height: 100,
+                displays: Vec::new(),
+            },
+            held: vec![
+                Event::Button {
+                    button: Button::Left,
+                    down: true,
+                    point: Point { x: 1, y: 1 },
+                },
+                Event::Key {
+                    code: 65,
+                    extended: true,
+                    down: true,
+                },
+            ],
+        };
+        let releases = player.take_releases();
+        assert_eq!(releases.len(), 2);
+        let key = unsafe { releases[0].Anonymous.ki };
+        assert_eq!(key.wVk, 65);
+        assert_eq!(key.dwFlags, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY);
+        assert_eq!(key.dwExtraInfo, crate::input_filter::INPUT_TAG);
+        let mouse = unsafe { releases[1].Anonymous.mi };
+        assert_eq!(mouse.dwFlags, MOUSEEVENTF_LEFTUP);
+        assert_eq!(mouse.dwExtraInfo, crate::input_filter::INPUT_TAG);
+        assert!(!player.has_held());
+    }
 
     #[test]
     fn confinement_accepts_only_points_inside_the_windows_rectangle() {
