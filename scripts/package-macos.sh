@@ -59,7 +59,18 @@ fi
 codesign --verify --strict "$bundle"
 ditto -c -k --sequesterRsrc "$stage/payload" "$stage/$archive"
 ditto -x -k "$stage/$archive" "$stage/check"
-codesign --verify --strict "$stage/check/Afterbeat.app"
+checked_bundle="$stage/check/Afterbeat.app"
+codesign --verify --strict "$checked_bundle"
+if [[ -n "$notary_profile" ]]; then
+    # Verify the ticket in the actual download, not just the staged bundle.
+    xcrun stapler validate "$checked_bundle"
+fi
+for document in LICENSE THIRD-PARTY-NOTICES.txt; do
+    cmp "$stage/payload/$document" "$stage/check/$document"
+done
+cmp "$stage/payload/usage.md" "$stage/check/usage.md"
+cmp "$bundle/Contents/Info.plist" "$checked_bundle/Contents/Info.plist"
+cmp "$bundle/Contents/Resources/afterbeat.icns" "$checked_bundle/Contents/Resources/afterbeat.icns"
 mv -f -- "$stage/$archive" "$output/$archive"
 (cd "$output" && shasum -a 256 "$archive" > SHA256SUMS.txt)
 printf '%s\n' "$output/$archive"

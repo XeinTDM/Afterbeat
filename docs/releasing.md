@@ -57,7 +57,7 @@ If draft creation fails after the draft appears, inspect its assets before proce
 
 After building and verifying the release, run `./scripts/package.ps1` on Windows, `bash scripts/package.sh` on Linux, or `bash scripts/package-macos.sh` on macOS. Each writes its archive and checksum to `target/dist`.
 
-For a Developer ID macOS build, set `AFTERBEAT_CODESIGN_IDENTITY` to the installed Developer ID Application identity. For notarization, also set `AFTERBEAT_NOTARY_PROFILE` to a configured `notarytool` keychain profile. The packaging script submits the signed bundle and staples the returned ticket before making the release ZIP. [Apple’s notarization instructions](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+For a Developer ID macOS build, set `AFTERBEAT_CODESIGN_IDENTITY` to the installed Developer ID Application identity. For notarization, also set `AFTERBEAT_NOTARY_PROFILE` to a configured `notarytool` keychain profile. The packaging script submits the signed bundle and staples the returned ticket before making the release ZIP. It extracts the finished ZIP to verify the signature, the stapled ticket when requested, and the packaged documents, icon, and plist before writing the download. [Apple’s notarization instructions](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 
 ## First GitHub setup
 
